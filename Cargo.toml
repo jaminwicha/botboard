@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/botboard-core", "crates/botboard-cli"]
+members = ["crates/botboard-core", "crates/botboard-cli", "crates/botboard-ffi"]
 resolver = "2"
 
 [profile.test]

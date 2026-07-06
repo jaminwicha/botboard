@@ -1,0 +1,59 @@
+//! Deterministic-grade evaluation (§10.6): integer-only material + mobility.
+//!
+//! This is the Phase-2 seed of the shared evaluator: material values come
+//! from the cost model (prior, then self-play-corrected), so evaluation
+//! already generalizes to procedural pieces — any Bit-set gets a value via
+//! its cost. The NNUE-with-Bit-embeddings network (§7.4) replaces this
+//! linear form later behind the same interface; per-player scores are the
+//! per-player value head in miniature.
+
+use crate::game::{GameDef, Side};
+use crate::movegen::pseudo_moves;
+use crate::position::{Loc, Position};
+
+pub const MOBILITY_CP: i32 = 4;
+
+#[derive(Clone, Debug)]
+pub struct Eval {
+    /// Centipawn value per piece type (royals 0 — losing them ends the game).
+    pub material: Vec<i32>,
+    pub mobility_cp: i32,
+}
+
+impl Eval {
+    pub fn new(material: Vec<i32>) -> Self {
+        Eval { material, mobility_cp: MOBILITY_CP }
+    }
+
+    /// Per-player score vector (the value-head shape, §7.4).
+    pub fn players(&self, g: &GameDef, pos: &mut Position) -> Vec<i32> {
+        let mut score = vec![0i32; g.sides as usize];
+        for p in &pos.pieces {
+            match p.loc {
+                Loc::Board(_) => score[p.side as usize] += self.material[p.t as usize],
+                Loc::Hand(s) => score[s as usize] += self.material[p.t as usize],
+                Loc::Dead => {}
+            }
+        }
+        if self.mobility_cp != 0 {
+            let saved = pos.stm;
+            for s in 0..g.sides {
+                pos.stm = s;
+                score[s as usize] += self.mobility_cp * pseudo_moves(g, pos).len() as i32;
+            }
+            pos.stm = saved;
+        }
+        score
+    }
+
+    /// Two-player scalar from the side-to-move's perspective (negamax form).
+    pub fn stm(&self, g: &GameDef, pos: &mut Position) -> i32 {
+        let v = self.players(g, pos);
+        let me = pos.stm as usize;
+        let enemy = (pos.stm as usize + 1) % g.sides as usize;
+        v[me] - v[enemy]
+    }
+
+    #[allow(dead_code)]
+    fn _unused(_: Side) {}
+}

@@ -9,12 +9,21 @@
 //! Phase-0 board representation is the mailbox + piece-list path (§7.1);
 //! the bitboard/SIMD classes and the empirical crossover are Prototype 1.
 
+pub mod belief;
 pub mod bits;
+pub mod cost;
+pub mod eval;
 pub mod fen;
 pub mod game;
 pub mod geometry;
+pub mod ladder;
+pub mod league;
 pub mod movegen;
 pub mod moves;
 pub mod perft;
 pub mod position;
+pub mod rng;
+pub mod search;
+pub mod selfplay;
 pub mod variants;
+pub mod zobrist;

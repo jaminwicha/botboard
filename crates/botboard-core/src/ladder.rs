@@ -1,0 +1,230 @@
+//! The belief-gated search ladder (§8.2–8.5): one shared evaluator under
+//! four dispatch modes, cheapest-sound-first.
+//!
+//! Rung 0: perfect-information alpha-beta (the point-mass cap).
+//! Rung 1: determinization / PIMC — sample consistent worlds, solve each
+//!         with the rung-0 engine, aggregate root votes.
+//! Rung 2: single-observer ISMCTS — fresh determinization per iteration,
+//!         UCT over the observer's move sequence (reduces strategy fusion).
+//! Rung 3: search-free softmax policy over the shared eval (the R-NaD-
+//!         shaped cap; its NeuRD refinement lives in the training loop).
+//!
+//! The gate dispatches on belief sharpness + pivotality, biased toward the
+//! next-sounder rung when uncertain (§8.5); the full GT-CFR interpolation
+//! between rungs is the Phase-2+ growth path.
+
+use crate::belief::{determinize, Belief};
+use crate::game::GameDef;
+use crate::movegen::legal_moves;
+use crate::moves::Move;
+use crate::position::Position;
+use crate::rng::Rng;
+use crate::search::Searcher;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rung {
+    R0PerfectInfo,
+    R1Determinize,
+    R2Ismcts,
+    R3Policy,
+}
+
+pub struct LadderConfig {
+    pub depth: i32,
+    pub node_budget: u64,
+    pub determinizations: usize,
+    pub ismcts_iters: usize,
+    /// Entropy thresholds: below `sharp` → rung 1, below `broad` → rung 2,
+    /// else rung 3.
+    pub sharp: f64,
+    pub broad: f64,
+}
+
+impl Default for LadderConfig {
+    fn default() -> Self {
+        LadderConfig {
+            depth: 4,
+            node_budget: 200_000,
+            determinizations: 8,
+            ismcts_iters: 400,
+            sharp: 6.0,
+            broad: 24.0,
+        }
+    }
+}
+
+/// The gate (§8.5): entropy → rung, with pivotality escalating one rung
+/// (bias toward the sounder side when uncertain).
+pub fn gate(belief: &Belief, material: &[i32], cfg: &LadderConfig) -> Rung {
+    let h = belief.entropy();
+    let mut rung = if h == 0.0 {
+        Rung::R0PerfectInfo
+    } else if h < cfg.sharp {
+        Rung::R1Determinize
+    } else if h < cfg.broad {
+        Rung::R2Ismcts
+    } else {
+        Rung::R3Policy
+    };
+    if rung == Rung::R1Determinize && belief.pivotal(material) {
+        rung = Rung::R2Ismcts;
+    }
+    rung
+}
+
+/// Choose a move for `pos.stm` given its belief. `truth` is ground truth;
+/// hidden information reaches the chooser only through `belief`-consistent
+/// determinizations (§8.6's no-leakage discipline).
+pub fn choose_move(
+    g: &GameDef,
+    truth: &mut Position,
+    belief: &Belief,
+    searcher: &mut Searcher,
+    cfg: &LadderConfig,
+    rng: &mut Rng,
+) -> Option<(Move, Rung)> {
+    let rung = gate(belief, &searcher.eval.material, cfg);
+    let mv = match rung {
+        Rung::R0PerfectInfo => searcher.search(g, truth, cfg.depth, cfg.node_budget).best,
+        Rung::R1Determinize => pimc(g, truth, belief, searcher, cfg, rng),
+        Rung::R2Ismcts => ismcts(g, truth, belief, searcher, cfg, rng),
+        Rung::R3Policy => policy_move(g, truth, belief, searcher, rng),
+    };
+    mv.map(|m| (m, rung))
+}
+
+/// Rung 1 — PIMC: root moves voted by average score across sampled worlds.
+fn pimc(
+    g: &GameDef,
+    truth: &mut Position,
+    belief: &Belief,
+    searcher: &mut Searcher,
+    cfg: &LadderConfig,
+    rng: &mut Rng,
+) -> Option<Move> {
+    let root_moves = legal_moves(g, truth);
+    if root_moves.is_empty() {
+        return None;
+    }
+    let mut totals = vec![0i64; root_moves.len()];
+    let mut counts = vec![0i64; root_moves.len()];
+    for _ in 0..cfg.determinizations {
+        let mut world = determinize(g, truth, belief, rng, 32);
+        let world_moves = legal_moves(g, &mut world);
+        for (i, mv) in root_moves.iter().enumerate() {
+            if !world_moves.contains(mv) {
+                continue;
+            }
+            let u = world.make(g, mv);
+            let r = searcher.search(g, &mut world, cfg.depth - 1, cfg.node_budget / 8);
+            world.unmake(g, &u);
+            totals[i] += -r.score as i64;
+            counts[i] += 1;
+        }
+    }
+    (0..root_moves.len())
+        .filter(|&i| counts[i] > 0)
+        .max_by_key(|&i| totals[i] / counts[i])
+        .or(Some(0))
+        .map(|i| root_moves[i])
+}
+
+/// Rung 2 — single-observer ISMCTS: UCT statistics per root move, a fresh
+/// consistent world per iteration, shallow eval as the leaf value.
+fn ismcts(
+    g: &GameDef,
+    truth: &mut Position,
+    belief: &Belief,
+    searcher: &mut Searcher,
+    cfg: &LadderConfig,
+    rng: &mut Rng,
+) -> Option<Move> {
+    let root_moves = legal_moves(g, truth);
+    if root_moves.is_empty() {
+        return None;
+    }
+    let n = root_moves.len();
+    let mut visits = vec![0f64; n];
+    let mut value = vec![0f64; n];
+    for it in 0..cfg.ismcts_iters {
+        let mut world = determinize(g, truth, belief, rng, 32);
+        // UCT selection over root moves legal in this world.
+        let legal: Vec<usize> = {
+            let wm = legal_moves(g, &mut world);
+            (0..n).filter(|&i| wm.contains(&root_moves[i])).collect()
+        };
+        if legal.is_empty() {
+            continue;
+        }
+        let total: f64 = legal.iter().map(|&i| visits[i]).sum::<f64>().max(1.0);
+        let pick = *legal
+            .iter()
+            .max_by(|&&a, &&b| {
+                let uct = |i: usize| {
+                    if visits[i] == 0.0 {
+                        f64::INFINITY
+                    } else {
+                        value[i] / visits[i] + 1.4 * (total.ln() / visits[i]).sqrt()
+                    }
+                };
+                uct(a).partial_cmp(&uct(b)).unwrap()
+            })
+            .unwrap();
+        let mv = root_moves[pick];
+        let u = world.make(g, &mv);
+        // Leaf value: shallow search from the opponent, negated, squashed.
+        let r = searcher.search(g, &mut world, 2, cfg.node_budget / 64);
+        world.unmake(g, &u);
+        let v = 1.0 / (1.0 + (-(-r.score as f64) / 300.0).exp());
+        visits[pick] += 1.0;
+        value[pick] += v;
+        let _ = it;
+    }
+    (0..n)
+        .max_by(|&a, &b| visits[a].partial_cmp(&visits[b]).unwrap())
+        .map(|i| root_moves[i])
+}
+
+/// Rung 3 — the search-free policy cap: softmax over one-ply eval on a
+/// sampled world, sampled with the core RNG (stochastic like DeepNash).
+/// Candidates come from the arbiter's legal set (rules-legality can depend
+/// on hidden enemy kernels — e.g. check — so the arbiter publishes what is
+/// playable, Kriegspiel-referee style); the *scoring* sees only the world.
+fn policy_move(
+    g: &GameDef,
+    truth: &mut Position,
+    belief: &Belief,
+    searcher: &mut Searcher,
+    rng: &mut Rng,
+) -> Option<Move> {
+    let mut world = determinize(g, truth, belief, rng, 32);
+    let moves = legal_moves(g, truth);
+    if moves.is_empty() {
+        return None;
+    }
+    let world_moves = legal_moves(g, &mut world);
+    let scores: Vec<f64> = moves
+        .iter()
+        .map(|mv| {
+            // A move the sampled world disallows scores neutrally.
+            if !world_moves.contains(mv) {
+                return 0.0;
+            }
+            let u = world.make(g, mv);
+            let s = -searcher.eval.stm(g, &mut world) as f64;
+            world.unmake(g, &u);
+            s / 150.0
+        })
+        .collect();
+    let max = scores.iter().cloned().fold(f64::MIN, f64::max);
+    let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+    let sum: f64 = exps.iter().sum();
+    let mut r = rng.unit_f64() * sum;
+    for (i, e) in exps.iter().enumerate() {
+        r -= e;
+        if r <= 0.0 {
+            return Some(moves[i]);
+        }
+    }
+    moves.last().copied()
+}
