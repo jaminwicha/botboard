@@ -3,9 +3,19 @@
 //! Mailbox array + piece list (§7.1, Phase-0 board class). Pieces never
 //! leave the list: capture sends them to `Dead` or to a hand (§3.2 capture
 //! fate); shogi drops re-activate hand pieces, so unmake is a pure reversal.
+//!
+//! Per-instance state (HP) lives in a parallel SoA array (§7.3), and
+//! mutable terrain in a per-cell array — both first-class in the Zobrist
+//! key (§7.5). Hit-count armor (§3.2): a capture against a piece with
+//! HP > 1 is a *strike* — the victim loses 1 HP and the attacker does not
+//! move. Abilities and compound moves apply atomically (§3.4).
 
 use crate::game::{CaptureFate, GameDef, Side, TypeId};
-use crate::moves::{Move, MoveKind, NO_SQ};
+use crate::moves::{Effect, Move, MoveKind, NO_SQ};
+
+pub const T_NONE: u8 = 0;
+pub const T_WALL: u8 = 1;
+pub const T_PIT: u8 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Loc {
@@ -29,6 +39,12 @@ pub struct Position {
     /// Mailbox: piece index or -1.
     pub board: Vec<i32>,
     pub pieces: Vec<Piece>,
+    /// SoA per-instance state (§7.3): hit points, parallel to `pieces`.
+    pub hp: Vec<i16>,
+    /// Per-cell terrain (T_NONE / T_WALL / T_PIT). Blocks entry, rays,
+    /// screens, and lame-leaper legs; flight/drill permissions are the
+    /// later path-interaction refinement (§3.1).
+    pub terrain: Vec<u8>,
     pub stm: Side,
     /// En-passant target square, or NO_SQ.
     pub ep: u16,
@@ -41,9 +57,16 @@ pub struct Undo {
     moving: usize,
     prior_t: TypeId,
     prior_moved: bool,
+    /// Where the mover actually stood before the move (strikes don't move).
+    prior_sq: u16,
     captured: Option<(usize, Piece)>,
+    /// Second-step capture of a compound.
+    captured2: Option<(usize, Piece)>,
     /// Castle partner: (index, prior square, prior moved).
     partner: Option<(usize, u16, bool)>,
+    /// (piece index, prior hp) — strikes, heals, overclock self-damage.
+    hp_changes: Vec<(usize, i16)>,
+    terrain_change: Option<(u16, u8)>,
     prior_ep: u16,
 }
 
@@ -52,6 +75,8 @@ impl Position {
         let mut pos = Position {
             board: vec![-1; g.board.ncells()],
             pieces: Vec::with_capacity(list.len()),
+            hp: Vec::with_capacity(list.len()),
+            terrain: vec![T_NONE; g.board.ncells()],
             stm,
             ep: NO_SQ,
             hands: vec![vec![0; g.types.len()]; g.sides as usize],
@@ -59,6 +84,7 @@ impl Position {
         for &(t, side, sq, moved) in list {
             pos.board[sq as usize] = pos.pieces.len() as i32;
             pos.pieces.push(Piece { t, base: t, side, loc: Loc::Board(sq), moved });
+            pos.hp.push(g.types[t as usize].max_hp);
         }
         pos
     }
@@ -81,12 +107,64 @@ impl Position {
         }
     }
 
+    /// A cell a ray/screen/leg cannot pass and a piece cannot enter.
+    #[inline]
+    pub fn cell_obstructed(&self, sq: u16) -> bool {
+        self.board[sq as usize] >= 0 || self.terrain[sq as usize] != T_NONE
+    }
+
+    /// May a piece land here (ignoring occupancy)?
+    #[inline]
+    pub fn terrain_open(&self, sq: u16) -> bool {
+        self.terrain[sq as usize] == T_NONE
+    }
+
     fn fwd(side: Side) -> i8 {
         if side == 0 {
             1
         } else {
             -1
         }
+    }
+
+    /// Apply a capture-or-strike against the occupant of `sq`.
+    /// Returns (captured record, killed).
+    fn hit(
+        &mut self,
+        g: &GameDef,
+        sq: u16,
+        undo_hp: &mut Vec<(usize, i16)>,
+    ) -> (Option<(usize, Piece)>, bool) {
+        let ci = self.board[sq as usize];
+        if ci < 0 {
+            return (None, false);
+        }
+        let ci = ci as usize;
+        if self.hp[ci] > 1 {
+            // Armor strike (§3.2): decrement HP, victim stays.
+            undo_hp.push((ci, self.hp[ci]));
+            self.hp[ci] -= 1;
+            return (None, false);
+        }
+        let prior = self.pieces[ci];
+        self.board[sq as usize] = -1;
+        match g.policy.capture_fate {
+            CaptureFate::Destroy => self.pieces[ci].loc = Loc::Dead,
+            CaptureFate::ToHand => {
+                let base = self.pieces[ci].base;
+                self.pieces[ci].t = base;
+                self.pieces[ci].side = self.stm;
+                self.pieces[ci].loc = Loc::Hand(self.stm);
+                self.hands[self.stm as usize][base as usize] += 1;
+            }
+        }
+        (Some((ci, prior)), true)
+    }
+
+    fn move_piece(&mut self, mi: usize, from: u16, to: u16) {
+        self.board[from as usize] = -1;
+        self.board[to as usize] = mi as i32;
+        self.pieces[mi].loc = Loc::Board(to);
     }
 
     pub fn make(&mut self, g: &GameDef, mv: &Move) -> Undo {
@@ -99,80 +177,123 @@ impl Position {
                 .iter()
                 .position(|p| p.loc == Loc::Hand(self.stm) && p.t == mv.drop_type)
                 .expect("drop with empty hand");
-            let u = Undo {
+            let mut u = Undo {
                 mv: *mv,
                 moving: idx,
                 prior_t: self.pieces[idx].t,
                 prior_moved: self.pieces[idx].moved,
+                prior_sq: NO_SQ,
                 captured: None,
+                captured2: None,
                 partner: None,
+                hp_changes: Vec::new(),
+                terrain_change: None,
                 prior_ep,
             };
             self.hands[self.stm as usize][mv.drop_type as usize] -= 1;
             self.pieces[idx].loc = Loc::Board(mv.to);
             self.pieces[idx].moved = true;
             self.board[mv.to as usize] = idx as i32;
+            // A dropped piece re-enters at full HP for its type.
+            if self.hp[idx] != g.types[mv.drop_type as usize].max_hp {
+                u.hp_changes.push((idx, self.hp[idx]));
+                self.hp[idx] = g.types[mv.drop_type as usize].max_hp;
+            }
             self.stm = (self.stm + 1) % g.sides;
             return u;
         }
 
         let mi = self.board[mv.from as usize] as usize;
-        let victim_sq = if mv.kind == MoveKind::EnPassant { mv.aux } else { mv.to };
-        let cap_idx = if mv.kind == MoveKind::Castle {
-            -1
-        } else {
-            self.board[victim_sq as usize]
-        };
-
         let mut u = Undo {
             mv: *mv,
             moving: mi,
             prior_t: self.pieces[mi].t,
             prior_moved: self.pieces[mi].moved,
+            prior_sq: mv.from,
             captured: None,
+            captured2: None,
             partner: None,
+            hp_changes: Vec::new(),
+            terrain_change: None,
             prior_ep,
         };
 
-        if cap_idx >= 0 && cap_idx as usize != mi {
-            let ci = cap_idx as usize;
-            u.captured = Some((ci, self.pieces[ci]));
-            self.board[victim_sq as usize] = -1;
-            match g.policy.capture_fate {
-                CaptureFate::Destroy => self.pieces[ci].loc = Loc::Dead,
-                CaptureFate::ToHand => {
-                    let base = self.pieces[ci].base;
-                    self.pieces[ci].t = base;
-                    self.pieces[ci].side = self.stm;
-                    self.pieces[ci].loc = Loc::Hand(self.stm);
-                    self.hands[self.stm as usize][base as usize] += 1;
+        match mv.kind {
+            MoveKind::Ability => {
+                match mv.effect {
+                    Effect::Heal(amount) => {
+                        let ti = self.board[mv.to as usize] as usize;
+                        u.hp_changes.push((ti, self.hp[ti]));
+                        let max = g.types[self.pieces[ti].t as usize].max_hp;
+                        self.hp[ti] = (self.hp[ti] + amount).min(max);
+                    }
+                    Effect::Wall | Effect::Pit => {
+                        u.terrain_change = Some((mv.to, self.terrain[mv.to as usize]));
+                        self.terrain[mv.to as usize] =
+                            if mv.effect == Effect::Wall { T_WALL } else { T_PIT };
+                    }
+                    Effect::Laser => {
+                        let (cap, _killed) = self.hit(g, mv.to, &mut u.hp_changes);
+                        u.captured = cap;
+                        if mv.aux != NO_SQ {
+                            // Coupled retreat (§3.4): part of the atomic script.
+                            self.move_piece(mi, mv.from, mv.aux);
+                            self.pieces[mi].moved = true;
+                        }
+                    }
+                    _ => {}
                 }
+                self.stm = (self.stm + 1) % g.sides;
+                return u;
+            }
+            MoveKind::Compound => {
+                // Overclock ⟨move, move, self −1 HP⟩ (§3.4): step 1 is a
+                // non-capture move from→to; step 2 to→aux may capture/strike.
+                self.move_piece(mi, mv.from, mv.to);
+                let (cap2, killed2) = self.hit(g, mv.aux, &mut u.hp_changes);
+                u.captured2 = cap2;
+                if killed2 || self.board[mv.aux as usize] < 0 {
+                    self.move_piece(mi, mv.to, mv.aux);
+                }
+                self.pieces[mi].moved = true;
+                u.hp_changes.push((mi, self.hp[mi]));
+                self.hp[mi] -= 1;
+                self.stm = (self.stm + 1) % g.sides;
+                return u;
+            }
+            _ => {}
+        }
+
+        let victim_sq = if mv.kind == MoveKind::EnPassant { mv.aux } else { mv.to };
+        let mut moved_to_dest = true;
+        if mv.kind != MoveKind::Castle && self.board[victim_sq as usize] >= 0 {
+            let (cap, killed) = self.hit(g, victim_sq, &mut u.hp_changes);
+            u.captured = cap;
+            if !killed && victim_sq == mv.to {
+                // Strike on an armored piece: the attacker stays put.
+                moved_to_dest = false;
             }
         }
 
-        self.board[mv.from as usize] = -1;
-        self.board[mv.to as usize] = mi as i32;
-        self.pieces[mi].loc = Loc::Board(mv.to);
-        self.pieces[mi].moved = true;
-        if let Some(pt) = mv.promo {
-            self.pieces[mi].t = pt;
+        if moved_to_dest {
+            self.move_piece(mi, mv.from, mv.to);
+            self.pieces[mi].moved = true;
+            if let Some(pt) = mv.promo {
+                self.pieces[mi].t = pt;
+            }
         }
 
         match mv.kind {
             MoveKind::DoubleStep => {
-                let (x, _) = g.board.xy(mv.from);
+                let (x, y1) = g.board.xy(mv.from);
                 let (_, y2) = g.board.xy(mv.to);
-                let (_, y1) = g.board.xy(mv.from);
-                let mid_y = (y1 + y2) / 2;
-                self.ep = g.board.sq(x as u8, mid_y as u8);
+                self.ep = g.board.sq(x as u8, ((y1 + y2) / 2) as u8);
             }
             MoveKind::Castle => {
                 let ri = self.board[mv.aux as usize] as usize;
                 let rook_to = (mv.from + mv.to) / 2;
                 u.partner = Some((ri, mv.aux, self.pieces[ri].moved));
-                self.board[mv.aux as usize] = -1;
-                self.board[rook_to as usize] = ri as i32;
-                self.pieces[ri].loc = Loc::Board(rook_to);
+                self.move_piece(ri, mv.aux, rook_to);
                 self.pieces[ri].moved = true;
             }
             _ => {}
@@ -192,7 +313,14 @@ impl Position {
             self.pieces[u.moving].loc = Loc::Hand(self.stm);
             self.pieces[u.moving].moved = u.prior_moved;
             self.hands[self.stm as usize][mv.drop_type as usize] += 1;
+            for &(i, hp) in u.hp_changes.iter().rev() {
+                self.hp[i] = hp;
+            }
             return;
+        }
+
+        if let Some((sq, prior)) = u.terrain_change {
+            self.terrain[sq as usize] = prior;
         }
 
         if let Some((ri, rsq, rmoved)) = u.partner {
@@ -203,24 +331,38 @@ impl Position {
             self.pieces[ri].moved = rmoved;
         }
 
-        self.board[mv.to as usize] = -1;
-        self.board[mv.from as usize] = u.moving as i32;
-        self.pieces[u.moving].loc = Loc::Board(mv.from);
+        // Put the mover back wherever it now stands.
+        if let Loc::Board(cur) = self.pieces[u.moving].loc {
+            if cur != u.prior_sq {
+                self.board[cur as usize] = -1;
+                self.board[u.prior_sq as usize] = u.moving as i32;
+                self.pieces[u.moving].loc = Loc::Board(u.prior_sq);
+            }
+        }
         self.pieces[u.moving].moved = u.prior_moved;
         self.pieces[u.moving].t = u.prior_t;
 
-        if let Some((ci, prior)) = u.captured {
+        // HP restores must run BEFORE captured-piece restores so a restored
+        // victim's board slot isn't clobbered (order is capture-safe: hp and
+        // board arrays are disjoint).
+        for &(i, hp) in u.hp_changes.iter().rev() {
+            self.hp[i] = hp;
+        }
+
+        for cap in [&u.captured2, &u.captured].into_iter().flatten() {
+            let (ci, prior) = *cap;
             if let Loc::Hand(s) = self.pieces[ci].loc {
                 self.hands[s as usize][self.pieces[ci].t as usize] -= 1;
             }
             self.pieces[ci] = prior;
-            let victim_sq = if mv.kind == MoveKind::EnPassant { mv.aux } else { mv.to };
-            self.board[victim_sq as usize] = ci as i32;
+            let Loc::Board(vsq) = prior.loc else { unreachable!() };
+            self.board[vsq as usize] = ci as i32;
         }
     }
 
     /// Is `sq` attacked by any piece of `by`? Target predicates see the
-    /// occupant of `sq` (empty ⇒ predicates like EnemyRoyal fail).
+    /// occupant of `sq` (empty ⇒ predicates like EnemyRoyal fail). Terrain
+    /// obstructs rays, screens, and lame-leaper legs.
     pub fn is_attacked(&self, g: &GameDef, sq: u16, by: Side) -> bool {
         use crate::bits::TargetPred;
         let (tx, ty) = g.board.xy(sq);
@@ -253,7 +395,7 @@ impl Position {
                 let blocked = k.blockers.iter().any(|b| {
                     g.board
                         .offset(psq, b.dx, b.dy)
-                        .map_or(true, |bsq| self.board[bsq as usize] >= 0)
+                        .map_or(true, |bsq| self.cell_obstructed(bsq))
                 });
                 if !blocked {
                     return true;
@@ -272,7 +414,7 @@ impl Position {
                 let mut cur = psq;
                 for _ in 1..steps {
                     cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
-                    if self.board[cur as usize] >= 0 {
+                    if self.cell_obstructed(cur) {
                         continue 'ride;
                     }
                 }
@@ -292,6 +434,9 @@ impl Position {
                 let mut cur = psq;
                 for _ in 1..steps {
                     cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
+                    if self.terrain[cur as usize] != T_NONE {
+                        continue 'hop; // terrain is not a screen; it blocks
+                    }
                     if self.board[cur as usize] >= 0 {
                         screens += 1;
                         if screens > 1 {

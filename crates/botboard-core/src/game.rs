@@ -1,7 +1,7 @@
 //! Game definition: board, zones, piece types, policy layer, and the
 //! compile step from authoring Bits to runtime kernels (spec §5, §7.3).
 
-use crate::bits::{Geometry, Mode, MoveBit, PathRule, SpecialBit, TargetPred};
+use crate::bits::{AbilityBit, Geometry, Mode, MoveBit, PathRule, SpecialBit, TargetPred};
 use crate::geometry::{symmetric_deltas, Delta};
 
 pub type Side = u8;
@@ -135,6 +135,7 @@ pub struct PieceTypeDef {
     pub glyph: char,
     pub bits: Vec<MoveBit>,
     pub specials: Vec<SpecialBit>,
+    pub abilities: Vec<AbilityBit>,
     pub royal: bool,
     pub promo: Option<PromoRule>,
     /// May be the rook half of a castling compound.
@@ -146,6 +147,13 @@ pub struct PieceTypeDef {
     /// Named legality predicate *uchifuzume*: no drop that delivers immediate
     /// checkmate (§5).
     pub drop_no_mate: bool,
+    /// Hit-count armor (§3.2): captures strike for 1 HP; the piece falls at
+    /// 0. HP lives in per-instance SoA state (§7.3), hashed via the state
+    /// bucket (§7.5).
+    pub max_hp: i16,
+    /// Multi-action Bit (§3.4): compiles into ⟨move, move, self −1 HP⟩
+    /// compound moves — piece-local, atomic, priced ×1.8 (§4.1).
+    pub overclock: bool,
 }
 
 impl PieceTypeDef {
@@ -155,16 +163,31 @@ impl PieceTypeDef {
             glyph,
             bits,
             specials: Vec::new(),
+            abilities: Vec::new(),
             royal: false,
             promo: None,
             castle_partner: false,
             droppable: false,
             drop_no_dup_file: false,
             drop_no_mate: false,
+            max_hp: 1,
+            overclock: false,
         }
     }
     pub fn specials(mut self, s: Vec<SpecialBit>) -> Self {
         self.specials = s;
+        self
+    }
+    pub fn abilities(mut self, a: Vec<AbilityBit>) -> Self {
+        self.abilities = a;
+        self
+    }
+    pub fn hp(mut self, hp: i16) -> Self {
+        self.max_hp = hp;
+        self
+    }
+    pub fn overclock(mut self) -> Self {
+        self.overclock = true;
         self
     }
     pub fn royal(mut self) -> Self {

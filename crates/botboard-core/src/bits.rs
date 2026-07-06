@@ -122,3 +122,16 @@ pub enum SpecialBit {
     /// Standard castling with an unmoved `castle_partner` rook on the same rank.
     Castling,
 }
+
+/// Axis-B ability Bits (§3.2, §3.4): effects invoked *as* the turn's single
+/// action. Ranges are chebyshev for point-targeted effects; the laser
+/// targets along rays like a bounded rider, capturing without vacating the
+/// origin. `retreat` is the coupled nerf: a forced 1-step retreat away from
+/// the target, and the whole compound is illegal if that square is blocked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbilityBit {
+    Heal { amount: i16, range: u8 },
+    CreateWall { range: u8 },
+    DigPit { range: u8 },
+    Laser { range: u8, retreat: bool },
+}

@@ -6,9 +6,9 @@
 //! legality runs the three tiers of §3.3: empty target, derivable
 //! can-act-from, and the named predicates (*nifu*, *uchifuzume*).
 
-use crate::bits::{SpecialBit, TargetPred};
+use crate::bits::{AbilityBit, SpecialBit, TargetPred};
 use crate::game::{GameDef, PromoTrigger, Side, StalematePolicy, TypeId};
-use crate::moves::{Move, MoveKind, NO_SQ};
+use crate::moves::{Effect, Move, MoveKind, NO_SQ};
 use crate::position::{Loc, Position};
 
 /// Expand a landing into promotion variants per the type's promo rule.
@@ -34,14 +34,22 @@ fn push_with_promo(
             // when the unpromoted piece could never act from the destination.
             let forced = !pr.optional || !g.compiled(t, side).can_act_from[to as usize];
             for &c in &pr.choices {
-                out.push(Move { from, to, kind, promo: Some(c), drop_type: 0, aux });
+                out.push(Move {
+                    from,
+                    to,
+                    kind,
+                    promo: Some(c),
+                    drop_type: 0,
+                    aux,
+                    effect: Effect::None,
+                });
             }
             if forced {
                 return;
             }
         }
     }
-    out.push(Move { from, to, kind, promo: None, drop_type: 0, aux });
+    out.push(Move { from, to, kind, promo: None, drop_type: 0, aux, effect: Effect::None });
 }
 
 pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
@@ -68,13 +76,13 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
                 continue;
             }
             let Some(to) = g.board.offset(from, k.d.dx, k.d.dy) else { continue };
-            if !zone_ok(k.to_zone, to) {
+            if !zone_ok(k.to_zone, to) || !pos.terrain_open(to) {
                 continue;
             }
             let blocked = k.blockers.iter().any(|b| {
                 g.board
                     .offset(from, b.dx, b.dy)
-                    .map_or(true, |bsq| pos.board[bsq as usize] >= 0)
+                    .map_or(true, |bsq| pos.cell_obstructed(bsq))
             });
             if blocked {
                 continue;
@@ -99,7 +107,7 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
             }
             let mut cur = from;
             while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
-                if !zone_ok(k.to_zone, to) {
+                if !zone_ok(k.to_zone, to) || !pos.terrain_open(to) {
                     break;
                 }
                 match pos.piece_at(to) {
@@ -130,6 +138,9 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
             let mut cur = from;
             let mut screened = false;
             while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
+                if !pos.terrain_open(to) {
+                    break; // terrain blocks; it is never a screen
+                }
                 match pos.piece_at(to) {
                     None => cur = to,
                     Some(v) => {
@@ -150,6 +161,11 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
             }
         }
 
+        gen_abilities(g, pos, p.t, from, &mut out);
+        if g.types[p.t as usize].overclock && pos.hp[pos.board[from as usize] as usize] > 1 {
+            gen_overclock(g, pos, from, &mut out);
+        }
+
         for s in &g.types[p.t as usize].specials {
             match s {
                 SpecialBit::DoubleStep { start_zone } => {
@@ -159,7 +175,7 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
                     let f = Position::forward(stm);
                     let Some(mid) = g.board.offset(from, 0, f) else { continue };
                     let Some(to) = g.board.offset(from, 0, 2 * f) else { continue };
-                    if pos.board[mid as usize] < 0 && pos.board[to as usize] < 0 {
+                    if !pos.cell_obstructed(mid) && !pos.cell_obstructed(to) {
                         out.push(Move::special(from, to, MoveKind::DoubleStep, NO_SQ));
                     }
                 }
@@ -197,7 +213,7 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
         }
         let ck = g.compiled(t, stm);
         for sq in 0..g.board.ncells() as u16 {
-            if pos.board[sq as usize] >= 0 || !ck.can_act_from[sq as usize] {
+            if pos.cell_obstructed(sq) || !ck.can_act_from[sq as usize] {
                 continue;
             }
             if g.types[t as usize].drop_no_dup_file {
@@ -240,7 +256,7 @@ fn gen_castles(g: &GameDef, pos: &Position, ksq: u16, out: &mut Vec<Move>) {
             if cur == rsq {
                 break;
             }
-            if pos.board[cur as usize] >= 0 {
+            if pos.cell_obstructed(cur) {
                 clear = false;
                 break;
             }
@@ -262,6 +278,171 @@ fn gen_castles(g: &GameDef, pos: &Position, ksq: u16, out: &mut Vec<Move>) {
         }
         out.push(Move::special(ksq, dest, MoveKind::Castle, rsq));
     }
+}
+
+/// Ability actions (§3.4): one Axis-B effect as the turn's single action.
+fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Vec<Move>) {
+    let stm = pos.stm;
+    let (fx, fy) = g.board.xy(from);
+    for a in &g.types[t as usize].abilities {
+        match *a {
+            AbilityBit::Heal { amount, range } => {
+                for p in &pos.pieces {
+                    let Loc::Board(sq) = p.loc else { continue };
+                    if p.side != stm {
+                        continue;
+                    }
+                    let idx = pos.board[sq as usize] as usize;
+                    if pos.hp[idx] >= g.types[p.t as usize].max_hp {
+                        continue;
+                    }
+                    let (x, y) = g.board.xy(sq);
+                    if (x - fx).abs().max((y - fy).abs()) as u8 <= range {
+                        out.push(Move::ability(from, sq, Effect::Heal(amount), NO_SQ));
+                    }
+                }
+            }
+            AbilityBit::CreateWall { range } | AbilityBit::DigPit { range } => {
+                let eff = if matches!(a, AbilityBit::CreateWall { .. }) {
+                    Effect::Wall
+                } else {
+                    Effect::Pit
+                };
+                for sq in 0..g.board.ncells() as u16 {
+                    if sq == from || pos.cell_obstructed(sq) {
+                        continue;
+                    }
+                    let (x, y) = g.board.xy(sq);
+                    if (x - fx).abs().max((y - fy).abs()) as u8 <= range {
+                        out.push(Move::ability(from, sq, eff, NO_SQ));
+                    }
+                }
+            }
+            AbilityBit::Laser { range, retreat } => {
+                // A bounded capture-at-range rider that never vacates the
+                // origin (§3.2 ranged effects).
+                for (dx, dy) in
+                    [(0i8, 1i8), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+                {
+                    let mut cur = from;
+                    for _ in 0..range {
+                        let Some(nsq) = g.board.offset(cur, dx, dy) else { break };
+                        if !pos.terrain_open(nsq) {
+                            break;
+                        }
+                        if let Some(v) = pos.piece_at(nsq) {
+                            if v.side != stm {
+                                let aux = if retreat {
+                                    // Coupled nerf: forced 1-step retreat away
+                                    // from the target; illegal if blocked —
+                                    // "the nerf has teeth" (§3.4).
+                                    match g.board.offset(from, -dx, -dy) {
+                                        Some(r)
+                                            if pos.board[r as usize] < 0
+                                                && pos.terrain_open(r) =>
+                                        {
+                                            r
+                                        }
+                                        _ => break,
+                                    }
+                                } else {
+                                    NO_SQ
+                                };
+                                out.push(Move::ability(from, nsq, Effect::Laser, aux));
+                            }
+                            break;
+                        }
+                        cur = nsq;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Overclock compound moves (§3.4): enumerate legal ⟨move, move⟩ pairs by
+/// actually applying step 1 — branching inflation is paid exactly where the
+/// Bit occurs (piece-local), never globally. Step 1 is a quiet move; step 2
+/// may capture or strike. Skipped at 1 HP (the self-damage would be lethal).
+fn gen_overclock(g: &GameDef, pos: &Position, from: u16, out: &mut Vec<Move>) {
+    let mut tmp = pos.clone();
+    let firsts: Vec<Move> = {
+        let all = pseudo_kernel_moves_of(g, &tmp, from);
+        all.into_iter()
+            .filter(|m| m.kind == MoveKind::Normal && tmp.board[m.to as usize] < 0)
+            .collect()
+    };
+    for f in firsts {
+        let u = tmp.make(g, &f);
+        tmp.stm = pos.stm; // same piece acts again within the compound
+        for s in pseudo_kernel_moves_of(g, &tmp, f.to) {
+            if s.kind == MoveKind::Normal {
+                out.push(Move::compound(from, f.to, s.to));
+            }
+        }
+        tmp.stm = (pos.stm + 1) % g.sides;
+        tmp.unmake(g, &u);
+    }
+}
+
+/// Kernel-only pseudo moves of the piece standing on `from` (no specials,
+/// abilities, drops, or nested compounds).
+fn pseudo_kernel_moves_of(g: &GameDef, pos: &Position, from: u16) -> Vec<Move> {
+    let Some(p) = pos.piece_at(from) else { return Vec::new() };
+    if p.side != pos.stm {
+        return Vec::new();
+    }
+    let stm = pos.stm;
+    let ck = g.compiled(p.t, stm);
+    let zone_ok = |z: Option<usize>, at: u16| z.map_or(true, |zi| g.zones[zi].contains(stm, at));
+    let mut out = Vec::new();
+    for k in &ck.leaps {
+        if !zone_ok(k.from_zone, from) {
+            continue;
+        }
+        let Some(to) = g.board.offset(from, k.d.dx, k.d.dy) else { continue };
+        if !zone_ok(k.to_zone, to) || !pos.terrain_open(to) {
+            continue;
+        }
+        if k.blockers.iter().any(|b| {
+            g.board.offset(from, b.dx, b.dy).map_or(true, |bsq| pos.cell_obstructed(bsq))
+        }) {
+            continue;
+        }
+        match pos.piece_at(to) {
+            None if k.mode.can_move() => out.push(Move::normal(from, to)),
+            Some(v) if v.side != stm && k.mode.can_capture() => {
+                out.push(Move::normal(from, to))
+            }
+            _ => {}
+        }
+    }
+    for k in &ck.rides {
+        if !zone_ok(k.from_zone, from) {
+            continue;
+        }
+        let mut cur = from;
+        while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
+            if !zone_ok(k.to_zone, to) || !pos.terrain_open(to) {
+                break;
+            }
+            match pos.piece_at(to) {
+                None => {
+                    if k.mode.can_move() {
+                        out.push(Move::normal(from, to));
+                    }
+                    cur = to;
+                }
+                Some(v) => {
+                    if v.side != stm && k.mode.can_capture() {
+                        out.push(Move::normal(from, to));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Full legality: make, verify own royal safety, apply *uchifuzume*, unmake.

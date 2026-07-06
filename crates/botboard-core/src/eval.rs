@@ -25,12 +25,17 @@ impl Eval {
         Eval { material, mobility_cp: MOBILITY_CP }
     }
 
-    /// Per-player score vector (the value-head shape, §7.4).
+    /// Per-player score vector (the value-head shape, §7.4). Armored pieces
+    /// count HP-proportionally so strikes register as progress.
     pub fn players(&self, g: &GameDef, pos: &mut Position) -> Vec<i32> {
         let mut score = vec![0i32; g.sides as usize];
-        for p in &pos.pieces {
+        for (i, p) in pos.pieces.iter().enumerate() {
             match p.loc {
-                Loc::Board(_) => score[p.side as usize] += self.material[p.t as usize],
+                Loc::Board(_) => {
+                    let max = g.types[p.t as usize].max_hp.max(1) as i32;
+                    let v = self.material[p.t as usize];
+                    score[p.side as usize] += v * pos.hp[i].max(0) as i32 / max;
+                }
                 Loc::Hand(s) => score[s as usize] += self.material[p.t as usize],
                 Loc::Dead => {}
             }

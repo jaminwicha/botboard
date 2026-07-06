@@ -92,16 +92,32 @@ pub struct Anchor {
 }
 
 /// C_prior = max(1, C_base × M_utility − S_nerfs) + Σ synergy (§4.1).
-/// Phase-1 content has no utility/nerf Bits yet, so those terms are the
-/// identity; the hooks stay so later Bits (armor, multi-action ×1.8) price in.
+/// Utility multipliers per §4.1: armor 1 + 0.5(HP−1); multi-action
+/// (overclock compound) ×1.8 initial prior. Coupled nerfs (the laser's
+/// forced retreat) price via S_nerfs; ability mobility (laser reach, wall/
+/// pit/heal targets) already flows through the measured integral because
+/// abilities are generated moves. Synergy weights ship 0 until self-play
+/// fits them (§4.3).
 pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
     if g.types[t as usize].royal {
         return 0.0; // royalty is priceless, not priced (§5 royalty policy)
     }
+    let ty = &g.types[t as usize];
     let m = mobility_integral(g, t, 0);
     let c_base = m.avg_moved * w.w_move + m.avg_attacked * w.w_attack;
-    let m_utility = 1.0;
-    let s_nerfs = 0.0;
+    let mut m_utility = 1.0;
+    if ty.max_hp > 1 {
+        m_utility *= 1.0 + 0.5 * (ty.max_hp as f64 - 1.0);
+    }
+    if ty.overclock {
+        m_utility *= 1.8;
+    }
+    let mut s_nerfs = 0.0;
+    for a in &ty.abilities {
+        if let crate::bits::AbilityBit::Laser { retreat: true, .. } = a {
+            s_nerfs += 0.5;
+        }
+    }
     (c_base * m_utility - s_nerfs).max(1.0)
 }
 

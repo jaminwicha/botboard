@@ -12,6 +12,25 @@ pub enum MoveKind {
     EnPassant,
     Castle,
     Drop,
+    /// An Axis-B effect invoked as the turn's single action (§3.4).
+    Ability,
+    /// A multi-step effect script generated as ONE move (§3.4): atomic,
+    /// piece-local. Overclock: from→to then to→aux, self −1 HP.
+    Compound,
+}
+
+/// Which Axis-B effect an Ability/Compound move applies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Effect {
+    None,
+    Heal(i16),
+    Wall,
+    Pit,
+    /// Capture at range without vacating the origin; `aux` holds the forced
+    /// retreat square (NO_SQ when the laser has no coupled retreat).
+    Laser,
+    /// Act-twice: second-step destination in `aux`, self −1 HP.
+    Twice,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -23,23 +42,38 @@ pub struct Move {
     pub promo: Option<TypeId>,
     /// Only meaningful when `kind == Drop`.
     pub drop_type: TypeId,
-    /// Auxiliary square: the victim square for en passant, the rook's
-    /// origin square for castling; `NO_SQ` otherwise.
+    /// Auxiliary square: en-passant victim, castling rook origin, compound
+    /// second step, or laser retreat; `NO_SQ` otherwise.
     pub aux: u16,
+    pub effect: Effect,
 }
 
 impl Move {
     pub fn normal(from: u16, to: u16) -> Self {
-        Move { from, to, kind: MoveKind::Normal, promo: None, drop_type: 0, aux: NO_SQ }
+        Move {
+            from,
+            to,
+            kind: MoveKind::Normal,
+            promo: None,
+            drop_type: 0,
+            aux: NO_SQ,
+            effect: Effect::None,
+        }
     }
     pub fn promo(from: u16, to: u16, t: TypeId) -> Self {
-        Move { from, to, kind: MoveKind::Normal, promo: Some(t), drop_type: 0, aux: NO_SQ }
+        Move { promo: Some(t), ..Self::normal(from, to) }
     }
     pub fn special(from: u16, to: u16, kind: MoveKind, aux: u16) -> Self {
-        Move { from, to, kind, promo: None, drop_type: 0, aux }
+        Move { kind, aux, ..Self::normal(from, to) }
     }
     pub fn drop(t: TypeId, to: u16) -> Self {
-        Move { from: NO_SQ, to, kind: MoveKind::Drop, promo: None, drop_type: t, aux: NO_SQ }
+        Move { from: NO_SQ, kind: MoveKind::Drop, drop_type: t, ..Self::normal(NO_SQ, to) }
+    }
+    pub fn ability(from: u16, to: u16, effect: Effect, aux: u16) -> Self {
+        Move { kind: MoveKind::Ability, effect, aux, ..Self::normal(from, to) }
+    }
+    pub fn compound(from: u16, to: u16, second: u16) -> Self {
+        Move { kind: MoveKind::Compound, effect: Effect::Twice, aux: second, ..Self::normal(from, to) }
     }
 }
 
@@ -48,13 +82,35 @@ pub fn sq_name(g: &GameDef, sq: u16) -> String {
     format!("{}{}", (b'a' + x as u8) as char, y + 1)
 }
 
-/// UCI-ish notation for perft divide and the CLI: "e2e4", "e7e8q", "P@e5".
+/// UCI-ish notation for perft divide and the CLI: "e2e4", "e7e8q", "P@e5",
+/// abilities "e2!heal:e3", compounds "e2e4+e4e5".
 pub fn move_str(g: &GameDef, mv: &Move) -> String {
     match mv.kind {
         MoveKind::Drop => format!(
             "{}@{}",
             g.types[mv.drop_type as usize].glyph,
             sq_name(g, mv.to)
+        ),
+        MoveKind::Ability => {
+            let name = match mv.effect {
+                Effect::Heal(_) => "heal",
+                Effect::Wall => "wall",
+                Effect::Pit => "pit",
+                Effect::Laser => "laser",
+                _ => "fx",
+            };
+            let mut s = format!("{}!{}:{}", sq_name(g, mv.from), name, sq_name(g, mv.to));
+            if mv.aux != NO_SQ {
+                s.push_str(&format!(">{}", sq_name(g, mv.aux)));
+            }
+            s
+        }
+        MoveKind::Compound => format!(
+            "{}{}+{}{}",
+            sq_name(g, mv.from),
+            sq_name(g, mv.to),
+            sq_name(g, mv.to),
+            sq_name(g, mv.aux)
         ),
         _ => {
             let mut s = format!("{}{}", sq_name(g, mv.from), sq_name(g, mv.to));
