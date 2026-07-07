@@ -250,11 +250,45 @@ pub struct HopK {
     pub target: TargetPred,
 }
 
+/// Wide-bitboard kernels (§7.1's bounded-mid-size class, portable u128
+/// form): one register holds any board up to 128 cells, so chess (64),
+/// shogi (81), and xiangqi (90) all ride the same fast path. Only *plain*
+/// kernels (no zones, no target predicate) compile here; the rest stay on
+/// the mailbox path — representation per kernel behind one abstraction.
+#[derive(Clone, Debug)]
+pub struct LeapBB {
+    pub to: u16,
+    /// Cells that must be empty (lame-leaper legs), as a mask.
+    pub blockers: u128,
+    pub mode: Mode,
+}
+
+#[derive(Clone, Debug)]
+pub struct RideBB {
+    pub mode: Mode,
+    /// True when the per-step bit offset is positive (blocker = trailing
+    /// one), false for negative (blocker = leading one).
+    pub positive: bool,
+    /// rays[sq] = cells reachable from sq along this delta, excluding sq.
+    pub rays: Vec<u128>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CompiledBB {
+    /// leaps[sq] = precomputed landings from sq (plain kernels only).
+    pub leaps: Vec<Vec<LeapBB>>,
+    pub rides: Vec<RideBB>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Compiled {
     pub leaps: Vec<LeapK>,
     pub rides: Vec<RideK>,
     pub hops: Vec<HopK>,
+    /// Parallel to `leaps`/`rides`: kernel is covered by the bitboard path.
+    pub leap_plain: Vec<bool>,
+    pub ride_plain: Vec<bool>,
+    pub bb: Option<CompiledBB>,
     /// Per square: could this type ever act from here on an empty board?
     /// Drives drop legality tier 2 and forced-if-immobile promotion.
     pub can_act_from: Vec<bool>,
@@ -276,6 +310,9 @@ pub struct GameDef {
     compiled: Vec<Compiled>,
     /// Ground-truth hashing tables (§7.5), deterministic per game shape.
     pub zobrist: crate::zobrist::Zobrist,
+    /// Dispatch to the wide-bitboard movegen path (auto for ≤128 cells;
+    /// switchable for the Prototype-1 crossover measurement, §12).
+    pub use_bitboards: bool,
 }
 
 impl GameDef {
@@ -288,6 +325,13 @@ impl GameDef {
         start: Vec<(TypeId, Side, u8, u8)>,
     ) -> Self {
         let zobrist = crate::zobrist::Zobrist::for_shape(board.ncells(), types.len(), sides);
+        // Prototype 1's measured answer (§7.1, §12): the tuned mailbox beats
+        // the portable u128 bitboard class at every tested size (0.80–0.93x
+        // for bitboards), confirming the expert position the spec cites.
+        // Mailbox is therefore the default; the bitboard class stays
+        // selectable (and perft-equivalence-tested) for re-measurement on
+        // hardware with native wide-SIMD.
+        let use_bitboards = false;
         let mut g = GameDef {
             board,
             sides,
@@ -297,6 +341,7 @@ impl GameDef {
             start,
             compiled: Vec::new(),
             zobrist,
+            use_bitboards,
         };
         g.compile();
         g
@@ -368,9 +413,61 @@ impl GameDef {
                 }
             }
         }
+        // Wide-bitboard tables for plain kernels (§7.1): no zones, no
+        // target predicate — everything else stays on the mailbox path.
+        let n = self.board.ncells();
+        if n <= 128 {
+            let plain_leap = |k: &LeapK| {
+                k.from_zone.is_none() && k.to_zone.is_none() && k.target == TargetPred::Any
+            };
+            let plain_ride = |k: &RideK| {
+                k.from_zone.is_none() && k.to_zone.is_none() && k.target == TargetPred::Any
+            };
+            ck.leap_plain = ck.leaps.iter().map(plain_leap).collect();
+            ck.ride_plain = ck.rides.iter().map(plain_ride).collect();
+            let mut bb = CompiledBB { leaps: vec![Vec::new(); n], rides: Vec::new() };
+            for (ki, k) in ck.leaps.iter().enumerate() {
+                if !ck.leap_plain[ki] {
+                    continue;
+                }
+                for sq in 0..n as u16 {
+                    let Some(to) = self.board.offset(sq, k.d.dx, k.d.dy) else { continue };
+                    let mut blockers = 0u128;
+                    let mut off_board = false;
+                    for b in &k.blockers {
+                        match self.board.offset(sq, b.dx, b.dy) {
+                            Some(bsq) => blockers |= 1u128 << bsq,
+                            None => off_board = true,
+                        }
+                    }
+                    if !off_board {
+                        bb.leaps[sq as usize].push(LeapBB { to, blockers, mode: k.mode });
+                    }
+                }
+            }
+            for (ki, k) in ck.rides.iter().enumerate() {
+                if !ck.ride_plain[ki] {
+                    continue;
+                }
+                let mut rays = vec![0u128; n];
+                for sq in 0..n as u16 {
+                    let mut cur = sq;
+                    while let Some(nx) = self.board.offset(cur, k.d.dx, k.d.dy) {
+                        rays[sq as usize] |= 1u128 << nx;
+                        cur = nx;
+                    }
+                }
+                let positive = (k.d.dy as i32 * self.board.w as i32 + k.d.dx as i32) > 0;
+                bb.rides.push(RideBB { mode: k.mode, positive, rays });
+            }
+            ck.bb = Some(bb);
+        } else {
+            ck.leap_plain = vec![false; ck.leaps.len()];
+            ck.ride_plain = vec![false; ck.rides.len()];
+        }
+
         // Reachability on an empty board. Hoppers need a screen, so they
         // cannot contribute here.
-        let n = self.board.ncells();
         ck.can_act_from = (0..n as u16)
             .map(|sq| {
                 let zone_ok = |z: Option<usize>, at: u16| {

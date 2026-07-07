@@ -270,23 +270,33 @@ fn cmd_armies(args: &[String]) {
     println!("legal moves from start: {}", legal_moves(&g, &mut pos).len());
 }
 
-/// Prototype 1 harness (spec §7.1/§12): movegen throughput per board class
-/// on the current representation; the wide-SIMD bitboard class plugs into
-/// the same harness to find the crossover empirically.
+/// Prototype 1 (spec §7.1/§12): the representation crossover, measured.
+/// Runs perft per variant on both board classes — mailbox+piece-list vs the
+/// wide-bitboard (u128) kernel path — and reports the speedup.
 fn cmd_bench() {
-    println!("{:<10} {:>7} {:>12} {:>10}", "variant", "cells", "perft-nodes", "kn/s");
+    println!(
+        "{:<10} {:>7} {:>12} {:>12} {:>12} {:>8}",
+        "variant", "cells", "perft-nodes", "mailbox kn/s", "bitboard kn/s", "speedup"
+    );
     for (name, depth) in [("chess", 5u32), ("xiangqi", 4), ("shogi", 4)] {
-        let g = game_for(name);
-        let mut pos = Position::startpos(&g);
-        let t0 = Instant::now();
-        let n = perft(&g, &mut pos, depth);
-        let dt = t0.elapsed().as_secs_f64();
+        let mut g = game_for(name);
+        let mut rates = [0f64; 2];
+        let mut nodes = 0;
+        for (i, use_bb) in [(0usize, false), (1, true)] {
+            g.use_bitboards = use_bb;
+            let mut pos = Position::startpos(&g);
+            let t0 = Instant::now();
+            nodes = perft(&g, &mut pos, depth);
+            rates[i] = nodes as f64 / t0.elapsed().as_secs_f64() / 1000.0;
+        }
         println!(
-            "{:<10} {:>7} {:>12} {:>10.0}",
+            "{:<10} {:>7} {:>12} {:>12.0} {:>12.0} {:>7.2}x",
             name,
             g.board.ncells(),
-            n,
-            n as f64 / dt / 1000.0
+            nodes,
+            rates[0],
+            rates[1],
+            rates[1] / rates[0]
         );
     }
 }

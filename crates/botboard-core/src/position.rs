@@ -57,6 +57,13 @@ pub struct Position {
     pub hands: Vec<Vec<u8>>,
     /// Incrementally-maintained full ground-truth Zobrist key (§7.5).
     pub hash: u64,
+    /// Wide-bitboard occupancy mirrors (boards ≤ 128 cells): the mailbox
+    /// stays the source of truth; these are maintained at the same
+    /// mutation sites and debug-asserted against it.
+    pub occ_all: u128,
+    pub occ_side: Vec<u128>,
+    pub terrain_mask: u128,
+    wide: bool,
 }
 
 pub struct Undo {
@@ -89,11 +96,19 @@ impl Position {
             ep: NO_SQ,
             hands: vec![vec![0; g.types.len()]; g.sides as usize],
             hash: 0,
+            occ_all: 0,
+            occ_side: vec![0; g.sides as usize],
+            terrain_mask: 0,
+            wide: g.use_bitboards && g.board.ncells() <= 128,
         };
         for &(t, side, sq, moved) in list {
             pos.board[sq as usize] = pos.pieces.len() as i32;
             pos.pieces.push(Piece { t, base: t, side, loc: Loc::Board(sq), moved });
             pos.hp.push(g.types[t as usize].max_hp);
+            if pos.wide {
+                pos.occ_all |= 1u128 << sq;
+                pos.occ_side[side as usize] |= 1u128 << sq;
+            }
         }
         pos.hash = g.zobrist.full_hash(&pos);
         pos
@@ -108,10 +123,31 @@ impl Position {
         Self::from_pieces(g, &list, 0)
     }
 
-    /// Re-derive the incremental key after out-of-band edits (tests,
-    /// determinization, manual setup).
+    /// Re-derive the incremental key and occupancy mirrors after
+    /// out-of-band edits (tests, determinization, manual setup).
     pub fn rehash(&mut self, g: &GameDef) {
         self.hash = g.zobrist.full_hash(self);
+        if self.wide {
+            self.occ_all = 0;
+            self.occ_side.iter_mut().for_each(|m| *m = 0);
+            self.terrain_mask = 0;
+            for p in self.pieces.iter() {
+                if let Loc::Board(sq) = p.loc {
+                    self.occ_all |= 1u128 << sq;
+                }
+            }
+            for (i, p) in self.pieces.iter().enumerate() {
+                let _ = i;
+                if let Loc::Board(sq) = p.loc {
+                    self.occ_side[p.side as usize] |= 1u128 << sq;
+                }
+            }
+            for sq in 0..self.terrain.len() {
+                if self.terrain[sq] != T_NONE {
+                    self.terrain_mask |= 1u128 << sq;
+                }
+            }
+        }
     }
 
     pub fn piece_at(&self, sq: u16) -> Option<&Piece> {
@@ -170,6 +206,39 @@ impl Position {
     #[inline]
     fn xor_terrain(&mut self, g: &GameDef, sq: u16) {
         self.hash ^= g.zobrist.terrain_key(self.terrain[sq as usize], sq as usize);
+    }
+
+    /// Put piece `i` on `sq` (mailbox + masks + loc).
+    #[inline]
+    fn place(&mut self, i: usize, sq: u16) {
+        self.board[sq as usize] = i as i32;
+        self.pieces[i].loc = Loc::Board(sq);
+        if self.wide {
+            self.occ_all |= 1u128 << sq;
+            self.occ_side[self.pieces[i].side as usize] |= 1u128 << sq;
+        }
+    }
+
+    /// Remove piece `i` from `sq` (mailbox + masks; caller sets loc).
+    #[inline]
+    fn lift(&mut self, i: usize, sq: u16) {
+        self.board[sq as usize] = -1;
+        if self.wide {
+            self.occ_all &= !(1u128 << sq);
+            self.occ_side[self.pieces[i].side as usize] &= !(1u128 << sq);
+        }
+    }
+
+    #[inline]
+    fn set_terrain(&mut self, sq: u16, t: u8) {
+        self.terrain[sq as usize] = t;
+        if self.wide {
+            if t == T_NONE {
+                self.terrain_mask &= !(1u128 << sq);
+            } else {
+                self.terrain_mask |= 1u128 << sq;
+            }
+        }
     }
 
     #[inline]
@@ -235,7 +304,7 @@ impl Position {
         }
         let prior = self.pieces[ci];
         self.xor_piece(g, ci);
-        self.board[sq as usize] = -1;
+        self.lift(ci, sq);
         match g.policy.capture_fate {
             CaptureFate::Destroy => self.pieces[ci].loc = Loc::Dead,
             CaptureFate::ToHand => {
@@ -253,9 +322,8 @@ impl Position {
     }
 
     fn move_piece(&mut self, mi: usize, from: u16, to: u16) {
-        self.board[from as usize] = -1;
-        self.board[to as usize] = mi as i32;
-        self.pieces[mi].loc = Loc::Board(to);
+        self.lift(mi, from);
+        self.place(mi, to);
     }
 
     pub fn make(&mut self, g: &GameDef, mv: &Move) -> Undo {
@@ -267,6 +335,16 @@ impl Position {
             g.zobrist.full_hash(self),
             "incremental hash diverged on {mv:?}"
         );
+        #[cfg(debug_assertions)]
+        if self.wide {
+            let mut occ = 0u128;
+            for p in &self.pieces {
+                if let Loc::Board(sq) = p.loc {
+                    occ |= 1u128 << sq;
+                }
+            }
+            debug_assert_eq!(self.occ_all, occ, "occupancy mirror diverged on {mv:?}");
+        }
         u
     }
 
@@ -300,9 +378,8 @@ impl Position {
             self.hands[self.stm as usize][mv.drop_type as usize] -= 1;
             self.xor_hand(g, self.stm as usize, mv.drop_type as usize);
             // From hand (no key) to board (keyed): single trailing XOR.
-            self.pieces[idx].loc = Loc::Board(mv.to);
+            self.place(idx, mv.to);
             self.pieces[idx].moved = true;
-            self.board[mv.to as usize] = idx as i32;
             // A dropped piece re-enters at full HP for its type.
             if self.hp[idx] != g.types[mv.drop_type as usize].max_hp {
                 u.hp_changes.push((idx, self.hp[idx]));
@@ -343,8 +420,10 @@ impl Position {
                     Effect::Wall | Effect::Pit => {
                         u.terrain_change = Some((mv.to, self.terrain[mv.to as usize]));
                         self.xor_terrain(g, mv.to);
-                        self.terrain[mv.to as usize] =
-                            if mv.effect == Effect::Wall { T_WALL } else { T_PIT };
+                        self.set_terrain(
+                            mv.to,
+                            if mv.effect == Effect::Wall { T_WALL } else { T_PIT },
+                        );
                         self.xor_terrain(g, mv.to);
                     }
                     Effect::Laser => {
@@ -435,7 +514,7 @@ impl Position {
         let mv = &u.mv;
 
         if mv.kind == MoveKind::Drop {
-            self.board[mv.to as usize] = -1;
+            self.lift(u.moving, mv.to);
             self.pieces[u.moving].loc = Loc::Hand(self.stm);
             self.pieces[u.moving].moved = u.prior_moved;
             self.hands[self.stm as usize][mv.drop_type as usize] += 1;
@@ -447,23 +526,21 @@ impl Position {
         }
 
         if let Some((sq, prior)) = u.terrain_change {
-            self.terrain[sq as usize] = prior;
+            self.set_terrain(sq, prior);
         }
 
         if let Some((ri, rsq, rmoved)) = u.partner {
             let rook_to = (mv.from + mv.to) / 2;
-            self.board[rook_to as usize] = -1;
-            self.board[rsq as usize] = ri as i32;
-            self.pieces[ri].loc = Loc::Board(rsq);
+            self.lift(ri, rook_to);
+            self.place(ri, rsq);
             self.pieces[ri].moved = rmoved;
         }
 
         // Put the mover back wherever it now stands.
         if let Loc::Board(cur) = self.pieces[u.moving].loc {
             if cur != u.prior_sq {
-                self.board[cur as usize] = -1;
-                self.board[u.prior_sq as usize] = u.moving as i32;
-                self.pieces[u.moving].loc = Loc::Board(u.prior_sq);
+                self.lift(u.moving, cur);
+                self.place(u.moving, u.prior_sq);
             }
         }
         self.pieces[u.moving].moved = u.prior_moved;
@@ -480,7 +557,7 @@ impl Position {
             }
             self.pieces[ci] = prior;
             let Loc::Board(vsq) = prior.loc else { unreachable!() };
-            self.board[vsq as usize] = ci as i32;
+            self.place(ci, vsq);
         }
 
         self.hash = u.prior_hash;
@@ -505,6 +582,9 @@ impl Position {
     /// Is `sq` attacked by any piece of `by`? Target predicates see the
     /// occupant of `sq` (empty ⇒ predicates like EnemyRoyal fail). Terrain
     /// obstructs rays, screens, and lame-leaper legs.
+    ///
+    /// Plain kernels (no zones/predicates) run on the wide-bitboard mirrors:
+    /// blocker checks are single mask intersections instead of walks.
     pub fn is_attacked(&self, g: &GameDef, sq: u16, by: Side) -> bool {
         use crate::bits::TargetPred;
         let (tx, ty) = g.board.xy(sq);
@@ -513,6 +593,9 @@ impl Position {
             TargetPred::Any => true,
             TargetPred::EnemyRoyal => occ_royal,
         };
+        let use_bb = self.wide && g.use_bitboards;
+        let obstructed = self.occ_all | self.terrain_mask;
+        let sq_bit = 1u128 << sq;
         for p in &self.pieces {
             let Loc::Board(psq) = p.loc else { continue };
             if p.side != by || psq == sq {
@@ -524,7 +607,33 @@ impl Position {
             let zone_ok = |z: Option<usize>, s: Side, at: u16| {
                 z.map_or(true, |zi| g.zones[zi].contains(s, at))
             };
-            for k in &ck.leaps {
+            let bb_active = use_bb && ck.bb.is_some();
+            if bb_active {
+                let bb = ck.bb.as_ref().unwrap();
+                for e in &bb.leaps[psq as usize] {
+                    if e.to == sq && e.mode.can_capture() && e.blockers & obstructed == 0 {
+                        return true;
+                    }
+                }
+                for r in &bb.rides {
+                    if !r.mode.can_capture() {
+                        continue;
+                    }
+                    let ray = r.rays[psq as usize];
+                    if ray & sq_bit == 0 {
+                        continue;
+                    }
+                    // Cells strictly between attacker and target.
+                    let between = ray & !r.rays[sq as usize] & !sq_bit;
+                    if between & obstructed == 0 {
+                        return true;
+                    }
+                }
+            }
+            for (ki, k) in ck.leaps.iter().enumerate() {
+                if bb_active && ck.leap_plain[ki] {
+                    continue;
+                }
                 if !k.mode.can_capture() || k.d.dx as i32 != dx || k.d.dy as i32 != dy {
                     continue;
                 }
@@ -543,7 +652,10 @@ impl Position {
                     return true;
                 }
             }
-            'ride: for k in &ck.rides {
+            'ride: for (ki, k) in ck.rides.iter().enumerate() {
+                if bb_active && ck.ride_plain[ki] {
+                    continue;
+                }
                 if !k.mode.can_capture() || !pred_ok(k.target) {
                     continue;
                 }

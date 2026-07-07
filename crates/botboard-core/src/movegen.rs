@@ -64,6 +64,13 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
         }
     };
 
+    // Occupancy masks for the wide-bitboard path (§7.1): incrementally
+    // maintained mirrors — the mailbox stays the source of truth.
+    let use_bb = g.use_bitboards && g.board.ncells() <= 128;
+    let (occ_all, occ_own, terrain_mask) =
+        (pos.occ_all, if use_bb { pos.occ_side[stm as usize] } else { 0 }, pos.terrain_mask);
+    let obstructed = occ_all | terrain_mask;
+
     for p in &pos.pieces {
         let Loc::Board(from) = p.loc else { continue };
         if p.side != stm {
@@ -71,7 +78,64 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
         }
         let ck = g.compiled(p.t, stm);
 
-        for k in &ck.leaps {
+        let bb_active = use_bb && ck.bb.is_some();
+        if bb_active {
+            let bb = ck.bb.as_ref().unwrap();
+            for e in &bb.leaps[from as usize] {
+                if e.blockers & obstructed != 0 {
+                    continue;
+                }
+                let tobit = 1u128 << e.to;
+                if terrain_mask & tobit != 0 {
+                    continue;
+                }
+                if occ_all & tobit == 0 {
+                    if e.mode.can_move() {
+                        push_with_promo(g, stm, p.t, from, e.to, MoveKind::Normal, NO_SQ, &mut out);
+                    }
+                } else if occ_own & tobit == 0 && e.mode.can_capture() {
+                    push_with_promo(g, stm, p.t, from, e.to, MoveKind::Normal, NO_SQ, &mut out);
+                }
+            }
+            for r in &bb.rides {
+                let ray = r.rays[from as usize];
+                let blk = ray & obstructed;
+                let (reach, stop) = if blk == 0 {
+                    (ray, None)
+                } else {
+                    let b = if r.positive {
+                        blk.trailing_zeros() as u16
+                    } else {
+                        127 - blk.leading_zeros() as u16
+                    };
+                    (ray & !r.rays[b as usize], Some(b))
+                };
+                if r.mode.can_move() {
+                    let mut quiet = reach & !obstructed;
+                    while quiet != 0 {
+                        let to = quiet.trailing_zeros() as u16;
+                        quiet &= quiet - 1;
+                        push_with_promo(g, stm, p.t, from, to, MoveKind::Normal, NO_SQ, &mut out);
+                    }
+                }
+                if r.mode.can_capture() {
+                    if let Some(b) = stop {
+                        let bbit = 1u128 << b;
+                        if terrain_mask & bbit == 0 && occ_own & bbit == 0 && occ_all & bbit != 0
+                        {
+                            push_with_promo(
+                                g, stm, p.t, from, b, MoveKind::Normal, NO_SQ, &mut out,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for (ki, k) in ck.leaps.iter().enumerate() {
+            if bb_active && ck.leap_plain[ki] {
+                continue;
+            }
             if !zone_ok(k.from_zone, from) {
                 continue;
             }
@@ -101,7 +165,10 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
             }
         }
 
-        for k in &ck.rides {
+        for (ki, k) in ck.rides.iter().enumerate() {
+            if bb_active && ck.ride_plain[ki] {
+                continue;
+            }
             if !zone_ok(k.from_zone, from) {
                 continue;
             }
