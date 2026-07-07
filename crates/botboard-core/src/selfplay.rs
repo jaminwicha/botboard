@@ -96,10 +96,7 @@ pub fn play_game(
 
         let _u = pos.make(g, &mv);
         plies += 1;
-        let key = {
-            let searcher: &Searcher = if pos.stm == 0 { &*s0 } else { &*s1 };
-            searcher.zob.hash(g, &pos)
-        };
+        let key = pos.hash;
         history.push(key);
         if history.iter().filter(|&&h| h == key).count() >= 3 {
             return GameRecord { outcome: Outcome::Draw, plies, samples };
@@ -359,7 +356,7 @@ pub fn play_hidden_game(
         // action per turn keeps this well-posed).
         beliefs[0].observe(g, &pre, &mv);
         beliefs[1].observe(g, &pre, &mv);
-        let key = searcher.zob.hash(g, &pos);
+        let key = pos.hash;
         history.push(key);
         if history.iter().filter(|&&h| h == key).count() >= 3 || plies >= max_plies {
             return (Outcome::Draw, rungs);

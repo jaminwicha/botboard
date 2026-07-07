@@ -120,7 +120,7 @@ pub extern "C" fn bb_apply(e: *mut Engine, mv: *const c_char) -> c_int {
     let moves = legal_moves(&e.g, &mut e.pos);
     let Some(m) = moves.iter().find(|m| move_str(&e.g, m) == s) else { return -3 };
     e.pos.make(&e.g, m);
-    e.history.push(e.searcher.zob.hash(&e.g, &e.pos));
+    e.history.push(e.pos.hash);
     0
 }
 

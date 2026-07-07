@@ -85,5 +85,6 @@ pub fn chess_from_fen(g: &GameDef, fen: &str) -> Result<Position, String> {
         g.board.sq(b[0] - b'a', b[1] - b'1')
     };
 
+    pos.rehash(g);
     Ok(pos)
 }

@@ -7,7 +7,6 @@ use botboard_core::game::*;
 use botboard_core::movegen::{legal_moves};
 use botboard_core::moves::{move_str, Effect, Move, MoveKind, NO_SQ};
 use botboard_core::position::{Loc, Position, T_NONE, T_WALL};
-use botboard_core::zobrist::Zobrist;
 
 const KING: TypeId = 0;
 const TANK: TypeId = 1; // rider(0,1), 3 HP armor
@@ -54,8 +53,7 @@ fn armor_strike_then_kill() {
     // White tank attacks a black 3-HP tank: two strikes, then the kill.
     let g = robot_game(vec![(KING, 0, 0, 0), (KING, 1, 7, 7), (TANK, 0, 3, 3), (TANK, 1, 3, 6)]);
     let mut pos = Position::startpos(&g);
-    let zob = Zobrist::new(&g);
-    let h0 = zob.hash(&g, &pos);
+    let h0 = pos.hash;
 
     let attack = Move::normal(g.board.sq(3, 3), g.board.sq(3, 6));
     let victim_idx = pos.board[g.board.sq(3, 6) as usize] as usize;
@@ -64,17 +62,17 @@ fn armor_strike_then_kill() {
     let u1 = pos.make(&g, &attack);
     assert_eq!(pos.hp[victim_idx], 2);
     assert!(pos.piece_at(g.board.sq(3, 3)).is_some(), "attacker stays on a strike");
-    let h1 = zob.hash(&g, &pos);
+    let h1 = pos.hash;
     assert_ne!(h0, h1, "HP is in the state bucket (§7.5)");
     // Board-identical positions differing only in HP are different nodes.
     pos.unmake(&g, &u1);
-    assert_eq!(zob.hash(&g, &pos), h0, "unmake restores the full state key");
+    assert_eq!(pos.hash, h0, "unmake restores the full state key");
 
     pos.make(&g, &attack); // 3→2
-    pos.stm = 0;
+    pos.set_stm(&g, 0);
     pos.make(&g, &attack); // 2→1
     assert_eq!(pos.hp[victim_idx], 1);
-    pos.stm = 0;
+    pos.set_stm(&g, 0);
     pos.make(&g, &attack); // kill: attacker moves in
     assert!(matches!(pos.pieces[victim_idx].loc, Loc::Dead));
     assert_eq!(
@@ -96,6 +94,7 @@ fn heal_is_the_turns_single_action() {
     let mut pos = Position::startpos(&g);
     let tank_idx = pos.board[g.board.sq(3, 3) as usize] as usize;
     pos.hp[tank_idx] = 1; // damaged
+    pos.rehash(&g);
 
     let moves = legal_moves(&g, &mut pos);
     let heal = moves
@@ -120,7 +119,6 @@ fn wall_blocks_riders_and_hashes_as_terrain() {
         (TANK, 1, 4, 6),
     ]);
     let mut pos = Position::startpos(&g);
-    let zob = Zobrist::new(&g);
 
     // Tank (file rider) initially attacks down the file toward y=0.
     assert!(pos.is_attacked(&g, g.board.sq(4, 1), 1));
@@ -129,17 +127,17 @@ fn wall_blocks_riders_and_hashes_as_terrain() {
     let moves = legal_moves(&g, &mut pos);
     assert!(moves.contains(&wall), "engineer offers wall creation");
 
-    let h0 = zob.hash(&g, &pos);
+    let h0 = pos.hash;
     let u = pos.make(&g, &wall);
     assert_eq!(pos.terrain[g.board.sq(4, 5) as usize], T_WALL);
     assert!(
         !pos.is_attacked(&g, g.board.sq(4, 1), 1),
         "wall interrupts the tank's ray (terrain mutates the blocker set, §7.2)"
     );
-    assert_ne!(zob.hash(&g, &pos), h0, "terrain XORs into the key (§7.5)");
+    assert_ne!(pos.hash, h0, "terrain XORs into the key (§7.5)");
     pos.unmake(&g, &u);
     assert_eq!(pos.terrain[g.board.sq(4, 5) as usize], T_NONE);
-    assert_eq!(zob.hash(&g, &pos), h0);
+    assert_eq!(pos.hash, h0);
 }
 
 #[test]
@@ -191,7 +189,6 @@ fn laser_captures_at_range_with_retreat_teeth() {
 fn overclock_compounds_are_atomic_and_bounded() {
     let g = robot_game(vec![(KING, 0, 0, 0), (KING, 1, 7, 7), (SCOUT, 0, 3, 3)]);
     let mut pos = Position::startpos(&g);
-    let zob = Zobrist::new(&g);
     let scout_idx = pos.board[g.board.sq(3, 3) as usize] as usize;
 
     let moves = legal_moves(&g, &mut pos);
@@ -203,7 +200,7 @@ fn overclock_compounds_are_atomic_and_bounded() {
     assert!(compounds.len() <= 64, "compound count bounded: {}", compounds.len());
     // The per-piece compound-count metric exists for content vetting (§13).
 
-    let h0 = zob.hash(&g, &pos);
+    let h0 = pos.hash;
     let mv = compounds
         .iter()
         .find(|m| m.to == g.board.sq(3, 4) && m.aux == g.board.sq(3, 5))
@@ -215,11 +212,12 @@ fn overclock_compounds_are_atomic_and_bounded() {
     assert_eq!(pos.hp[scout_idx], 1, "self-damage applied");
     assert_eq!(pos.stm, 1, "one action, one turn (§3.4)");
     pos.unmake(&g, &u);
-    assert_eq!(zob.hash(&g, &pos), h0, "atomic unmake");
+    assert_eq!(pos.hash, h0, "atomic unmake");
     assert_eq!(pos.hp[scout_idx], 2);
 
     // At 1 HP the self-damage would be lethal: no compounds offered.
     pos.hp[scout_idx] = 1;
+    pos.rehash(&g);
     let n = legal_moves(&g, &mut pos)
         .iter()
         .filter(|m| m.kind == MoveKind::Compound)

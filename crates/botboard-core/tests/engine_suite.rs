@@ -90,7 +90,7 @@ fn belief_collapses_with_observation() {
     // Black plays g8f6 (a knight move): the mover's hypotheses must shrink
     // to types whose kernels generate it — the knight uniquely, here.
     let mut p2 = pos.clone();
-    p2.stm = 1;
+    p2.set_stm(&g, 1);
     let mv = legal_moves(&g, &mut p2)
         .into_iter()
         .find(|m| botboard_core::moves::move_str(&g, m) == "g8f6")

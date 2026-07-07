@@ -264,7 +264,7 @@ pub struct Compiled {
 // GameDef
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct GameDef {
     pub board: BoardDef,
     pub sides: u8,
@@ -274,6 +274,8 @@ pub struct GameDef {
     /// Initial setup: (type, side, x, y).
     pub start: Vec<(TypeId, Side, u8, u8)>,
     compiled: Vec<Compiled>,
+    /// Ground-truth hashing tables (§7.5), deterministic per game shape.
+    pub zobrist: crate::zobrist::Zobrist,
 }
 
 impl GameDef {
@@ -285,7 +287,17 @@ impl GameDef {
         policy: Policy,
         start: Vec<(TypeId, Side, u8, u8)>,
     ) -> Self {
-        let mut g = GameDef { board, sides, types, zones, policy, start, compiled: Vec::new() };
+        let zobrist = crate::zobrist::Zobrist::for_shape(board.ncells(), types.len(), sides);
+        let mut g = GameDef {
+            board,
+            sides,
+            types,
+            zones,
+            policy,
+            start,
+            compiled: Vec::new(),
+            zobrist,
+        };
         g.compile();
         g
     }

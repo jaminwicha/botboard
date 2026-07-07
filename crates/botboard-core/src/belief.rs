@@ -169,6 +169,7 @@ pub fn determinize(
             world.pieces[i].t = t;
             world.pieces[i].base = t;
         }
+        world.rehash(_g);
         return world;
     }
     pool.clear();

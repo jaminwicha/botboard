@@ -43,10 +43,10 @@ impl Eval {
         if self.mobility_cp != 0 {
             let saved = pos.stm;
             for s in 0..g.sides {
-                pos.stm = s;
+                pos.set_stm(g, s);
                 score[s as usize] += self.mobility_cp * pseudo_moves(g, pos).len() as i32;
             }
-            pos.stm = saved;
+            pos.set_stm(g, saved);
         }
         score
     }

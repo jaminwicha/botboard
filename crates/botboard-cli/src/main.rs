@@ -184,7 +184,7 @@ fn cmd_play(g: &GameDef, name: &str, args: &[String]) {
             println!("engine plays {} ({:.1}s)", move_str(g, &mv), t0.elapsed().as_secs_f64());
             pos.make(g, &mv);
         }
-        history.push(searcher.zob.hash(g, &pos));
+        history.push(pos.hash);
         if history.iter().filter(|&&h| h == *history.last().unwrap()).count() >= 3 {
             print_board(g, &pos, None);
             println!("Draw by threefold repetition.");

@@ -1,22 +1,26 @@
 //! Zobrist hashing (§7.5). The key covers ⟨type, square, state-bucket⟩,
 //! per-cell terrain type, side-to-move, hands, and the en-passant square.
-//! The state bucket quantizes the instance state that affects play — here
-//! the `moved` flag (castling rights) and HP (hit-count armor); ammunition
-//! and cooldown phases extend the same bucket when those Bits land.
-//! Repetition is equality of this full ground-truth key (§7.5): monotone
-//! counters make true repetition impossible while they tick, and cyclic
-//! state must match for a repeat to count.
+//! The state bucket quantizes the instance state that affects play — the
+//! `moved` flag (castling rights) and HP (hit-count armor); ammunition and
+//! cooldown phases extend the same bucket when those Bits land.
+//! Repetition is equality of this full ground-truth key: monotone counters
+//! make true repetition impossible while they tick, and cyclic state must
+//! match for a repeat to count.
+//!
+//! The tables live in `GameDef`; `Position.hash` is maintained
+//! *incrementally* by make/unmake (unmake restores the recorded prior key),
+//! with a debug assertion against the full recompute.
 
-use crate::game::GameDef;
 use crate::position::{Loc, Position, T_NONE};
 use crate::rng::Rng;
 
 const MAX_HAND: usize = 20;
-/// State buckets: bit 0 = moved flag, bits 1..3 = HP capped at 7.
+/// State buckets: bit 0 = moved flag, bits 1..4 = HP capped at 7.
 const BUCKETS: usize = 16;
 /// Terrain types keyed per cell (T_NONE hashes to nothing).
 const TERRAINS: usize = 4;
 
+#[derive(Clone, Debug)]
 pub struct Zobrist {
     /// [type][side][bucket][square]
     piece: Vec<u64>,
@@ -33,11 +37,9 @@ pub struct Zobrist {
 }
 
 impl Zobrist {
-    pub fn new(g: &GameDef) -> Self {
+    pub fn for_shape(ncells: usize, ntypes: usize, nsides: u8) -> Self {
         let mut rng = Rng::new(0xB07B0A2D_5EED_0001);
-        let ncells = g.board.ncells();
-        let ntypes = g.types.len();
-        let nsides = g.sides as usize;
+        let nsides = nsides as usize;
         let mut fill = |n: usize| (0..n).map(|_| rng.next_u64()).collect::<Vec<_>>();
         Zobrist {
             piece: fill(ntypes * nsides * BUCKETS * ncells),
@@ -57,39 +59,55 @@ impl Zobrist {
         self.piece[((t * self.nsides + side) * BUCKETS + b) * self.ncells + sq]
     }
 
-    /// Full ground-truth hash of a position (§7.5). Recomputed O(pieces);
-    /// incremental update is a later optimization, not a semantic change.
-    pub fn hash(&self, g: &GameDef, pos: &Position) -> u64 {
-        let mut h = self.stm[pos.stm as usize];
+    #[inline]
+    pub fn terrain_key(&self, terrain: u8, sq: usize) -> u64 {
+        if terrain == T_NONE {
+            0
+        } else {
+            self.terrain[terrain as usize * self.ncells + sq]
+        }
+    }
+
+    #[inline]
+    pub fn hand_key(&self, side: usize, t: usize, count: usize) -> u64 {
+        if count == 0 {
+            0
+        } else {
+            self.hand[(side * self.ntypes + t) * MAX_HAND + (count - 1).min(MAX_HAND - 1)]
+        }
+    }
+
+    #[inline]
+    pub fn stm_key(&self, side: usize) -> u64 {
+        self.stm[side]
+    }
+
+    #[inline]
+    pub fn ep_key(&self, ep: u16) -> u64 {
+        if ep == crate::moves::NO_SQ {
+            0
+        } else {
+            self.ep[ep as usize]
+        }
+    }
+
+    /// Full ground-truth hash — the incremental key's reference definition.
+    pub fn full_hash(&self, pos: &Position) -> u64 {
+        let mut h = self.stm_key(pos.stm as usize);
         for (i, p) in pos.pieces.iter().enumerate() {
             if let Loc::Board(sq) = p.loc {
-                h ^= self.piece_key(
-                    p.t as usize,
-                    p.side as usize,
-                    p.moved,
-                    pos.hp[i],
-                    sq as usize,
-                );
+                h ^= self.piece_key(p.t as usize, p.side as usize, p.moved, pos.hp[i], sq as usize);
             }
         }
         for sq in 0..self.ncells {
-            let t = pos.terrain[sq];
-            if t != T_NONE {
-                h ^= self.terrain[t as usize * self.ncells + sq];
-            }
+            h ^= self.terrain_key(pos.terrain[sq], sq);
         }
         for s in 0..self.nsides {
             for t in 0..self.ntypes {
-                let c = pos.hands[s][t] as usize;
-                if c > 0 {
-                    h ^= self.hand[(s * self.ntypes + t) * MAX_HAND + (c - 1).min(MAX_HAND - 1)];
-                }
+                h ^= self.hand_key(s, t, pos.hands[s][t] as usize);
             }
         }
-        if pos.ep != crate::moves::NO_SQ {
-            h ^= self.ep[pos.ep as usize];
-        }
-        let _ = g;
+        h ^= self.ep_key(pos.ep);
         h
     }
 }

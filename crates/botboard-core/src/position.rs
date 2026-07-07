@@ -9,6 +9,11 @@
 //! key (§7.5). Hit-count armor (§3.2): a capture against a piece with
 //! HP > 1 is a *strike* — the victim loses 1 HP and the attacker does not
 //! move. Abilities and compound moves apply atomically (§3.4).
+//!
+//! `hash` is the full ground-truth Zobrist key, maintained incrementally:
+//! every mutation cluster XORs the affected entity out and back in; unmake
+//! restores the recorded prior key in O(1). Debug builds assert equality
+//! with the full recompute after every make.
 
 use crate::game::{CaptureFate, GameDef, Side, TypeId};
 use crate::moves::{Effect, Move, MoveKind, NO_SQ};
@@ -50,6 +55,8 @@ pub struct Position {
     pub ep: u16,
     /// hands[side][type] = count of that type held.
     pub hands: Vec<Vec<u8>>,
+    /// Incrementally-maintained full ground-truth Zobrist key (§7.5).
+    pub hash: u64,
 }
 
 pub struct Undo {
@@ -68,6 +75,7 @@ pub struct Undo {
     hp_changes: Vec<(usize, i16)>,
     terrain_change: Option<(u16, u8)>,
     prior_ep: u16,
+    prior_hash: u64,
 }
 
 impl Position {
@@ -80,12 +88,14 @@ impl Position {
             stm,
             ep: NO_SQ,
             hands: vec![vec![0; g.types.len()]; g.sides as usize],
+            hash: 0,
         };
         for &(t, side, sq, moved) in list {
             pos.board[sq as usize] = pos.pieces.len() as i32;
             pos.pieces.push(Piece { t, base: t, side, loc: Loc::Board(sq), moved });
             pos.hp.push(g.types[t as usize].max_hp);
         }
+        pos.hash = g.zobrist.full_hash(&pos);
         pos
     }
 
@@ -96,6 +106,12 @@ impl Position {
             .map(|&(t, side, x, y)| (t, side, g.board.sq(x, y), false))
             .collect();
         Self::from_pieces(g, &list, 0)
+    }
+
+    /// Re-derive the incremental key after out-of-band edits (tests,
+    /// determinization, manual setup).
+    pub fn rehash(&mut self, g: &GameDef) {
+        self.hash = g.zobrist.full_hash(self);
     }
 
     pub fn piece_at(&self, sq: u16) -> Option<&Piece> {
@@ -127,45 +143,52 @@ impl Position {
         }
     }
 
-    /// Apply a capture-or-strike against the occupant of `sq`.
-    /// Returns (captured record, killed).
-    fn hit(
-        &mut self,
-        g: &GameDef,
-        sq: u16,
-        undo_hp: &mut Vec<(usize, i16)>,
-    ) -> (Option<(usize, Piece)>, bool) {
-        let ci = self.board[sq as usize];
-        if ci < 0 {
-            return (None, false);
+    // -- incremental-hash brackets -------------------------------------
+
+    /// XOR piece `i`'s key (state-dependent) into the hash. Call once
+    /// before and once after mutating any of its keyed state; off-board
+    /// pieces contribute nothing, so hand/dead transitions pair naturally.
+    #[inline]
+    fn xor_piece(&mut self, g: &GameDef, i: usize) {
+        if let Loc::Board(sq) = self.pieces[i].loc {
+            let p = &self.pieces[i];
+            self.hash ^= g.zobrist.piece_key(
+                p.t as usize,
+                p.side as usize,
+                p.moved,
+                self.hp[i],
+                sq as usize,
+            );
         }
-        let ci = ci as usize;
-        if self.hp[ci] > 1 {
-            // Armor strike (§3.2): decrement HP, victim stays.
-            undo_hp.push((ci, self.hp[ci]));
-            self.hp[ci] -= 1;
-            return (None, false);
-        }
-        let prior = self.pieces[ci];
-        self.board[sq as usize] = -1;
-        match g.policy.capture_fate {
-            CaptureFate::Destroy => self.pieces[ci].loc = Loc::Dead,
-            CaptureFate::ToHand => {
-                let base = self.pieces[ci].base;
-                self.pieces[ci].t = base;
-                self.pieces[ci].side = self.stm;
-                self.pieces[ci].loc = Loc::Hand(self.stm);
-                self.hands[self.stm as usize][base as usize] += 1;
-            }
-        }
-        (Some((ci, prior)), true)
     }
 
-    fn move_piece(&mut self, mi: usize, from: u16, to: u16) {
-        self.board[from as usize] = -1;
-        self.board[to as usize] = mi as i32;
-        self.pieces[mi].loc = Loc::Board(to);
+    #[inline]
+    fn xor_hand(&mut self, g: &GameDef, s: usize, t: usize) {
+        self.hash ^= g.zobrist.hand_key(s, t, self.hands[s][t] as usize);
     }
+
+    #[inline]
+    fn xor_terrain(&mut self, g: &GameDef, sq: u16) {
+        self.hash ^= g.zobrist.terrain_key(self.terrain[sq as usize], sq as usize);
+    }
+
+    #[inline]
+    fn advance_stm(&mut self, g: &GameDef) {
+        self.hash ^= g.zobrist.stm_key(self.stm as usize);
+        self.stm = (self.stm + 1) % g.sides;
+        self.hash ^= g.zobrist.stm_key(self.stm as usize);
+    }
+
+    /// Set the side to move out-of-band, keeping the incremental key valid
+    /// (evaluation probes, compound-step enumeration, tests).
+    #[inline]
+    pub fn set_stm(&mut self, g: &GameDef, s: Side) {
+        self.hash ^= g.zobrist.stm_key(self.stm as usize);
+        self.stm = s;
+        self.hash ^= g.zobrist.stm_key(self.stm as usize);
+    }
+
+    // -------------------------------------------------------------------
 
     /// Debug-only invariant: mailbox and piece list must agree.
     #[cfg(debug_assertions)]
@@ -189,10 +212,68 @@ impl Position {
         }
     }
 
+    /// Apply a capture-or-strike against the occupant of `sq`.
+    /// Returns (captured record, killed).
+    fn hit(
+        &mut self,
+        g: &GameDef,
+        sq: u16,
+        undo_hp: &mut Vec<(usize, i16)>,
+    ) -> (Option<(usize, Piece)>, bool) {
+        let ci = self.board[sq as usize];
+        if ci < 0 {
+            return (None, false);
+        }
+        let ci = ci as usize;
+        if self.hp[ci] > 1 {
+            // Armor strike (§3.2): decrement HP, victim stays.
+            undo_hp.push((ci, self.hp[ci]));
+            self.xor_piece(g, ci);
+            self.hp[ci] -= 1;
+            self.xor_piece(g, ci);
+            return (None, false);
+        }
+        let prior = self.pieces[ci];
+        self.xor_piece(g, ci);
+        self.board[sq as usize] = -1;
+        match g.policy.capture_fate {
+            CaptureFate::Destroy => self.pieces[ci].loc = Loc::Dead,
+            CaptureFate::ToHand => {
+                let base = self.pieces[ci].base;
+                self.pieces[ci].t = base;
+                self.pieces[ci].side = self.stm;
+                self.pieces[ci].loc = Loc::Hand(self.stm);
+                self.xor_hand(g, self.stm as usize, base as usize);
+                self.hands[self.stm as usize][base as usize] += 1;
+                self.xor_hand(g, self.stm as usize, base as usize);
+            }
+        }
+        // Off-board now: xor_piece contributes nothing (paired naturally).
+        (Some((ci, prior)), true)
+    }
+
+    fn move_piece(&mut self, mi: usize, from: u16, to: u16) {
+        self.board[from as usize] = -1;
+        self.board[to as usize] = mi as i32;
+        self.pieces[mi].loc = Loc::Board(to);
+    }
+
     pub fn make(&mut self, g: &GameDef, mv: &Move) -> Undo {
         #[cfg(debug_assertions)]
         self.assert_consistent("make-entry");
+        let u = self.make_impl(g, mv);
+        debug_assert_eq!(
+            self.hash,
+            g.zobrist.full_hash(self),
+            "incremental hash diverged on {mv:?}"
+        );
+        u
+    }
+
+    fn make_impl(&mut self, g: &GameDef, mv: &Move) -> Undo {
         let prior_ep = self.ep;
+        let prior_hash = self.hash;
+        self.hash ^= g.zobrist.ep_key(self.ep);
         self.ep = NO_SQ;
 
         if mv.kind == MoveKind::Drop {
@@ -213,8 +294,12 @@ impl Position {
                 hp_changes: Vec::new(),
                 terrain_change: None,
                 prior_ep,
+                prior_hash,
             };
+            self.xor_hand(g, self.stm as usize, mv.drop_type as usize);
             self.hands[self.stm as usize][mv.drop_type as usize] -= 1;
+            self.xor_hand(g, self.stm as usize, mv.drop_type as usize);
+            // From hand (no key) to board (keyed): single trailing XOR.
             self.pieces[idx].loc = Loc::Board(mv.to);
             self.pieces[idx].moved = true;
             self.board[mv.to as usize] = idx as i32;
@@ -223,7 +308,8 @@ impl Position {
                 u.hp_changes.push((idx, self.hp[idx]));
                 self.hp[idx] = g.types[mv.drop_type as usize].max_hp;
             }
-            self.stm = (self.stm + 1) % g.sides;
+            self.xor_piece(g, idx);
+            self.advance_stm(g);
             return u;
         }
 
@@ -240,6 +326,7 @@ impl Position {
             hp_changes: Vec::new(),
             terrain_change: None,
             prior_ep,
+            prior_hash,
         };
 
         match mv.kind {
@@ -249,40 +336,50 @@ impl Position {
                         let ti = self.board[mv.to as usize] as usize;
                         u.hp_changes.push((ti, self.hp[ti]));
                         let max = g.types[self.pieces[ti].t as usize].max_hp;
+                        self.xor_piece(g, ti);
                         self.hp[ti] = (self.hp[ti] + amount).min(max);
+                        self.xor_piece(g, ti);
                     }
                     Effect::Wall | Effect::Pit => {
                         u.terrain_change = Some((mv.to, self.terrain[mv.to as usize]));
+                        self.xor_terrain(g, mv.to);
                         self.terrain[mv.to as usize] =
                             if mv.effect == Effect::Wall { T_WALL } else { T_PIT };
+                        self.xor_terrain(g, mv.to);
                     }
                     Effect::Laser => {
                         let (cap, _killed) = self.hit(g, mv.to, &mut u.hp_changes);
                         u.captured = cap;
                         if mv.aux != NO_SQ {
                             // Coupled retreat (§3.4): part of the atomic script.
+                            self.xor_piece(g, mi);
                             self.move_piece(mi, mv.from, mv.aux);
                             self.pieces[mi].moved = true;
+                            self.xor_piece(g, mi);
                         }
                     }
                     _ => {}
                 }
-                self.stm = (self.stm + 1) % g.sides;
+                self.advance_stm(g);
                 return u;
             }
             MoveKind::Compound => {
                 // Overclock ⟨move, move, self −1 HP⟩ (§3.4): step 1 is a
                 // non-capture move from→to; step 2 to→aux may capture/strike.
+                self.xor_piece(g, mi);
                 self.move_piece(mi, mv.from, mv.to);
+                self.xor_piece(g, mi);
                 let (cap2, killed2) = self.hit(g, mv.aux, &mut u.hp_changes);
                 u.captured2 = cap2;
+                self.xor_piece(g, mi);
                 if killed2 || self.board[mv.aux as usize] < 0 {
                     self.move_piece(mi, mv.to, mv.aux);
                 }
                 self.pieces[mi].moved = true;
                 u.hp_changes.push((mi, self.hp[mi]));
                 self.hp[mi] -= 1;
-                self.stm = (self.stm + 1) % g.sides;
+                self.xor_piece(g, mi);
+                self.advance_stm(g);
                 return u;
             }
             _ => {}
@@ -300,11 +397,13 @@ impl Position {
         }
 
         if moved_to_dest {
+            self.xor_piece(g, mi);
             self.move_piece(mi, mv.from, mv.to);
             self.pieces[mi].moved = true;
             if let Some(pt) = mv.promo {
                 self.pieces[mi].t = pt;
             }
+            self.xor_piece(g, mi);
         }
 
         match mv.kind {
@@ -312,18 +411,21 @@ impl Position {
                 let (x, y1) = g.board.xy(mv.from);
                 let (_, y2) = g.board.xy(mv.to);
                 self.ep = g.board.sq(x as u8, ((y1 + y2) / 2) as u8);
+                self.hash ^= g.zobrist.ep_key(self.ep);
             }
             MoveKind::Castle => {
                 let ri = self.board[mv.aux as usize] as usize;
                 let rook_to = (mv.from + mv.to) / 2;
                 u.partner = Some((ri, mv.aux, self.pieces[ri].moved));
+                self.xor_piece(g, ri);
                 self.move_piece(ri, mv.aux, rook_to);
                 self.pieces[ri].moved = true;
+                self.xor_piece(g, ri);
             }
             _ => {}
         }
 
-        self.stm = (self.stm + 1) % g.sides;
+        self.advance_stm(g);
         u
     }
 
@@ -340,6 +442,7 @@ impl Position {
             for &(i, hp) in u.hp_changes.iter().rev() {
                 self.hp[i] = hp;
             }
+            self.hash = u.prior_hash;
             return;
         }
 
@@ -366,9 +469,6 @@ impl Position {
         self.pieces[u.moving].moved = u.prior_moved;
         self.pieces[u.moving].t = u.prior_t;
 
-        // HP restores must run BEFORE captured-piece restores so a restored
-        // victim's board slot isn't clobbered (order is capture-safe: hp and
-        // board arrays are disjoint).
         for &(i, hp) in u.hp_changes.iter().rev() {
             self.hp[i] = hp;
         }
@@ -382,6 +482,24 @@ impl Position {
             let Loc::Board(vsq) = prior.loc else { unreachable!() };
             self.board[vsq as usize] = ci as i32;
         }
+
+        self.hash = u.prior_hash;
+    }
+
+    /// Null move (for null-move pruning): pass the turn, clearing ep.
+    /// Returns (prior_ep, prior_hash) for `unmake_null`.
+    pub fn make_null(&mut self, g: &GameDef) -> (u16, u64) {
+        let prior = (self.ep, self.hash);
+        self.hash ^= g.zobrist.ep_key(self.ep);
+        self.ep = NO_SQ;
+        self.advance_stm(g);
+        prior
+    }
+
+    pub fn unmake_null(&mut self, g: &GameDef, prior: (u16, u64)) {
+        self.stm = (self.stm + g.sides - 1) % g.sides;
+        self.ep = prior.0;
+        self.hash = prior.1;
     }
 
     /// Is `sq` attacked by any piece of `by`? Target predicates see the

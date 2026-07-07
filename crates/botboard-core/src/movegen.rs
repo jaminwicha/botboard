@@ -383,13 +383,13 @@ fn gen_overclock(g: &GameDef, pos: &Position, from: u16, out: &mut Vec<Move>) {
     };
     for f in firsts {
         let u = tmp.make(g, &f);
-        tmp.stm = pos.stm; // same piece acts again within the compound
+        tmp.set_stm(g, pos.stm); // same piece acts again within the compound
         for s in pseudo_kernel_moves_of(g, &tmp, f.to) {
             if s.kind == MoveKind::Normal {
                 out.push(Move::compound(from, f.to, s.to));
             }
         }
-        tmp.stm = (pos.stm + 1) % g.sides;
+        tmp.set_stm(g, (pos.stm + 1) % g.sides);
         tmp.unmake(g, &u);
     }
 }
