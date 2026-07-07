@@ -706,14 +706,15 @@ impl Position {
         false
     }
 
-    /// True if any royal piece of `side` is attacked (includes xiangqi's
-    /// facing-generals rule via the flying-general target-predicate Bit).
+    /// True if any royal piece of `side` is attacked by **any** other side
+    /// (N-player-correct; includes xiangqi's facing-generals rule via the
+    /// flying-general target-predicate Bit).
     pub fn royal_attacked(&self, g: &GameDef, side: Side) -> bool {
-        let enemy = (side + 1) % g.sides;
         self.pieces.iter().any(|p| {
             g.types[p.t as usize].royal
                 && p.side == side
-                && matches!(p.loc, Loc::Board(sq) if self.is_attacked(g, sq, enemy))
+                && matches!(p.loc, Loc::Board(sq)
+                    if (0..g.sides).any(|e| e != side && self.is_attacked(g, sq, e)))
         })
     }
 

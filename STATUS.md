@@ -2,55 +2,63 @@
 
 Traceability from **Botboard_Spec_v4.md** and **Botboard_Training_Spec.md** to code.
 Everything listed as *implemented* is exercised by `cargo test --release`
-(deep perft and statistical matches behind `-- --ignored`).
+(deep perft and statistical matches behind `-- --ignored`; debug builds
+additionally assert incremental hash/mirror consistency on every make).
 
 ## Engine spec (Botboard_Spec_v4.md)
 
 | Spec | Status | Where |
 |---|---|---|
 | §3.1 Axis A — leaper/rider/hopper, direction, mode, path (lame leapers), zone conditions, target predicates | ✅ | `bits.rs`, `geometry.rs`, compiled in `game.rs` |
-| §3.2 Axis B — capture fates (destroy / to-hand), transformation with base-type de-promotion, forced-if-immobile | ✅ | `game.rs` (PromoRule), `position.rs` (make/unmake) |
-| §3.2 stateful effects — hit-count armor (strikes), heal, spawn (walls/pits), laser-at-range with coupled retreat | ✅ SoA HP arrays; ammo/cooldown extend the same bucket | `position.rs`, `bits.rs::AbilityBit`, `tests/abilities_suite.rs` |
+| §3.2 Axis B — capture fates, transformation w/ base-type de-promotion, forced-if-immobile, hit-count armor (strikes), heal, spawn (walls/pits), laser-at-range with coupled retreat | ✅ SoA HP arrays; ammo/cooldown extend the same state bucket | `position.rs`, `bits.rs::AbilityBit`, `tests/abilities_suite.rs` |
 | §3.3 Special moves — castling, en passant, double-step; drops with 3 legality tiers (*nifu*, *uchifuzume*) | ✅ | `movegen.rs` |
-| §3.4 Turn model — one turn = one action, strict rotation, pass forbidden by default; compound moves piece-local, atomic, priced | ✅ incl. overclock ⟨move,move,−1HP⟩ compounds and ability actions; laser retreat "nerf has teeth" | `moves.rs`, `movegen.rs::gen_overclock/gen_abilities`, `tests/abilities_suite.rs` |
-| §4 Cost model — C_prior formula, mobility integral, floor, utility/nerf hooks, synergy hook | ✅ (synergy weights ship 0 until self-play fits them) | `cost.rs` |
-| §4.2 Anchors — recover Q≈9 R≈5 B≈N≈3 P≈1 | ✅ Q 8.71 / R 5.04 / B 3.51 / N 3.23 / P 1.0 | `cost.rs`, test `cost_prior_recovers_classical_ordering` |
-| §4.3 Correction loop — self-play folds realized value back, anchored | ✅ miniature (logistic regression on material diffs) | `selfplay.rs::correct_values` |
-| §5 Policy layer — royalty attr, stalemate, capture-fate, turn/pass, named predicates | ✅ | `game.rs`, predicates as flags on types |
-| §6 Acceptance — chess/xiangqi/shogi from Bits, perft-validated | ✅ chess d6=119,060,324 (+ Kiwipete, CPW 3–5), xiangqi d5=133,312,995, shogi d5=19,861,490 | `variants/`, `tests/perft_acceptance.rs` |
-| §7.1 Representation per board class | ✅ mailbox+piece-list class (Phase-0 per roadmap); SIMD-bitboard class & crossover = Prototype 1, pending | `position.rs` |
-| §7.2 Sliding attacks | ✅ ray-scan (the portable default); magic/PEXT are small-board optimizations, pending | `position.rs::is_attacked` |
-| §7.3 Compile step, SoA stateful data | ✅ compile; SoA arrives with stateful Bits | `game.rs::compile` |
-| §7.4 Learned evaluation, per-player value head | ✅ seed: integer material(=cost)+mobility linear eval, per-player vector; NNUE+Bit-embeddings is the scale-up | `eval.rs` |
-| §7.5 Zobrist w/ state buckets (moved+HP), per-cell terrain keys, hands, stm; repetition = full-state equality | ✅ tested: HP and terrain change the key; unmake restores it | `zobrist.rs`, `search.rs`, `tests/abilities_suite.rs` |
-| §8.1 Belief sharpness (entropy dial) | ✅ | `belief.rs::entropy` |
-| §8.2 Ladder — rung 0 αβ+TT; rung 1 PIMC; rung 2 ISMCTS; rung 3 search-free policy | ✅ all four dispatchable; GT-CFR interpolation core = Phase-2 growth | `search.rs`, `ladder.rs` |
-| §8.5 Gate — entropy + pivotality, bias-to-sounder | ✅ threshold gate; learned meta-controller pending | `ladder.rs::gate` |
-| §8.6 Belief substrate — ground truth vs observed view, per-piece knowledge masks, no leakage | ✅ hidden-identity regime; per-Bit masks arrive with Phase-3 stealth | `belief.rs` |
-| §8.7 Multiplayer N>2 | 🔲 open Tier-1 gap per spec §13 | model supports N sides; victory rules unresolved |
-| §8.8 Recon = belief collapse → cheaper rungs | ✅ observed in test `hidden_game_runs_the_ladder_and_reveals` | `selfplay.rs::play_hidden_game` |
-| §10.1 Determinism — core owns rules/state/RNG | ✅ integer-only rules, seeded SplitMix64, same-seed ⇒ identical game (tested) | `rng.rs` |
-| §10.2 C ABI — opaque handle, coarse commands | ✅ `cdylib` + smoke-tested via ctypes | `crates/botboard-ffi` |
-| §10.6 Determinism grades | ✅ deterministic grade (integer eval) is the only shipped path; float exists only in offline fitting math | `eval.rs`, `cost.rs` |
-| §12 Prototype 1 (representation crossover benchmark) | ◐ harness shipped (`botboard bench` measures kn/s per board class); the wide-SIMD bitboard second class plugs into it to find the crossover | `botboard-cli` |
+| §3.4 Turn model — one turn = one action, strict rotation, pass forbidden; compound moves piece-local, atomic, priced | ✅ incl. overclock ⟨move,move,−1HP⟩ compounds, ability actions, laser-retreat "nerf has teeth" | `moves.rs`, `movegen.rs`, `tests/abilities_suite.rs` |
+| §4 Cost model — C_prior, mobility integral, utility multipliers (armor 1+0.5(HP−1), overclock ×1.8), nerfs, floor, **synergy term with fitting loop** | ✅ synergy S_ij over Bit categories, SGD-fitted from residuals, recovers planted interactions | `cost.rs::SynergyModel`, `tests/systems_suite.rs` |
+| §4.2 Anchors — recover Q≈9 R≈5 B≈N≈3 P≈1 | ✅ Q 8.71 / R 5.04 / B 3.51 / N 3.23 / P 1.0 | `cost.rs`, `tests/engine_suite.rs` |
+| §4.3 Correction loop — self-play folds realized value back, anchored | ✅ logistic regression on material diffs + synergy residual fitting | `selfplay.rs::correct_values` |
+| §5 Policy layer | ✅ | `game.rs` |
+| §6 Acceptance — chess/xiangqi/shogi from Bits, perft-validated | ✅ chess d6=119,060,324 (+Kiwipete, CPW 3–5), xiangqi d5=133,312,995, shogi d5=19,861,490 | `variants/`, `tests/perft_acceptance.rs` |
+| §7.1 Representation per board class + **Prototype 1 crossover** | ✅ **measured**: two classes (mailbox+piece-list; wide-u128 bitboard kernels w/ ray tables) behind one abstraction, perft-equivalent; mailbox wins at all tested sizes (bitboards 0.80–0.93×), confirming the spec's cited expert position — mailbox default, bitboards selectable | `game.rs::CompiledBB`, `position.rs` mirrors, `tests/representation_suite.rs`, `botboard bench` |
+| §7.2 Sliding attacks | ✅ ray-scan (portable default) + mask-intersection fast path for plain kernels | `position.rs::is_attacked` |
+| §7.3 Compile step, SoA stateful data | ✅ | `game.rs`, `position.rs` |
+| §7.4 Learned evaluation — **Bit-derived embeddings, per-player value head, generalizes to unseen pieces** | ✅ NNUE-style accumulator net: descriptors from compiled kernels (no type ids), two-perspective accumulator, hidden layer; trained by self-play; evaluates novel random-army pieces sanely (tested) | `nnue.rs`, `tests/nnue_suite.rs` |
+| §7.5 Zobrist — **incremental**, state buckets (moved+HP), per-cell terrain keys, hands; repetition = full-state equality; TT + move ordering + pruning | ✅ incremental key w/ O(1) unmake restore, debug-asserted vs full recompute on every make; null-move, LMR, killers, history, aspiration | `zobrist.rs`, `position.rs`, `search.rs` |
+| §8.1 Belief sharpness | ✅ | `belief.rs` |
+| §8.2 Ladder — rung 0 αβ+TT; rung 1 PIMC; **rung 2 OOS** (the spec's named algorithm); rung 3 search-free policy | ✅ OOS = depth-limited external-sampling MCCFR over infosets, regret matching, average-strategy root; finds forced wins at point mass, sound + deterministic under uncertainty | `search.rs`, `ladder.rs`, `oos.rs`, `tests/oos_suite.rs` |
+| §8.5 Gate — entropy + pivotality, bias-to-sounder, **trained thresholds** | ✅ cheapest-sufficient-rung labels → monotone threshold fit | `ladder.rs`, `training.rs` |
+| §8.6 Belief substrate — ground truth vs observed view, knowledge masks, no leakage | ✅ | `belief.rs` |
+| §8.7 Multiplayer 1–4 — **committed baseline ruling for the open Tier-1 gap** | ✅ last-royal-standing FFA: strict rotation over live players, elimination removes the army, N-player-correct check, per-player value head chooser; 3-player game tested to verdict | `ffa.rs`, `tests/systems_suite.rs` |
+| §8.8 Recon = belief collapse → cheaper rungs; **codex persistence + rematch warm-start** | ✅ belief JSON roundtrip; rematch starts strictly sharper | `codex.rs`, `tests/systems_suite.rs` |
+| §10.1 Determinism — core owns rules/state/RNG | ✅ same-seed ⇒ identical games (tested, incl. FFA and OOS) | `rng.rs` |
+| §10.2 C ABI | ✅ opaque handle, coarse commands, ctypes-smoke-tested | `crates/botboard-ffi` |
+| §10.6 Determinism grades + **quantization parity (named obligation)** | ✅ deterministic grade = int16/i32 fixed-point net inference, bit-exact (tested); performance grade = f32 training; parity: ≥90% chosen-move agreement, ≤20cp drift (tested); checkpoints (BBNET001) | `nnue.rs`, `tests/nnue_suite.rs` |
 
 ## Training spec (Botboard_Training_Spec.md)
 
 | Spec | Status | Where |
 |---|---|---|
-| §2 Shared network (CVPN) | ✅ seed: one shared evaluator w/ per-player head + cost head (same table) serving every rung; neural CVPN is the scale-up | `eval.rs` |
-| §3 Reconciliation (GT-CFR / AlphaZero / R-NaD family) | ✅ miniature: the rung-3 net-sharing prototype is implemented — a NeuRD-style regularized policy head (FoReL pull, R-NaD outer iteration) refining the *shared* evaluator's move scores, trained by hidden self-play; regret matching in `league.rs`; full neural GT-CFR is the farm-scale growth | `training.rs::PolicyHead/train_policy_selfplay` |
-| §4 Continuum curriculum | ✅ miniature: cold-open ↔ revealed self-play both exercised; rematch belief persistence pending | `selfplay.rs` |
-| §5 Population / league, diversity, Nash averaging | ✅ personalities → round-robin meta-payoff → regret-matching Nash mixture + ratings | `league.rs` |
-| §6 Gate training | ✅ miniature: cheapest-sufficient-rung labels from rung agreement on sampled hidden positions; conservative threshold fit (escalate when uncertain) | `training.rs::collect_gate_samples/fit_gate_thresholds` |
-| §7 Co-evolution — generate → measure → correct | ✅ miniature: `random_army` (generate, priced, budget-packed) + `correct_values` (measure/correct, anchored) | `selfplay.rs` |
-| §8 Libraries & profiles — versioned, core-owned serialization | ✅ JSON profiles + meta-payoff (`league_profiles.json`) | `league.rs::profiles_json` |
-| §9 Two deployments over one C ABI | ✅ same surface serves CLI (game side) and ctypes harness (training side) | `botboard-ffi` |
-| §10 Infrastructure (distributed farm, GPU batching) | 🔲 offline scale-up | single-process loops shipped |
-| §11 Evaluation — cost-model gate, rung consistency, population health | ◐ cost gate + RPS-cycle Nash test shipped; exploitability metrics pending | tests |
+| §2 Shared network — Bit-set encoder inputs, policy/value heads, cost head | ✅ one evaluator (net or anchored-cost linear) under every rung; descriptors are the Bit-set encoder; cost prior shares the same kernel-derived features | `nnue.rs`, `eval.rs`, `cost.rs` |
+| §3 Reconciliation — GT-CFR family + AlphaZero cap + R-NaD cap, NeuRD=softmax-CFR | ✅ OOS (CFR family, search-based) + alpha-beta cap + NeuRD policy head with **R-NaD reward transformation** r′=r−η·log(π/π_reg) and FoReL regularization, all on the shared substrate — the rung-3 net-sharing prototype | `oos.rs`, `training.rs` |
+| §4 Continuum curriculum | ✅ cold-open ↔ revealed self-play; rematch sampling via codex warm-starts | `selfplay.rs`, `codex.rs` |
+| §5 Population/league, diversity, Nash averaging | ✅ | `league.rs` |
+| §6 Gate training | ✅ rung-agreement labels, monotone conservative fit | `training.rs` |
+| §7 Co-evolution — generate → measure → select → correct | ✅ random-army generation priced under budget; value + synergy correction | `selfplay.rs`, `cost.rs` |
+| §8 Libraries & profiles — versioned, core-owned | ✅ net checkpoints (BBNET001), league profiles JSON, codex JSON | `nnue.rs`, `league.rs`, `codex.rs` |
+| §9 Two deployments over one C ABI | ✅ CLI game side + ctypes training side | `botboard-ffi`, `botboard-cli` |
+| §10 Infrastructure — actors/learners | ✅ in-process **parallel actor pool** (thread-scoped, deterministic per seed at any thread count — tested); distributed multi-machine deployment is an ops scale-out of the same loop | `selfplay.rs::parallel_selfplay` |
+| §11 Evaluation — cost gate, rung consistency, parity, population health | ✅ all tested | test suites |
+
+## Scale notes (honest boundaries)
+
+The architecture is complete and every committed decision has a tested
+realization. Numbers scale with compute, not code: the shipped net is small
+(H=32) and trained on thousands—not millions—of games; OOS runs depth-capped;
+the league is 4 members. Growing those is configuration + hardware on the
+same loops. Distributed multi-machine orchestration and GPU-batched inference
+remain ops work outside the engine's semantics.
 
 ## UI
 
-`botboard` CLI (simple UI per current direction): `play` (interactive vs AI,
-`--hidden` for the imperfect-info ladder with masked view), `selfplay`,
-`cost`, `league`, `armies`, `show`, `perft`, `divide`.
+`botboard` CLI: `play` (interactive vs AI; `--hidden` for the imperfect-info
+ladder; `--net` for the deterministic-grade net), `selfplay`, `train-net`,
+`cost`, `league`, `armies`, `show`, `perft`, `divide`, `bench`.

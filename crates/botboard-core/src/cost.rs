@@ -150,6 +150,100 @@ pub fn fit_weights(g: &GameDef, anchors: &[Anchor]) -> CostWeights {
     CostWeights { w_move: w, w_attack: w }
 }
 
+/// Bit-category flags for the synergy term (§4.1): K interpretable
+/// categories per type, from the compiled kernels and type flags.
+pub const K_CATS: usize = 8;
+
+pub fn bit_categories(g: &GameDef, t: TypeId) -> [bool; K_CATS] {
+    let ck = g.compiled(t, 0);
+    let ty = &g.types[t as usize];
+    [
+        !ck.leaps.is_empty(),
+        !ck.rides.is_empty(),
+        !ck.hops.is_empty(),
+        ck.leaps.iter().all(|k| k.d.dy > 0) && !ck.leaps.is_empty()
+            || ck.rides.iter().all(|k| k.d.dy > 0) && !ck.rides.is_empty(),
+        ty.max_hp > 1,
+        ty.overclock,
+        !ty.abilities.is_empty(),
+        ck.leaps.iter().any(|k| !k.mode.can_move())
+            || ck.rides.iter().any(|k| !k.mode.can_move()),
+    ]
+}
+
+/// The synergy term (§4.1): Σ_{i<j} S_ij·x_i·x_j over Bit categories —
+/// a structured pairwise prior, O(K²), fitted from self-play residuals
+/// (measured value − analytic prior) per §4.3.
+#[derive(Clone, Debug)]
+pub struct SynergyModel {
+    /// Upper-triangular pairwise weights, row-major over i<j.
+    pub s: Vec<f64>,
+}
+
+impl SynergyModel {
+    pub fn zeros() -> Self {
+        SynergyModel { s: vec![0.0; K_CATS * (K_CATS - 1) / 2] }
+    }
+
+    fn idx(i: usize, j: usize) -> usize {
+        debug_assert!(i < j);
+        i * (2 * K_CATS - i - 1) / 2 + (j - i - 1)
+    }
+
+    pub fn term(&self, x: &[bool; K_CATS]) -> f64 {
+        let mut sum = 0.0;
+        for i in 0..K_CATS {
+            if !x[i] {
+                continue;
+            }
+            for j in (i + 1)..K_CATS {
+                if x[j] {
+                    sum += self.s[Self::idx(i, j)];
+                }
+            }
+        }
+        sum
+    }
+
+    /// Fit pairwise weights by SGD on (categories, residual) samples —
+    /// the §4.3 correction loop's synergy half. L2-regularized so sparse
+    /// data can't inflate the structured prior.
+    pub fn fit(samples: &[([bool; K_CATS], f64)], epochs: u32, lr: f64) -> Self {
+        let mut m = Self::zeros();
+        for _ in 0..epochs {
+            for (x, y) in samples {
+                let err = m.term(x) - y;
+                for i in 0..K_CATS {
+                    if !x[i] {
+                        continue;
+                    }
+                    for j in (i + 1)..K_CATS {
+                        if x[j] {
+                            let w = &mut m.s[Self::idx(i, j)];
+                            *w -= lr * (err + 0.01 * *w);
+                        }
+                    }
+                }
+            }
+        }
+        m
+    }
+}
+
+/// C_prior with the fitted synergy term (§4.1's full form).
+pub fn cost_prior_with_synergy(
+    g: &GameDef,
+    t: TypeId,
+    w: &CostWeights,
+    synergy: &SynergyModel,
+) -> f64 {
+    let base = cost_prior(g, t, w);
+    if g.types[t as usize].royal {
+        return base;
+    }
+    (base + synergy.term(&bit_categories(g, t))).max(1.0)
+}
+
 /// Integer piece values for the deterministic-grade evaluator (§10.6):
 /// centi-pawn scale, derived from the prior, overridable by self-play
 /// corrected values.

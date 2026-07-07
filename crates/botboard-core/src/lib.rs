@@ -11,7 +11,9 @@
 
 pub mod belief;
 pub mod bits;
+pub mod codex;
 pub mod cost;
+pub mod ffa;
 pub mod eval;
 pub mod fen;
 pub mod game;

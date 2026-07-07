@@ -314,6 +314,54 @@ pub fn random_army(
     (def, gen)
 }
 
+/// The self-play farm's actor pool (Training Spec §10) in-process:
+/// deterministic per seed regardless of thread count — each seeded game is
+/// independent, so records assemble in seed order. Scales the correction
+/// loop, league round-robins, and net-training sample generation.
+pub fn parallel_selfplay(
+    g: &GameDef,
+    eval: &Eval,
+    n_games: u32,
+    threads: usize,
+    depth: i32,
+    node_budget: u64,
+    seed: u64,
+    max_plies: u32,
+    sample_every: u32,
+) -> Vec<GameRecord> {
+    let threads = threads.max(1);
+    let mut slots: Vec<Option<GameRecord>> = Vec::new();
+    slots.resize_with(n_games as usize, || None);
+    let slots_ref = std::sync::Mutex::new(&mut slots);
+    let next = std::sync::atomic::AtomicU32::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= n_games {
+                    break;
+                }
+                let mut s0 = Searcher::new(g, eval.clone());
+                let mut s1 = Searcher::new(g, eval.clone());
+                let rec = play_game(
+                    g,
+                    &mut s0,
+                    &mut s1,
+                    (depth, depth),
+                    (node_budget, node_budget),
+                    seed + i as u64,
+                    6,
+                    max_plies,
+                    sample_every,
+                );
+                slots_ref.lock().unwrap()[i as usize] = Some(rec);
+            });
+        }
+    });
+    slots.into_iter().map(|r| r.expect("all games played")).collect()
+}
+
 /// Hidden-information self-play through the ladder (§8.6 discipline: each
 /// side chooses on its own belief; ground truth never leaks).
 pub fn play_hidden_game(
