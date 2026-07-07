@@ -25,5 +25,6 @@ pub mod position;
 pub mod rng;
 pub mod search;
 pub mod selfplay;
+pub mod training;
 pub mod variants;
 pub mod zobrist;

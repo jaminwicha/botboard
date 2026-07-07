@@ -270,11 +270,32 @@ fn cmd_armies(args: &[String]) {
     println!("legal moves from start: {}", legal_moves(&g, &mut pos).len());
 }
 
+/// Prototype 1 harness (spec §7.1/§12): movegen throughput per board class
+/// on the current representation; the wide-SIMD bitboard class plugs into
+/// the same harness to find the crossover empirically.
+fn cmd_bench() {
+    println!("{:<10} {:>7} {:>12} {:>10}", "variant", "cells", "perft-nodes", "kn/s");
+    for (name, depth) in [("chess", 5u32), ("xiangqi", 4), ("shogi", 4)] {
+        let g = game_for(name);
+        let mut pos = Position::startpos(&g);
+        let t0 = Instant::now();
+        let n = perft(&g, &mut pos, depth);
+        let dt = t0.elapsed().as_secs_f64();
+        println!(
+            "{:<10} {:>7} {:>12} {:>10.0}",
+            name,
+            g.board.ncells(),
+            n,
+            n as f64 / dt / 1000.0
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: botboard <show|perft|divide|play|selfplay|cost|league|armies> [variant] [args]"
+            "usage: botboard <show|perft|divide|play|selfplay|cost|league|armies|bench> [variant] [args]"
         );
         std::process::exit(1);
     }
@@ -282,6 +303,9 @@ fn main() {
 
     if cmd == "armies" {
         return cmd_armies(&args[2..]);
+    }
+    if cmd == "bench" {
+        return cmd_bench();
     }
 
     let variant = args.get(2).map(String::as_str).unwrap_or("chess");

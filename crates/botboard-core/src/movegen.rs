@@ -266,8 +266,17 @@ fn gen_castles(g: &GameDef, pos: &Position, ksq: u16, out: &mut Vec<Move>) {
         }
         let mid = (ksq as i32 + dir as i32) as u16;
         let dest = (ksq as i32 + 2 * dir as i32) as u16;
-        // Dest must lie strictly before the rook (true on 8x8; guards odd boards).
-        if dest == rsq && rsq != mid {
+        // The king's crossing and landing squares must be free (the rook's
+        // own square counts as free for `mid` — it vacates). With standard
+        // rook placement the between-check already covers these; arbitrary
+        // Bit-worlds can put an unmoved partner adjacent to the king.
+        if dest == rsq {
+            continue;
+        }
+        if (pos.board[mid as usize] >= 0 && mid != rsq) || !pos.terrain_open(mid) {
+            continue;
+        }
+        if pos.board[dest as usize] >= 0 || !pos.terrain_open(dest) {
             continue;
         }
         if pos.is_attacked(g, ksq, enemy)

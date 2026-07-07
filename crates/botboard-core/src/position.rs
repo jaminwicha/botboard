@@ -167,7 +167,31 @@ impl Position {
         self.pieces[mi].loc = Loc::Board(to);
     }
 
+    /// Debug-only invariant: mailbox and piece list must agree.
+    #[cfg(debug_assertions)]
+    pub fn assert_consistent(&self, ctx: &str) {
+        for (i, p) in self.pieces.iter().enumerate() {
+            if let Loc::Board(sq) = p.loc {
+                assert_eq!(
+                    self.board[sq as usize], i as i32,
+                    "{ctx}: piece {i} thinks it is on {sq} but the mailbox disagrees"
+                );
+            }
+        }
+        for (sq, &pi) in self.board.iter().enumerate() {
+            if pi >= 0 {
+                assert_eq!(
+                    self.pieces[pi as usize].loc,
+                    Loc::Board(sq as u16),
+                    "{ctx}: mailbox {sq} points at piece {pi} which is elsewhere"
+                );
+            }
+        }
+    }
+
     pub fn make(&mut self, g: &GameDef, mv: &Move) -> Undo {
+        #[cfg(debug_assertions)]
+        self.assert_consistent("make-entry");
         let prior_ep = self.ep;
         self.ep = NO_SQ;
 

@@ -21,7 +21,7 @@ use crate::position::Position;
 use crate::rng::Rng;
 use crate::search::Searcher;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Rung {
     R0PerfectInfo,
     R1Determinize,
@@ -84,13 +84,26 @@ pub fn choose_move(
     rng: &mut Rng,
 ) -> Option<(Move, Rung)> {
     let rung = gate(belief, &searcher.eval.material, cfg);
-    let mv = match rung {
+    choose_move_with_rung(g, truth, belief, searcher, cfg, rng, rung).map(|m| (m, rung))
+}
+
+/// Run a specific rung directly (gate bypass — used by gate training,
+/// Training Spec §6, and rung-consistency checks, §11).
+pub fn choose_move_with_rung(
+    g: &GameDef,
+    truth: &mut Position,
+    belief: &Belief,
+    searcher: &mut Searcher,
+    cfg: &LadderConfig,
+    rng: &mut Rng,
+    rung: Rung,
+) -> Option<Move> {
+    match rung {
         Rung::R0PerfectInfo => searcher.search(g, truth, cfg.depth, cfg.node_budget).best,
         Rung::R1Determinize => pimc(g, truth, belief, searcher, cfg, rng),
         Rung::R2Ismcts => ismcts(g, truth, belief, searcher, cfg, rng),
         Rung::R3Policy => policy_move(g, truth, belief, searcher, rng),
-    };
-    mv.map(|m| (m, rung))
+    }
 }
 
 /// Rung 1 — PIMC: root moves voted by average score across sampled worlds.
