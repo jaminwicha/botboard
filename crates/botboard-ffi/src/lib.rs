@@ -6,6 +6,9 @@
 //! Conventions: functions return 0 on success, negative on error; move and
 //! board strings are NUL-terminated UTF-8 in caller-supplied buffers.
 
+pub mod json;
+pub mod srw;
+
 use std::ffi::{c_char, c_int, CStr};
 use std::ptr;
 
@@ -169,7 +172,7 @@ pub extern "C" fn bb_perft(e: *mut Engine, depth: c_int) -> i64 {
     perft(&e.g, &mut e.pos, depth.max(0) as u32) as i64
 }
 
-fn write_str(s: &str, buf: *mut c_char, cap: c_int) -> c_int {
+pub(crate) fn write_str(s: &str, buf: *mut c_char, cap: c_int) -> c_int {
     let bytes = s.as_bytes();
     if buf.is_null() || (bytes.len() + 1) as c_int > cap {
         return -10;

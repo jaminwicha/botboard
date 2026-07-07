@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 name = "botboard"
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 botboard-core = { path = "../botboard-core" }
