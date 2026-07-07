@@ -109,12 +109,24 @@ fn opt<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+fn eval_for(g: &GameDef, name: &str, args: &[String]) -> Eval {
+    let material = material_for(g, name);
+    let net_path: String = opt(args, "--net", String::new());
+    if net_path.is_empty() {
+        return Eval::new(material);
+    }
+    let data = std::fs::read(&net_path).expect("read net checkpoint");
+    let fnet = botboard_core::nnue::FloatNet::from_bytes(&data).expect("parse checkpoint");
+    let qnet = botboard_core::nnue::QuantNet::from_float(g, &fnet);
+    println!("[deterministic-grade net loaded from {net_path}]");
+    Eval::with_net(material, qnet)
+}
+
 fn cmd_play(g: &GameDef, name: &str, args: &[String]) {
     let depth: i32 = opt(args, "--depth", 4);
     let seed: u64 = opt(args, "--seed", 1);
     let hidden = flag(args, "--hidden");
-    let material = material_for(g, name);
-    let mut searcher = Searcher::new(g, Eval::new(material));
+    let mut searcher = Searcher::new(g, eval_for(g, name, args));
     let mut pos = Position::startpos(g);
     let mut history: Vec<u64> = Vec::new();
     let mut rng = Rng::new(seed);
@@ -316,6 +328,27 @@ fn main() {
     }
     if cmd == "bench" {
         return cmd_bench();
+    }
+    if cmd == "train-net" {
+        let variant = args.get(2).map(String::as_str).unwrap_or("chess");
+        let g = game_for(variant);
+        let rest: Vec<String> = args[3.min(args.len())..].to_vec();
+        let games: u32 = opt(&rest, "--games", 24);
+        let epochs: u32 = opt(&rest, "--epochs", 6);
+        let out: String = opt(&rest, "--out", format!("{variant}_net.bin"));
+        let material = material_for(&g, variant);
+        let mut net = botboard_core::nnue::FloatNet::new(7);
+        println!("training on {games} self-play games ({epochs} epochs)…");
+        let rep = botboard_core::nnue::train_from_selfplay(
+            &g, &mut net, &material, games, 2, epochs, 0.01, 11,
+        );
+        println!(
+            "samples: {}  loss: {:.4} → {:.4}",
+            rep.samples, rep.first_loss, rep.last_loss
+        );
+        std::fs::write(&out, net.to_bytes()).expect("write checkpoint");
+        println!("checkpoint written to {out} (deterministic grade derives at load)");
+        return;
     }
 
     let variant = args.get(2).map(String::as_str).unwrap_or("chess");

@@ -16,13 +16,21 @@ pub const MOBILITY_CP: i32 = 4;
 #[derive(Clone, Debug)]
 pub struct Eval {
     /// Centipawn value per piece type (royals 0 — losing them ends the game).
+    /// Kept even with a net: move ordering (MVV) and pivotality read it.
     pub material: Vec<i32>,
     pub mobility_cp: i32,
+    /// Deterministic-grade network (§10.6): when present, replaces the
+    /// linear material+mobility form on every value query.
+    pub net: Option<crate::nnue::QuantNet>,
 }
 
 impl Eval {
     pub fn new(material: Vec<i32>) -> Self {
-        Eval { material, mobility_cp: MOBILITY_CP }
+        Eval { material, mobility_cp: MOBILITY_CP, net: None }
+    }
+
+    pub fn with_net(material: Vec<i32>, net: crate::nnue::QuantNet) -> Self {
+        Eval { material, mobility_cp: 0, net: Some(net) }
     }
 
     /// Per-player score vector (the value-head shape, §7.4). Armored pieces
@@ -53,6 +61,9 @@ impl Eval {
 
     /// Two-player scalar from the side-to-move's perspective (negamax form).
     pub fn stm(&self, g: &GameDef, pos: &mut Position) -> i32 {
+        if let Some(net) = &self.net {
+            return net.eval(g, pos);
+        }
         let v = self.players(g, pos);
         let me = pos.stm as usize;
         let enemy = (pos.stm as usize + 1) % g.sides as usize;
