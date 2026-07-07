@@ -61,7 +61,7 @@ fn gate_labels_and_threshold_fit() {
         depth: 2,
         node_budget: 5_000,
         determinizations: 3,
-        ismcts_iters: 60,
+        oos_iterations: 64, oos_depth: 3,
         ..Default::default()
     };
     let samples = collect_gate_samples(&g, &mut searcher, &cfg, 12, 7);
@@ -81,7 +81,7 @@ fn gate_labels_and_threshold_fit() {
     let belief = Belief::cold_open(&g, &pos, 0);
     let mut rng = Rng::new(3);
     let legal = legal_moves(&g, &mut pos);
-    for rung in [Rung::R0PerfectInfo, Rung::R1Determinize, Rung::R2Ismcts, Rung::R3Policy] {
+    for rung in [Rung::R0PerfectInfo, Rung::R1Determinize, Rung::R2Sound, Rung::R3Policy] {
         let mv = choose_move_with_rung(&g, &mut pos, &belief, &mut searcher, &cfg, &mut rng, rung);
         let mv = mv.expect("every rung yields a move");
         if rung != Rung::R0PerfectInfo {

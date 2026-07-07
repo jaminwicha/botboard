@@ -21,6 +21,7 @@ pub mod league;
 pub mod movegen;
 pub mod moves;
 pub mod nnue;
+pub mod oos;
 pub mod perft;
 pub mod position;
 pub mod rng;

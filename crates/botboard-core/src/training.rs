@@ -84,10 +84,22 @@ impl PolicyHead {
         exps.iter().map(|e| e / sum).collect()
     }
 
+    /// Probability the regularization policy assigns to `played` (1/n when
+    /// no regularization policy exists yet).
+    fn reg_prob(&self, g: &GameDef, pos: &mut Position, moves: &[Move], played: usize, eval: &Eval) -> f64 {
+        match &self.reg {
+            Some(reg) => Self::softmax(&reg.logits(g, pos, moves, eval))[played],
+            None => 1.0 / moves.len() as f64,
+        }
+    }
+
     /// One NeuRD update from a sampled episode step: logit gradients follow
     /// the counterfactual advantage (score of the played move against the
     /// policy's expectation), plus the FoReL pull toward the regularization
-    /// policy. `reward` is from the mover's perspective in [-1, 1].
+    /// policy. `reward` is from the mover's perspective in [-1, 1] and is
+    /// **R-NaD reward-transformed** here: r′ = r − η·log(π(a)/π_reg(a)),
+    /// the regularized-Nash-dynamics penalty that makes the fixed point an
+    /// ε-Nash of the transformed game (Perolat et al.).
     pub fn neurd_update(
         &mut self,
         g: &GameDef,
@@ -101,6 +113,10 @@ impl PolicyHead {
     ) {
         let logits = self.logits(g, pos, moves, eval);
         let probs = Self::softmax(&logits);
+        // R-NaD reward transformation.
+        let eta = 0.2;
+        let pr = self.reg_prob(g, pos, moves, played, eval).max(1e-9);
+        let reward = reward - eta * (probs[played].max(1e-9) / pr).ln();
         // Expected value baseline under the current policy.
         let scores: Vec<f64> = moves
             .iter()
@@ -258,10 +274,10 @@ pub fn collect_gate_samples(
         }
 
         // The "soundest" reference at this scale: ISMCTS (rung 2).
-        let reference = run_rung(g, &mut pos, &belief, searcher, cfg, Rung::R2Ismcts, &mut rng);
+        let reference = run_rung(g, &mut pos, &belief, searcher, cfg, Rung::R2Sound, &mut rng);
         let Some(reference) = reference else { continue };
 
-        let mut cheapest = Rung::R2Ismcts;
+        let mut cheapest = Rung::R2Sound;
         for rung in [Rung::R0PerfectInfo, Rung::R1Determinize] {
             let mv = run_rung(g, &mut pos, &belief, searcher, cfg, rung, &mut rng);
             if mv == Some(reference) {
@@ -323,5 +339,8 @@ pub fn fit_gate_thresholds(samples: &[GateSample], default: &LadderConfig) -> (f
             v[(v.len() - 1) / 4]
         }
     };
-    (q(&r0_ok, default.sharp), q(&r1_ok, default.broad))
+    let sharp = q(&r0_ok, default.sharp);
+    // Monotone by construction: rung 1's region contains rung 0's.
+    let broad = q(&r1_ok, default.broad).max(sharp);
+    (sharp, broad)
 }

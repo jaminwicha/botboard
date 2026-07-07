@@ -118,7 +118,7 @@ fn gate_spans_the_ladder() {
     let cold = Belief::cold_open(&g, &pos, 0);
     assert!(matches!(
         gate(&cold, &material, &cfg),
-        Rung::R2Ismcts | Rung::R3Policy
+        Rung::R2Sound | Rung::R3Policy
     ));
 }
 

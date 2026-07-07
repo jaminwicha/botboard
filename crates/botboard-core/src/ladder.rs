@@ -4,8 +4,9 @@
 //! Rung 0: perfect-information alpha-beta (the point-mass cap).
 //! Rung 1: determinization / PIMC — sample consistent worlds, solve each
 //!         with the rung-0 engine, aggregate root votes.
-//! Rung 2: single-observer ISMCTS — fresh determinization per iteration,
-//!         UCT over the observer's move sequence (reduces strategy fusion).
+//! Rung 2: sound game-theoretic search — depth-limited external-sampling
+//!         MCCFR/OOS over information sets (`oos.rs`); the rung that can
+//!         bluff and value information-gathering correctly.
 //! Rung 3: search-free softmax policy over the shared eval (the R-NaD-
 //!         shaped cap; its NeuRD refinement lives in the training loop).
 //!
@@ -25,7 +26,7 @@ use crate::search::Searcher;
 pub enum Rung {
     R0PerfectInfo,
     R1Determinize,
-    R2Ismcts,
+    R2Sound,
     R3Policy,
 }
 
@@ -33,7 +34,8 @@ pub struct LadderConfig {
     pub depth: i32,
     pub node_budget: u64,
     pub determinizations: usize,
-    pub ismcts_iters: usize,
+    pub oos_iterations: u32,
+    pub oos_depth: u32,
     /// Entropy thresholds: below `sharp` → rung 1, below `broad` → rung 2,
     /// else rung 3.
     pub sharp: f64,
@@ -46,7 +48,8 @@ impl Default for LadderConfig {
             depth: 4,
             node_budget: 200_000,
             determinizations: 8,
-            ismcts_iters: 400,
+            oos_iterations: 256,
+            oos_depth: 4,
             sharp: 6.0,
             broad: 24.0,
         }
@@ -62,12 +65,12 @@ pub fn gate(belief: &Belief, material: &[i32], cfg: &LadderConfig) -> Rung {
     } else if h < cfg.sharp {
         Rung::R1Determinize
     } else if h < cfg.broad {
-        Rung::R2Ismcts
+        Rung::R2Sound
     } else {
         Rung::R3Policy
     };
     if rung == Rung::R1Determinize && belief.pivotal(material) {
-        rung = Rung::R2Ismcts;
+        rung = Rung::R2Sound;
     }
     rung
 }
@@ -101,7 +104,7 @@ pub fn choose_move_with_rung(
     match rung {
         Rung::R0PerfectInfo => searcher.search(g, truth, cfg.depth, cfg.node_budget).best,
         Rung::R1Determinize => pimc(g, truth, belief, searcher, cfg, rng),
-        Rung::R2Ismcts => ismcts(g, truth, belief, searcher, cfg, rng),
+        Rung::R2Sound => oos_move(g, truth, belief, searcher, cfg, rng),
         Rung::R3Policy => policy_move(g, truth, belief, searcher, rng),
     }
 }
@@ -142,9 +145,8 @@ fn pimc(
         .map(|i| root_moves[i])
 }
 
-/// Rung 2 — single-observer ISMCTS: UCT statistics per root move, a fresh
-/// consistent world per iteration, shallow eval as the leaf value.
-fn ismcts(
+/// Rung 2 — sound search: OOS average strategy at the root (§8.2).
+fn oos_move(
     g: &GameDef,
     truth: &mut Position,
     belief: &Belief,
@@ -152,50 +154,13 @@ fn ismcts(
     cfg: &LadderConfig,
     rng: &mut Rng,
 ) -> Option<Move> {
-    let root_moves = legal_moves(g, truth);
-    if root_moves.is_empty() {
-        return None;
-    }
-    let n = root_moves.len();
-    let mut visits = vec![0f64; n];
-    let mut value = vec![0f64; n];
-    for it in 0..cfg.ismcts_iters {
-        let mut world = determinize(g, truth, belief, rng, 32);
-        // UCT selection over root moves legal in this world.
-        let legal: Vec<usize> = {
-            let wm = legal_moves(g, &mut world);
-            (0..n).filter(|&i| wm.contains(&root_moves[i])).collect()
-        };
-        if legal.is_empty() {
-            continue;
-        }
-        let total: f64 = legal.iter().map(|&i| visits[i]).sum::<f64>().max(1.0);
-        let pick = *legal
-            .iter()
-            .max_by(|&&a, &&b| {
-                let uct = |i: usize| {
-                    if visits[i] == 0.0 {
-                        f64::INFINITY
-                    } else {
-                        value[i] / visits[i] + 1.4 * (total.ln() / visits[i]).sqrt()
-                    }
-                };
-                uct(a).partial_cmp(&uct(b)).unwrap()
-            })
-            .unwrap();
-        let mv = root_moves[pick];
-        let u = world.make(g, &mv);
-        // Leaf value: shallow search from the opponent, negated, squashed.
-        let r = searcher.search(g, &mut world, 2, cfg.node_budget / 64);
-        world.unmake(g, &u);
-        let v = 1.0 / (1.0 + (-(-r.score as f64) / 300.0).exp());
-        visits[pick] += 1.0;
-        value[pick] += v;
-        let _ = it;
-    }
-    (0..n)
-        .max_by(|&a, &b| visits[a].partial_cmp(&visits[b]).unwrap())
-        .map(|i| root_moves[i])
+    let mut oos = crate::oos::Oos::new();
+    let ocfg = crate::oos::OosConfig {
+        iterations: cfg.oos_iterations,
+        depth: cfg.oos_depth,
+        ..Default::default()
+    };
+    oos.choose(g, truth, belief, searcher, &ocfg, rng).map(|(mv, _)| mv)
 }
 
 /// Rung 3 — the search-free policy cap: softmax over one-ply eval on a

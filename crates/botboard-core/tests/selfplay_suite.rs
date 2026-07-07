@@ -83,7 +83,7 @@ fn correction_loop_moves_values_toward_outcomes() {
 fn hidden_game_runs_the_ladder_and_reveals() {
     let (g, material) = chess_material();
     let mut s = Searcher::new(&g, Eval::new(material));
-    let cfg = LadderConfig { depth: 2, node_budget: 8_000, determinizations: 3, ismcts_iters: 40, ..Default::default() };
+    let cfg = LadderConfig { depth: 2, node_budget: 8_000, determinizations: 3, oos_iterations: 48, oos_depth: 3, ..Default::default() };
     let (outcome, rungs) = play_hidden_game(&g, &mut s, &cfg, 11, 60);
     assert!(!rungs.is_empty());
     // Cold open must start on an imperfect-info rung…
