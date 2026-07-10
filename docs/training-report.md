@@ -273,3 +273,24 @@ tier-2 informed play dispatches rung 0 as assumed. The `EncounterFactory`
 veilworks tier cap (suggestion 3) is therefore lifted. The "inert armies:
 100 % draws" flag on veilworks mirrors persists at tier 1 (mean ~51
 plies, threefold repetition) — a balance item, not a perf one.
+
+### Re-vet on the fixed engine (2026-07-10)
+
+Full sweep rerun (`tools/VetSweep`, all clans × budgets {8,14,20} ×
+seeds {31,32}, tier 1) with the qsearch fix in place, ~35 min total:
+
+- **Scrapline, foundry, deepcore reproduce the §4 table bit-identically**
+  (every cell). The fix only alters play where friendly-target abilities
+  reached quiescence, so the July tunings (deepcore floor 12, scrapline
+  skirmish cap 10) were never distorted — revalidated as-is.
+- **Veilworks tier-1 row (previously DNF)**: 8/31 0%-win 100%-draw 50.8
+  plies (inert flag); 8/32 0%/83%/71.7; 14/31 0%/50%/45.2; 14/32
+  17%/83%/44.3; 20/31 33%/0%/46.0; 20/32 50%/17%/55.5. Same
+  low-budget-inertness shape deepcore had.
+- **Balance action**: veilworks joins deepcore's budget floor of 12
+  (`EncounterFactory.BudgetFor`); the floor-budget probe
+  (`VetSweep veilworks 12`) vets clean on both seeds (17% s0-win,
+  50%/83% draws, no flags). The tier cap stays lifted.
+- Mover asymmetry remains clan-dependent (side 0 starved for scrapline/
+  veilworks at low budgets, side 0 *favored* for deepcore at 14/20) — a
+  uniform second-player compensation would cut both ways; left open.
