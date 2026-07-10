@@ -137,4 +137,8 @@ pub enum AbilityBit {
     /// Revive a dead friendly non-royal piece onto an empty in-range
     /// square at 1 HP (the SRW §7 resurrect controller spell).
     Resurrect { range: u8 },
+    /// Flip an in-range enemy to the caster's side (the SRW §7 hack
+    /// spell). The spec's "target predicate": non-royal at exactly 1 HP —
+    /// its defenses are down. Deterministic, so search stays sound.
+    Hack { range: u8 },
 }

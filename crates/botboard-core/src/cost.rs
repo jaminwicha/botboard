@@ -121,6 +121,7 @@ pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
             // mobility-integral board, so they carry Appendix-B-style flat
             // priors until self-play refits them (§4.3).
             crate::bits::AbilityBit::Resurrect { .. } => s_flat += 4.0,
+            crate::bits::AbilityBit::Hack { .. } => s_flat += 5.0,
             _ => {}
         }
     }

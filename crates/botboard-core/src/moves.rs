@@ -34,6 +34,8 @@ pub enum Effect {
     /// Revive a dead friendly piece at `to`; `drop_type` names which type
     /// re-enters (piece identity within a type is interchangeable).
     Resurrect,
+    /// Flip the enemy piece at `to` to the caster's side.
+    Hack,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,6 +114,7 @@ pub fn move_str(g: &GameDef, mv: &Move) -> String {
                 Effect::Resurrect => {
                     format!("rez{}", g.types[mv.drop_type as usize].glyph)
                 }
+                Effect::Hack => "hack".to_string(),
                 _ => "fx".to_string(),
             };
             let mut s = format!("{}!{}:{}", sq_name(g, mv.from), name, sq_name(g, mv.to));

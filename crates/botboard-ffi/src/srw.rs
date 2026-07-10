@@ -154,6 +154,7 @@ fn parse_ability(j: &Json) -> Option<AbilityBit> {
         "pit" => Some(AbilityBit::DigPit { range }),
         "laser" => Some(AbilityBit::Laser { range, retreat: j.bool_or("retreat", true) }),
         "resurrect" => Some(AbilityBit::Resurrect { range }),
+        "hack" => Some(AbilityBit::Hack { range }),
         _ => None,
     }
 }
@@ -658,7 +659,8 @@ pub extern "C" fn srw_legal_move(
 /// out[6] = [from(-1 drop), to, kind, aux(-1 none), effect, promo(-1 none)].
 /// kind: 0 normal 1 double-step 2 en-passant 3 castle 4 drop 5 ability
 /// 6 compound; effect: 0 none 1 heal 2 wall 3 pit 4 laser 5 twice
-/// 6 resurrect (out[5] then carries the revived type id, not a promo).
+/// 6 resurrect (out[5] then carries the revived type id, not a promo)
+/// 7 hack.
 #[no_mangle]
 pub extern "C" fn srw_legal_info(b: *mut SrwBattle, i: c_int, out: *mut c_int) -> c_int {
     let Some(b) = (unsafe { b.as_mut() }) else { return -1 };
@@ -684,6 +686,7 @@ pub extern "C" fn srw_legal_info(b: *mut SrwBattle, i: c_int, out: *mut c_int) -
         Effect::Laser => 4,
         Effect::Twice => 5,
         Effect::Resurrect => 6,
+        Effect::Hack => 7,
     };
     unsafe {
         *out = if mv.from == NO_SQ { -1 } else { mv.from as c_int };

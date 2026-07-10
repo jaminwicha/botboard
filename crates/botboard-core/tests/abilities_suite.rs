@@ -15,6 +15,7 @@ const ENGINEER: TypeId = 3; // leaper(0,1), wall range 1
 const LASERBOT: TypeId = 4; // leaper(0,1), laser range 3 with retreat
 const SCOUT: TypeId = 5; // leaper(0,1)+(1,1), overclock, 2 HP
 const NECRO: TypeId = 6; // leaper(0,1), resurrect range 1
+const HACKER: TypeId = 7; // leaper(0,1), hack range 2
 
 fn robot_types() -> Vec<PieceTypeDef> {
     vec![
@@ -32,6 +33,8 @@ fn robot_types() -> Vec<PieceTypeDef> {
             .overclock(),
         PieceTypeDef::new("necro", 'N', vec![MoveBit::leaper(0, 1)])
             .abilities(vec![AbilityBit::Resurrect { range: 1 }]),
+        PieceTypeDef::new("hacker", 'H', vec![MoveBit::leaper(0, 1)])
+            .abilities(vec![AbilityBit::Hack { range: 2 }]),
     ]
 }
 
@@ -327,3 +330,51 @@ fn resurrect_offers_one_candidate_per_dead_type() {
     pos.set_stm(&g, 1);
     pos.unmake(&g, &u1);
 }
+
+#[test]
+fn hack_flips_a_weakened_enemy() {
+    let g = robot_game(vec![
+        (KING, 0, 0, 0),
+        (KING, 1, 7, 7),
+        (HACKER, 0, 3, 3),
+        (TANK, 1, 4, 4),   // 3 HP: defended, unhackable
+        (SCOUT, 1, 2, 4),  // 2 HP: unhackable until damaged
+    ]);
+    let mut pos = Position::startpos(&g);
+    assert!(
+        !legal_moves(&g, &mut pos).iter().any(|m| m.effect == Effect::Hack),
+        "healthy targets resist the hack (predicate: exactly 1 HP)"
+    );
+
+    // Wear the scout down to 1 HP: its defenses are open.
+    let si = pos.board[g.board.sq(2, 4) as usize] as usize;
+    pos.hp[si] = 1;
+    pos.rehash(&g);
+
+    let moves = legal_moves(&g, &mut pos);
+    let hacks: Vec<_> = moves.iter().filter(|m| m.effect == Effect::Hack).collect();
+    assert_eq!(hacks.len(), 1, "only the weakened scout is hackable");
+    assert_eq!(hacks[0].to, g.board.sq(2, 4));
+    assert!(move_str(&g, hacks[0]).contains("!hack:"));
+
+    let mv = *hacks[0];
+    let h0 = pos.hash;
+    let u = pos.make(&g, &mv);
+    assert_eq!(pos.pieces[si].side, 0, "the scout fights for us now");
+    assert_eq!(pos.stm, 1, "hack consumed the turn (§3.4)");
+    pos.unmake(&g, &u);
+    assert_eq!(pos.pieces[si].side, 1, "unmake gives it back");
+    assert_eq!(pos.hash, h0, "unmake restores the full state key");
+}
+
+#[test]
+fn hack_never_touches_royals() {
+    // Enemy king wandered adjacent at 1 HP: still not a legal hack target.
+    let g = robot_game(vec![(KING, 0, 0, 0), (HACKER, 0, 3, 3), (KING, 1, 4, 4)]);
+    let mut pos = Position::startpos(&g);
+    assert!(
+        !legal_moves(&g, &mut pos).iter().any(|m| m.effect == Effect::Hack),
+        "royals cannot be flipped — capture-the-controller is its own system"
+    );
+}
+

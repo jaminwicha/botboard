@@ -394,6 +394,24 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                     }
                 }
             }
+            AbilityBit::Hack { range } => {
+                // The target predicate (§7 hack): a non-royal enemy at
+                // exactly 1 HP in range — flip it, deterministically.
+                for p in &pos.pieces {
+                    let Loc::Board(sq) = p.loc else { continue };
+                    if p.side == stm || g.types[p.t as usize].royal {
+                        continue;
+                    }
+                    let idx = pos.board[sq as usize] as usize;
+                    if pos.hp[idx] != 1 {
+                        continue;
+                    }
+                    let (x, y) = g.board.xy(sq);
+                    if (x - fx).abs().max((y - fy).abs()) as u8 <= range {
+                        out.push(Move::ability(from, sq, Effect::Hack, NO_SQ));
+                    }
+                }
+            }
             AbilityBit::Resurrect { range } => {
                 // One candidate per dead friendly type (piece identity
                 // within a type is interchangeable): revive onto any empty

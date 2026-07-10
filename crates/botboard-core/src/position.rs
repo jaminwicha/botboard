@@ -83,6 +83,8 @@ pub struct Undo {
     terrain_change: Option<(u16, u8)>,
     /// Resurrect: (revived piece index, its prior `moved` flag).
     revived: Option<(usize, bool)>,
+    /// Hack: (flipped piece index, its prior side).
+    hacked: Option<(usize, Side)>,
     prior_ep: u16,
     prior_hash: u64,
 }
@@ -374,6 +376,7 @@ impl Position {
                 hp_changes: Vec::new(),
                 terrain_change: None,
                 revived: None,
+                hacked: None,
                 prior_ep,
                 prior_hash,
             };
@@ -406,6 +409,7 @@ impl Position {
             hp_changes: Vec::new(),
             terrain_change: None,
             revived: None,
+            hacked: None,
             prior_ep,
             prior_hash,
         };
@@ -440,6 +444,18 @@ impl Position {
                             self.pieces[mi].moved = true;
                             self.xor_piece(g, mi);
                         }
+                    }
+                    Effect::Hack => {
+                        // Flip the target to the caster's side. Masks track
+                        // side, so lift under the old side and re-place
+                        // under the new; the hash brackets the whole flip.
+                        let ti = self.board[mv.to as usize] as usize;
+                        u.hacked = Some((ti, self.pieces[ti].side));
+                        self.xor_piece(g, ti);
+                        self.lift(ti, mv.to);
+                        self.pieces[ti].side = self.stm;
+                        self.place(ti, mv.to);
+                        self.xor_piece(g, ti);
                     }
                     Effect::Resurrect => {
                         // Revive the first dead friendly of the named type
@@ -566,6 +582,12 @@ impl Position {
             self.lift(ri, mv.to);
             self.pieces[ri].loc = Loc::Dead;
             self.pieces[ri].moved = rmoved;
+        }
+
+        if let Some((hi, side)) = u.hacked {
+            self.lift(hi, mv.to);
+            self.pieces[hi].side = side;
+            self.place(hi, mv.to);
         }
 
         // Put the mover back wherever it now stands.
