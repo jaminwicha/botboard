@@ -75,6 +75,14 @@ pub fn gate(belief: &Belief, material: &[i32], cfg: &LadderConfig) -> Rung {
     rung
 }
 
+/// What one ladder decision cost (for profiling/attribution; `oos` is
+/// populated only when the gate dispatched to rung 2).
+#[derive(Clone, Copy, Debug)]
+pub struct LadderTrace {
+    pub rung: Rung,
+    pub oos: Option<crate::oos::OosStats>,
+}
+
 /// Choose a move for `pos.stm` given its belief. `truth` is ground truth;
 /// hidden information reaches the chooser only through `belief`-consistent
 /// determinizations (§8.6's no-leakage discipline).
@@ -86,8 +94,35 @@ pub fn choose_move(
     cfg: &LadderConfig,
     rng: &mut Rng,
 ) -> Option<(Move, Rung)> {
+    choose_move_traced(g, truth, belief, searcher, cfg, rng).map(|(m, t)| (m, t.rung))
+}
+
+/// `choose_move` plus per-decision counters. Identical move selection —
+/// rung 2 runs through the same `Oos::choose`, only the stats are kept.
+pub fn choose_move_traced(
+    g: &GameDef,
+    truth: &mut Position,
+    belief: &Belief,
+    searcher: &mut Searcher,
+    cfg: &LadderConfig,
+    rng: &mut Rng,
+) -> Option<(Move, LadderTrace)> {
     let rung = gate(belief, &searcher.eval.material, cfg);
-    choose_move_with_rung(g, truth, belief, searcher, cfg, rng, rung).map(|m| (m, rung))
+    let mut trace = LadderTrace { rung, oos: None };
+    let mv = if rung == Rung::R2Sound {
+        let mut oos = crate::oos::Oos::new();
+        let ocfg = crate::oos::OosConfig {
+            iterations: cfg.oos_iterations,
+            depth: cfg.oos_depth,
+            ..Default::default()
+        };
+        let mv = oos.choose(g, truth, belief, searcher, &ocfg, rng).map(|(mv, _)| mv);
+        trace.oos = Some(oos.stats);
+        mv
+    } else {
+        choose_move_with_rung(g, truth, belief, searcher, cfg, rng, rung)
+    };
+    mv.map(|m| (m, trace))
 }
 
 /// Run a specific rung directly (gate bypass — used by gate training,

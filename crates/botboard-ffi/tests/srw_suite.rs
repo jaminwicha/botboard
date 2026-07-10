@@ -244,3 +244,46 @@ fn pricing_is_engine_derived_and_ordered() {
         costs[1]
     );
 }
+
+/// Regression for the veilworks vet-sweep DNF (docs/training-report.md §4):
+/// heal Bits used to qualify as "captures" in quiescence (friendly-occupied
+/// target), and since heal undoes armor-strike damage the damage/heal tree
+/// had no monotone bound — one tier-1 ai_move ran for CPU-hours. The army
+/// below is the exact sweep game (veilworks, budget 8, seed 31, game 3).
+/// With the enemy-target qsearch filter the whole battle finishes in
+/// well under a second; if this test hangs, that invariant regressed.
+#[test]
+fn heal_army_tier1_battle_terminates_deterministically() {
+    let spec = include_str!("fixtures/veilworks_b8_s31_g3_t1.json");
+    let run = || -> (c_int, c_int, Vec<String>) {
+        let s = c(spec);
+        let b = srw_create(s.as_ptr());
+        assert!(!b.is_null(), "fixture must build");
+        let mut mv = [0 as c_char; 32];
+        let mut log = Vec::new();
+        for _ in 0..300 {
+            if srw_status(b) != 0 {
+                break;
+            }
+            let r = srw_ai_move(b, mv.as_mut_ptr(), 32);
+            assert!(r >= 0, "ai_move failed: {r}");
+            let m = buf_str(&mv);
+            assert_eq!(srw_apply(b, c(&m).as_ptr()), 0);
+            log.push(m);
+        }
+        let st = srw_status(b);
+        let reason = srw_end_reason(b);
+        srw_destroy(b);
+        (st, reason, log)
+    };
+    let (st1, reason1, log1) = run();
+    let (st2, _, log2) = run();
+    assert_ne!(st1, 0, "heal-army battle must reach a verdict");
+    assert!(log1.len() <= 240, "must end before the ply cap, got {}", log1.len());
+    assert!(
+        [1, 2, 5].contains(&reason1),
+        "expected a decisive/repetition end, got reason {reason1}"
+    );
+    assert_eq!(st1, st2, "same seed ⇒ same verdict");
+    assert_eq!(log1, log2, "same seed ⇒ identical move log (§10.1)");
+}

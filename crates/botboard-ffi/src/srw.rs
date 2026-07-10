@@ -44,7 +44,7 @@ use botboard_core::game::{
     TurnPolicy, TypeId,
 };
 use botboard_core::geometry::DirFilter;
-use botboard_core::ladder::{choose_move, LadderConfig, Rung};
+use botboard_core::ladder::{choose_move_traced, LadderConfig, LadderTrace, Rung};
 use botboard_core::movegen::{legal_moves, status, Status};
 use botboard_core::moves::{move_str, Effect, MoveKind, NO_SQ};
 use botboard_core::position::{Loc, Position, T_NONE, T_PIT, T_WALL};
@@ -72,6 +72,12 @@ pub struct SrwBattle {
     /// Encoded terminal status once decided out-of-band (royal death,
     /// FFA elimination, repetition, ply cap): 1+side win, 9 draw.
     over: Option<c_int>,
+    /// Why the battle ended: 0 not ended, 1 elimination (royal death /
+    /// stuck seat), 2 threefold repetition, 3 ply cap, 4 no-progress
+    /// adjudication, 5 mate/stalemate.
+    end_reason: c_int,
+    /// Counters from the most recent `ai_move` ladder decision.
+    last_trace: Option<LadderTrace>,
 }
 
 /// Competence tiers (SRW §6 dial 2): the ladder run at tuned strength.
@@ -304,6 +310,8 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
         plies: 0,
         max_plies: spec.num("max_plies", 400.0) as u32,
         over: None,
+        end_reason: 0,
+        last_trace: None,
         g,
     })
 }
@@ -382,8 +390,10 @@ impl SrwBattle {
         if live == 1 {
             let w = self.alive.iter().position(|&a| a).unwrap() as c_int;
             self.over = Some(1 + w);
+            self.end_reason = 1;
         } else if live == 0 {
             self.over = Some(9);
+            self.end_reason = 1;
         }
     }
 
@@ -395,8 +405,14 @@ impl SrwBattle {
         if self.g.sides == 2 {
             match status(&self.g, &mut self.pos) {
                 Status::Ongoing => 0,
-                Status::Win(s) => 1 + s as c_int,
-                Status::Draw => 9,
+                Status::Win(s) => {
+                    self.end_reason = 5;
+                    1 + s as c_int
+                }
+                Status::Draw => {
+                    self.end_reason = 5;
+                    9
+                }
             }
         } else {
             0
@@ -419,10 +435,12 @@ impl SrwBattle {
             b.observe(&self.g, &pre, &mv);
         }
         self.history.push(self.pos.hash);
-        if self.history.iter().filter(|&&h| h == self.pos.hash).count() >= 3
-            || self.plies >= self.max_plies
-        {
+        if self.history.iter().filter(|&&h| h == self.pos.hash).count() >= 3 {
             self.over = Some(9);
+            self.end_reason = 2;
+        } else if self.plies >= self.max_plies {
+            self.over = Some(9);
+            self.end_reason = 3;
         }
         self.upkeep();
         0
@@ -437,7 +455,7 @@ impl SrwBattle {
         }
         let stm = self.pos.stm as usize;
         if self.g.sides == 2 {
-            let Some((mv, rung)) = choose_move(
+            let Some((mv, trace)) = choose_move_traced(
                 &self.g,
                 &mut self.pos,
                 &self.beliefs[stm],
@@ -447,6 +465,8 @@ impl SrwBattle {
             ) else {
                 return -2;
             };
+            let rung = trace.rung;
+            self.last_trace = Some(trace);
             let r = write_str(&move_str(&self.g, &mv), buf, cap);
             if r < 0 {
                 return r;
@@ -687,6 +707,44 @@ pub extern "C" fn srw_apply(b: *mut SrwBattle, mv: *const c_char) -> c_int {
 pub extern "C" fn srw_ai_move(b: *mut SrwBattle, buf: *mut c_char, cap: c_int) -> c_int {
     let Some(b) = (unsafe { b.as_mut() }) else { return -1 };
     b.ai_move(buf, cap)
+}
+
+/// Why the battle ended: 0 not ended, 1 elimination (royal death / stuck
+/// seat), 2 threefold repetition, 3 ply cap, 4 no-progress adjudication,
+/// 5 mate/stalemate. Call after `srw_status` reports non-zero.
+#[no_mangle]
+pub extern "C" fn srw_end_reason(b: *mut SrwBattle) -> c_int {
+    unsafe { b.as_ref() }.map_or(-1, |b| b.end_reason)
+}
+
+/// Counters from the most recent `srw_ai_move` ladder decision, written as
+/// u64s: [rung, oos_iterations, walk_nodes, terminal_nodes, depth0_leaves,
+/// update_nodes, sample_nodes, moves_generated, table_nodes]. The OOS
+/// fields are zero unless the decision dispatched to rung 2. Returns the
+/// number of values written, or negative (-3 if no decision yet).
+#[no_mangle]
+pub extern "C" fn srw_last_move_stats(b: *mut SrwBattle, out: *mut u64, cap: c_int) -> c_int {
+    let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
+    if out.is_null() || cap < 9 {
+        return -2;
+    }
+    let Some(trace) = b.last_trace else { return -3 };
+    let s = trace.oos.unwrap_or_default();
+    let vals: [u64; 9] = [
+        trace.rung as u64,
+        s.iterations,
+        s.walk_nodes,
+        s.terminal_nodes,
+        s.depth0_leaves,
+        s.update_nodes,
+        s.sample_nodes,
+        s.moves_generated,
+        s.table_nodes,
+    ];
+    for (i, v) in vals.iter().enumerate() {
+        unsafe { *out.add(i) = *v };
+    }
+    vals.len() as c_int
 }
 
 /// Price the setup's piece types with the engine cost model (SRW §8: the

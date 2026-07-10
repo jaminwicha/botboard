@@ -284,15 +284,23 @@ impl Searcher {
     fn qsearch(&mut self, g: &GameDef, pos: &mut Position, mut alpha: i32, beta: i32, ply: i32) -> i32 {
         self.nodes += 1;
         let stand = self.eval.stm(g, pos);
-        if stand >= beta || ply > 64 {
+        if stand >= beta || ply > 64 || self.nodes >= self.node_budget {
             return stand;
         }
         if stand > alpha {
             alpha = stand;
         }
+        // Enemy-occupied targets only: every recursion strictly reduces the
+        // opponent's total HP (armor strike or kill), so the line is bounded.
+        // Friendly-target abilities (Heal) would undo that progress and make
+        // damage/heal cycles explode toward the ply cap — they are position
+        // maintenance, not tactics, and stand-pat covers them.
         let mut moves: Vec<Move> = pseudo_moves(g, pos)
             .into_iter()
-            .filter(|m| m.kind != MoveKind::Drop && pos.piece_at(m.to).is_some())
+            .filter(|m| {
+                m.kind != MoveKind::Drop
+                    && pos.piece_at(m.to).is_some_and(|p| p.side != pos.stm)
+            })
             .collect();
         self.order(g, pos, &mut moves, None, ply);
         for mv in &moves {

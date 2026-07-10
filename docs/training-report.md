@@ -242,3 +242,34 @@ pathology, not a tuning issue.
 - `tools/VetSweep/` — C# harness for §4 (references SRW.Core.csproj).
 - `native/libbotboard.dylib` — engine cdylib built for the test runs
   (untracked; rebuild with `cargo build --release -p botboard-ffi`).
+
+## Addendum (2026-07-10): veilworks DNF root-caused and fixed
+
+The §4 veilworks tier-1 DNF was profiled engine-side (`crates/botboard-ffi/
+examples/srw_profile.rs` over exact sweep-game fixtures dumped with
+`VetSweep dump`). The report's hypothesis — heal-loop plies × tier-1 OOS
+cost — was wrong on both counts:
+
+- **OOS was innocent.** Rung 2 runs ~50–60 ms/move at tier 1. Games 0–2
+  and 4–5 of the DNF cell complete in 0.04–3.4 s each.
+- **The stall was one `qsearch` call.** Game 3's very first `ai_move`
+  (rung 0/1 negamax) never returned: a 15 s `sample` put 100 % of stacks
+  in quiescence recursion. `qsearch`'s capture filter admitted any move
+  onto an *occupied* square — which includes friendly-target `Heal`
+  abilities. Captures terminate quiescence because material/HP strictly
+  falls; heal *undoes* armor-strike damage, so damage/heal lines had no
+  monotone bound and the ply-64 cap left a ~b^64 tree. The node budget
+  was also never checked inside `qsearch`.
+
+Fix (botboard `search.rs`): quiescence now recurses only on
+**enemy-occupied targets** (every line strictly reduces opponent HP) and
+stands pat once the node budget is exhausted. Deterministic; chess/
+xiangqi/shogi are ability-free and unaffected; all suites green plus a
+new regression (`heal_army_tier1_battle_terminates_deterministically`,
+fixture = the exact stalling game).
+
+Post-fix: the full veilworks tier-1 cell (6 games) completes in seconds;
+tier-2 informed play dispatches rung 0 as assumed. The `EncounterFactory`
+veilworks tier cap (suggestion 3) is therefore lifted. The "inert armies:
+100 % draws" flag on veilworks mirrors persists at tier 1 (mean ~51
+plies, threefold repetition) — a balance item, not a perf one.

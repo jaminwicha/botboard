@@ -46,6 +46,25 @@ pub struct OosConfig {
     pub scale: f64,
 }
 
+/// Per-solve counters (reset by `choose`) — cheap u64 adds so the cost of a
+/// solve can be attributed without a profiler attached.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct OosStats {
+    pub iterations: u64,
+    /// walk() entries == `legal_moves` calls inside the tree.
+    pub walk_nodes: u64,
+    pub terminal_nodes: u64,
+    pub depth0_leaves: u64,
+    /// Nodes where the updating player branched over every action.
+    pub update_nodes: u64,
+    /// Nodes where the opponent sampled one action.
+    pub sample_nodes: u64,
+    /// Sum of legal-move-list lengths across walk nodes (branching mass).
+    pub moves_generated: u64,
+    /// Distinct infosets in the table at end of solve.
+    pub table_nodes: u64,
+}
+
 impl Default for OosConfig {
     fn default() -> Self {
         OosConfig { iterations: 256, depth: 4, scale: 300.0 }
@@ -63,11 +82,12 @@ fn child_key(key: u64, g: &GameDef, mv: &Move) -> u64 {
 
 pub struct Oos {
     nodes: HashMap<u64, InfoNode>,
+    pub stats: OosStats,
 }
 
 impl Oos {
     pub fn new() -> Self {
-        Oos { nodes: HashMap::new() }
+        Oos { nodes: HashMap::new(), stats: OosStats::default() }
     }
 
     /// Run OOS from `truth` under `belief` and return the average-strategy
@@ -81,6 +101,7 @@ impl Oos {
         cfg: &OosConfig,
         rng: &mut Rng,
     ) -> Option<(Move, Vec<f64>)> {
+        self.stats = OosStats::default();
         let root_moves = legal_moves(g, truth);
         if root_moves.is_empty() {
             return None;
@@ -94,11 +115,13 @@ impl Oos {
         });
         let updating_root = truth.stm;
         for it in 0..cfg.iterations {
+            self.stats.iterations += 1;
             let mut world = determinize(g, truth, belief, rng, 32);
             // Alternate the updating player so both sides' infosets learn.
             let update_for = (updating_root + (it % 2) as u8) % g.sides;
             self.walk(g, &mut world, searcher, cfg, rng, 1, cfg.depth, update_for);
         }
+        self.stats.table_nodes = self.nodes.len() as u64;
         // Average strategy at the root infoset.
         let root = self.nodes.get(&1)?;
         let total: f64 = root.strat_sum.iter().sum();
@@ -125,8 +148,11 @@ impl Oos {
         update_for: u8,
     ) -> f64 {
         let stm = world.stm;
+        self.stats.walk_nodes += 1;
         let moves = legal_moves(g, world);
+        self.stats.moves_generated += moves.len() as u64;
         if moves.is_empty() {
+            self.stats.terminal_nodes += 1;
             // Terminal: mate/stalemate — utility for the updating player.
             let in_check = world.royal_attacked(g, stm);
             let loser_is_stm = in_check
@@ -137,6 +163,7 @@ impl Oos {
             return if stm == update_for { 0.0 } else { 1.0 };
         }
         if depth == 0 {
+            self.stats.depth0_leaves += 1;
             // Depth-capped leaf: shared evaluator, squashed to [0,1].
             let v = searcher.eval.stm(g, world) as f64 / cfg.scale;
             let p = 1.0 / (1.0 + (-v).exp());
@@ -155,6 +182,7 @@ impl Oos {
         let node_moves = node.moves.clone();
 
         if stm == update_for {
+            self.stats.update_nodes += 1;
             // External sampling: explore every action of the updating player.
             let mut util = vec![0.0f64; node_moves.len()];
             let mut node_util = 0.0;
@@ -187,6 +215,7 @@ impl Oos {
             }
             node_util
         } else {
+            self.stats.sample_nodes += 1;
             // Sample the opponent per its current strategy (restricted to
             // moves legal in this world).
             let legal_idx: Vec<usize> = (0..node_moves.len())
