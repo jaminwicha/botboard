@@ -134,4 +134,7 @@ pub enum AbilityBit {
     CreateWall { range: u8 },
     DigPit { range: u8 },
     Laser { range: u8, retreat: bool },
+    /// Revive a dead friendly non-royal piece onto an empty in-range
+    /// square at 1 HP (the SRW §7 resurrect controller spell).
+    Resurrect { range: u8 },
 }

@@ -31,6 +31,9 @@ pub enum Effect {
     Laser,
     /// Act-twice: second-step destination in `aux`, self −1 HP.
     Twice,
+    /// Revive a dead friendly piece at `to`; `drop_type` names which type
+    /// re-enters (piece identity within a type is interchangeable).
+    Resurrect,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,6 +75,14 @@ impl Move {
     pub fn ability(from: u16, to: u16, effect: Effect, aux: u16) -> Self {
         Move { kind: MoveKind::Ability, effect, aux, ..Self::normal(from, to) }
     }
+    pub fn resurrect(from: u16, to: u16, t: TypeId) -> Self {
+        Move {
+            kind: MoveKind::Ability,
+            effect: Effect::Resurrect,
+            drop_type: t,
+            ..Self::normal(from, to)
+        }
+    }
     pub fn compound(from: u16, to: u16, second: u16) -> Self {
         Move { kind: MoveKind::Compound, effect: Effect::Twice, aux: second, ..Self::normal(from, to) }
     }
@@ -93,11 +104,15 @@ pub fn move_str(g: &GameDef, mv: &Move) -> String {
         ),
         MoveKind::Ability => {
             let name = match mv.effect {
-                Effect::Heal(_) => "heal",
-                Effect::Wall => "wall",
-                Effect::Pit => "pit",
-                Effect::Laser => "laser",
-                _ => "fx",
+                Effect::Heal(_) => "heal".to_string(),
+                Effect::Wall => "wall".to_string(),
+                Effect::Pit => "pit".to_string(),
+                Effect::Laser => "laser".to_string(),
+                // The revived type's glyph disambiguates ("e2!rezT:d3").
+                Effect::Resurrect => {
+                    format!("rez{}", g.types[mv.drop_type as usize].glyph)
+                }
+                _ => "fx".to_string(),
             };
             let mut s = format!("{}!{}:{}", sq_name(g, mv.from), name, sq_name(g, mv.to));
             if mv.aux != NO_SQ {

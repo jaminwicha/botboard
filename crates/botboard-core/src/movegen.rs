@@ -394,6 +394,32 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                     }
                 }
             }
+            AbilityBit::Resurrect { range } => {
+                // One candidate per dead friendly type (piece identity
+                // within a type is interchangeable): revive onto any empty
+                // open square in range, at 1 HP. Royals stay dead — their
+                // loss decided something.
+                for t2 in 0..g.types.len() {
+                    if g.types[t2].royal {
+                        continue;
+                    }
+                    let has_dead = pos.pieces.iter().any(|p| {
+                        p.side == stm && p.t == t2 as TypeId && p.loc == Loc::Dead
+                    });
+                    if !has_dead {
+                        continue;
+                    }
+                    for sq in 0..g.board.ncells() as u16 {
+                        if pos.cell_obstructed(sq) {
+                            continue;
+                        }
+                        let (x, y) = g.board.xy(sq);
+                        if (x - fx).abs().max((y - fy).abs()) as u8 <= range {
+                            out.push(Move::resurrect(from, sq, t2 as TypeId));
+                        }
+                    }
+                }
+            }
             AbilityBit::Laser { range, retreat } => {
                 // A bounded capture-at-range rider that never vacates the
                 // origin (§3.2 ranged effects).

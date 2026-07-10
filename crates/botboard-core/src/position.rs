@@ -81,6 +81,8 @@ pub struct Undo {
     /// (piece index, prior hp) — strikes, heals, overclock self-damage.
     hp_changes: Vec<(usize, i16)>,
     terrain_change: Option<(u16, u8)>,
+    /// Resurrect: (revived piece index, its prior `moved` flag).
+    revived: Option<(usize, bool)>,
     prior_ep: u16,
     prior_hash: u64,
 }
@@ -371,6 +373,7 @@ impl Position {
                 partner: None,
                 hp_changes: Vec::new(),
                 terrain_change: None,
+                revived: None,
                 prior_ep,
                 prior_hash,
             };
@@ -402,6 +405,7 @@ impl Position {
             partner: None,
             hp_changes: Vec::new(),
             terrain_change: None,
+            revived: None,
             prior_ep,
             prior_hash,
         };
@@ -436,6 +440,28 @@ impl Position {
                             self.pieces[mi].moved = true;
                             self.xor_piece(g, mi);
                         }
+                    }
+                    Effect::Resurrect => {
+                        // Revive the first dead friendly of the named type
+                        // (identity within a type is interchangeable, so
+                        // lowest index keeps it deterministic) at 1 HP.
+                        let ri = self
+                            .pieces
+                            .iter()
+                            .position(|p| {
+                                p.side == self.stm
+                                    && p.t == mv.drop_type
+                                    && p.loc == Loc::Dead
+                            })
+                            .expect("resurrect with no dead piece of that type");
+                        u.revived = Some((ri, self.pieces[ri].moved));
+                        u.hp_changes.push((ri, self.hp[ri]));
+                        // Dead pieces are unkeyed: mutate fully, then one
+                        // trailing XOR keys the revived state.
+                        self.hp[ri] = 1;
+                        self.place(ri, mv.to);
+                        self.pieces[ri].moved = true;
+                        self.xor_piece(g, ri);
                     }
                     _ => {}
                 }
@@ -533,6 +559,12 @@ impl Position {
             let rook_to = (mv.from + mv.to) / 2;
             self.lift(ri, rook_to);
             self.place(ri, rsq);
+            self.pieces[ri].moved = rmoved;
+        }
+
+        if let Some((ri, rmoved)) = u.revived {
+            self.lift(ri, mv.to);
+            self.pieces[ri].loc = Loc::Dead;
             self.pieces[ri].moved = rmoved;
         }
 

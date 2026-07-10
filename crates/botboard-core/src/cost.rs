@@ -113,12 +113,18 @@ pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
         m_utility *= 1.8;
     }
     let mut s_nerfs = 0.0;
+    let mut s_flat = 0.0;
     for a in &ty.abilities {
-        if let crate::bits::AbilityBit::Laser { retreat: true, .. } = a {
-            s_nerfs += 0.5;
+        match a {
+            crate::bits::AbilityBit::Laser { retreat: true, .. } => s_nerfs += 0.5,
+            // Board-state-dependent abilities generate no moves on the
+            // mobility-integral board, so they carry Appendix-B-style flat
+            // priors until self-play refits them (§4.3).
+            crate::bits::AbilityBit::Resurrect { .. } => s_flat += 4.0,
+            _ => {}
         }
     }
-    (c_base * m_utility - s_nerfs).max(1.0)
+    (c_base * m_utility - s_nerfs + s_flat).max(1.0)
 }
 
 /// Fit (w_move, w_attack) by least squares against the anchors:

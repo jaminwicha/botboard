@@ -14,6 +14,7 @@ const MEDIC: TypeId = 2; // leaper(0,1)+(1,1), heal 1 range 1
 const ENGINEER: TypeId = 3; // leaper(0,1), wall range 1
 const LASERBOT: TypeId = 4; // leaper(0,1), laser range 3 with retreat
 const SCOUT: TypeId = 5; // leaper(0,1)+(1,1), overclock, 2 HP
+const NECRO: TypeId = 6; // leaper(0,1), resurrect range 1
 
 fn robot_types() -> Vec<PieceTypeDef> {
     vec![
@@ -29,6 +30,8 @@ fn robot_types() -> Vec<PieceTypeDef> {
         PieceTypeDef::new("scout", 'S', vec![MoveBit::leaper(0, 1), MoveBit::leaper(1, 1)])
             .hp(2)
             .overclock(),
+        PieceTypeDef::new("necro", 'N', vec![MoveBit::leaper(0, 1)])
+            .abilities(vec![AbilityBit::Resurrect { range: 1 }]),
     ]
 }
 
@@ -237,4 +240,90 @@ fn utility_multipliers_price_armor_and_overclock() {
         scout > medic * 1.5,
         "armor(×1.5)·overclock(×1.8) must raise the prior: scout {scout:.2} vs medic-base {medic:.2}"
     );
+}
+
+#[test]
+fn resurrect_revives_a_dead_friendly_at_one_hp() {
+    let g = robot_game(vec![
+        (KING, 0, 0, 0),
+        (KING, 1, 7, 7),
+        (NECRO, 0, 4, 4),
+        (MEDIC, 0, 3, 3),
+        (TANK, 1, 3, 6),
+    ]);
+    let mut pos = Position::startpos(&g);
+    // Nobody dead: no resurrect on offer.
+    assert!(
+        !legal_moves(&g, &mut pos).iter().any(|m| m.effect == Effect::Resurrect),
+        "resurrect needs a dead friendly"
+    );
+
+    // The medic falls (out-of-band, as a battle would leave it).
+    let mi = pos.board[g.board.sq(3, 3) as usize] as usize;
+    pos.board[g.board.sq(3, 3) as usize] = -1;
+    pos.pieces[mi].loc = Loc::Dead;
+    pos.rehash(&g);
+
+    let moves = legal_moves(&g, &mut pos);
+    let rez: Vec<_> = moves.iter().filter(|m| m.effect == Effect::Resurrect).collect();
+    assert!(!rez.is_empty(), "necro must offer resurrect once a friendly is dead");
+    assert!(
+        rez.iter().all(|m| m.drop_type == MEDIC),
+        "only the dead medic is revivable (royals never are)"
+    );
+    // Notation is unambiguous about which type re-enters.
+    assert!(move_str(&g, rez[0]).contains("!rezM:"));
+
+    let mv = rez
+        .iter()
+        .find(|m| m.to == g.board.sq(4, 5))
+        .copied()
+        .copied()
+        .expect("an in-range empty square");
+    let h0 = pos.hash;
+    let u = pos.make(&g, &mv);
+    assert!(matches!(pos.pieces[mi].loc, Loc::Board(_)), "medic back on board");
+    assert_eq!(pos.hp[mi], 1, "revived at 1 HP");
+    assert_eq!(pos.stm, 1, "resurrect consumed the turn (§3.4)");
+    pos.unmake(&g, &u);
+    assert_eq!(pos.hash, h0, "unmake restores the full state key");
+    assert!(matches!(pos.pieces[mi].loc, Loc::Dead), "medic dead again");
+}
+
+#[test]
+fn resurrect_offers_one_candidate_per_dead_type() {
+    // Two dead medics must not double the move list: piece identity within
+    // a type is interchangeable.
+    let g = robot_game(vec![
+        (KING, 0, 0, 0),
+        (KING, 1, 7, 7),
+        (NECRO, 0, 4, 4),
+        (MEDIC, 0, 2, 2),
+        (MEDIC, 0, 2, 4),
+        (TANK, 1, 3, 6),
+    ]);
+    let mut pos = Position::startpos(&g);
+    for sq in [g.board.sq(2, 2), g.board.sq(2, 4)] {
+        let i = pos.board[sq as usize] as usize;
+        pos.board[sq as usize] = -1;
+        pos.pieces[i].loc = Loc::Dead;
+    }
+    pos.rehash(&g);
+
+    let moves = legal_moves(&g, &mut pos);
+    let rez: Vec<_> = moves.iter().filter(|m| m.effect == Effect::Resurrect).collect();
+    let unique: std::collections::HashSet<_> =
+        rez.iter().map(|m| (m.to, m.drop_type)).collect();
+    assert_eq!(rez.len(), unique.len(), "no duplicate resurrect candidates");
+    // Reviving twice brings back both bodies, lowest index first.
+    let first = rez[0];
+    let u1 = pos.make(&g, first);
+    let again: Vec<_> = {
+        pos.set_stm(&g, 0);
+        let ms = legal_moves(&g, &mut pos);
+        ms.into_iter().filter(|m| m.effect == Effect::Resurrect).collect()
+    };
+    assert!(!again.is_empty(), "second body still revivable");
+    pos.set_stm(&g, 1);
+    pos.unmake(&g, &u1);
 }
