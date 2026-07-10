@@ -112,6 +112,9 @@ pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
     if ty.overclock {
         m_utility *= 1.8;
     }
+    if ty.stealth {
+        m_utility *= 1.4; // Appendix B: concealment multiplier
+    }
     let mut s_nerfs = 0.0;
     let mut s_flat = 0.0;
     for a in &ty.abilities {
@@ -122,8 +125,13 @@ pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
             // priors until self-play refits them (§4.3).
             crate::bits::AbilityBit::Resurrect { .. } => s_flat += 4.0,
             crate::bits::AbilityBit::Hack { .. } => s_flat += 5.0,
+            crate::bits::AbilityBit::MineLayer { .. } => s_flat += 2.0,
             _ => {}
         }
+    }
+    if ty.hologram {
+        // A decoy's value is the bluff, not the body (Appendix B +2.5).
+        s_flat += 2.5;
     }
     (c_base * m_utility - s_nerfs + s_flat).max(1.0)
 }

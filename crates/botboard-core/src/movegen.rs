@@ -297,6 +297,19 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
         }
     }
 
+    // Holograms move but never threaten (SRW Appendix B): keep only their
+    // quiet kernel steps — no captures, abilities, compounds, or specials.
+    out.retain(|m| {
+        if m.kind == MoveKind::Drop || m.from == NO_SQ {
+            return true;
+        }
+        let Some(p) = pos.piece_at(m.from) else { return true };
+        if !g.types[p.t as usize].hologram {
+            return true;
+        }
+        m.kind == MoveKind::Normal && pos.board[m.to as usize] < 0
+    });
+
     out
 }
 
@@ -378,14 +391,20 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                     }
                 }
             }
-            AbilityBit::CreateWall { range } | AbilityBit::DigPit { range } => {
-                let eff = if matches!(a, AbilityBit::CreateWall { .. }) {
-                    Effect::Wall
-                } else {
-                    Effect::Pit
+            AbilityBit::CreateWall { range }
+            | AbilityBit::DigPit { range }
+            | AbilityBit::MineLayer { range } => {
+                let eff = match a {
+                    AbilityBit::CreateWall { .. } => Effect::Wall,
+                    AbilityBit::DigPit { .. } => Effect::Pit,
+                    _ => Effect::Mine,
                 };
                 for sq in 0..g.board.ncells() as u16 {
-                    if sq == from || pos.cell_obstructed(sq) {
+                    // Bare floor only: no stacking terrain on mines.
+                    if sq == from
+                        || pos.cell_obstructed(sq)
+                        || pos.terrain[sq as usize] != crate::position::T_NONE
+                    {
                         continue;
                     }
                     let (x, y) = g.board.xy(sq);

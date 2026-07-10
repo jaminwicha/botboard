@@ -36,6 +36,8 @@ pub enum Effect {
     Resurrect,
     /// Flip the enemy piece at `to` to the caster's side.
     Hack,
+    /// Lay an owner-tagged mine on the empty square at `to`.
+    Mine,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -115,6 +117,7 @@ pub fn move_str(g: &GameDef, mv: &Move) -> String {
                     format!("rez{}", g.types[mv.drop_type as usize].glyph)
                 }
                 Effect::Hack => "hack".to_string(),
+                Effect::Mine => "mine".to_string(),
                 _ => "fx".to_string(),
             };
             let mut s = format!("{}!{}:{}", sq_name(g, mv.from), name, sq_name(g, mv.to));

@@ -154,6 +154,12 @@ pub struct PieceTypeDef {
     /// Multi-action Bit (§3.4): compiles into ⟨move, move, self −1 HP⟩
     /// compound moves — piece-local, atomic, priced ×1.8 (§4.1).
     pub overclock: bool,
+    /// Decoy (SRW Appendix B hologram): moves but cannot capture or give
+    /// check; its bluff is carried by the identity-hidden belief substrate.
+    pub hologram: bool,
+    /// Concealed presence (SRW Appendix B stealth): hidden from opponents'
+    /// search worlds until revealed — masking lives at the battle layer.
+    pub stealth: bool,
 }
 
 impl PieceTypeDef {
@@ -172,6 +178,8 @@ impl PieceTypeDef {
             drop_no_mate: false,
             max_hp: 1,
             overclock: false,
+            hologram: false,
+            stealth: false,
         }
     }
     pub fn specials(mut self, s: Vec<SpecialBit>) -> Self {
@@ -188,6 +196,14 @@ impl PieceTypeDef {
     }
     pub fn overclock(mut self) -> Self {
         self.overclock = true;
+        self
+    }
+    pub fn hologram(mut self) -> Self {
+        self.hologram = true;
+        self
+    }
+    pub fn stealth(mut self) -> Self {
+        self.stealth = true;
         self
     }
     pub fn royal(mut self) -> Self {

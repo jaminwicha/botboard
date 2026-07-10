@@ -287,3 +287,114 @@ fn heal_army_tier1_battle_terminates_deterministically() {
     assert_eq!(st1, st2, "same seed ⇒ same verdict");
     assert_eq!(log1, log2, "same seed ⇒ identical move log (§10.1)");
 }
+
+/// Appendix B presence masks over the C ABI: stealth robots are invisible
+/// to the enemy observer until adjacency or damage reveals them; enemy
+/// mines never render; full battles containing all three Bits stay
+/// deterministic.
+#[test]
+fn stealth_and_mines_are_masked_per_observer() {
+    let spec = r#"{
+  "seed": 11, "max_plies": 60,
+  "board": {"w": 7, "h": 7},
+  "sides": 2,
+  "types": [
+    {"name": "ctrl", "glyph": "C", "royal": true,
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}]},
+    {"name": "shade", "glyph": "S", "stealth": true,
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}]},
+    {"name": "sapper", "glyph": "P",
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}],
+     "abilities": [{"kind": "mine", "range": 1}]},
+    {"name": "decoy", "glyph": "D", "hologram": true,
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}]}
+  ],
+  "placements": [
+    {"t": 0, "side": 0, "x": 3, "y": 0},
+    {"t": 2, "side": 0, "x": 2, "y": 1},
+    {"t": 3, "side": 0, "x": 4, "y": 1},
+    {"t": 0, "side": 1, "x": 3, "y": 6},
+    {"t": 1, "side": 1, "x": 3, "y": 3}
+  ],
+  "tiers": [0, 0]
+}"#;
+    let b = srw_create(c(spec).as_ptr());
+    assert!(!b.is_null(), "trio setup must build");
+
+    // The shade (piece 4, side 1) is hidden from side 0, seen by side 1.
+    assert_eq!(srw_visible(b, 0, 4), 0, "stealth starts concealed");
+    assert_eq!(srw_visible(b, 1, 4), 1, "its own side always sees it");
+    // The decoy and controllers are plain to everyone.
+    assert_eq!(srw_visible(b, 0, 2), 1);
+    assert_eq!(srw_visible(b, 1, 2), 1);
+
+    // Side 0 lays a mine at c3 (sapper at c2): the enemy view shows floor.
+    assert_eq!(srw_apply(b, c("c2!mine:c3").as_ptr()), 0);
+    let mine_sq = 2 + 2 * 7; // (2,2) on a 7-wide board
+    assert_eq!(srw_terrain(b, mine_sq), 3, "ground truth holds the mine");
+    assert_eq!(srw_terrain_for(b, 0, mine_sq), 3, "the owner sees it");
+    assert_eq!(srw_terrain_for(b, 1, mine_sq), 0, "the enemy sees bare floor");
+
+    // Walk the shade next to the sapper: chebyshev adjacency reveals it.
+    assert_eq!(srw_apply(b, c("d4d3").as_ptr()), 0); // shade to d3, diagonal to c2
+    assert_eq!(srw_visible(b, 0, 4), 1, "adjacency blows the shade's cover");
+    srw_destroy(b);
+}
+
+#[test]
+fn trio_battles_run_to_verdict_deterministically() {
+    // Autoplay with stealth+mine+hologram content on both sides: the
+    // masked-world AI path must stay seed-deterministic and terminate.
+    let spec = |seed: u64| format!(r#"{{
+  "seed": {seed}, "max_plies": 120,
+  "board": {{"w": 7, "h": 7}},
+  "sides": 2,
+  "types": [
+    {{"name": "ctrl", "glyph": "C", "royal": true,
+     "moves": [{{"geom": "leaper", "m": 0, "n": 1}}, {{"geom": "leaper", "m": 1, "n": 1}}]}},
+    {{"name": "shade", "glyph": "S", "stealth": true,
+     "moves": [{{"geom": "leaper", "m": 1, "n": 2}}]}},
+    {{"name": "sapper", "glyph": "P",
+     "moves": [{{"geom": "leaper", "m": 0, "n": 1}}],
+     "abilities": [{{"kind": "mine", "range": 1}}]}},
+    {{"name": "decoy", "glyph": "D", "hologram": true,
+     "moves": [{{"geom": "leaper", "m": 0, "n": 1}}, {{"geom": "leaper", "m": 1, "n": 1}}]}}
+  ],
+  "placements": [
+    {{"t": 0, "side": 0, "x": 3, "y": 0}},
+    {{"t": 1, "side": 0, "x": 1, "y": 1}},
+    {{"t": 2, "side": 0, "x": 5, "y": 1}},
+    {{"t": 3, "side": 0, "x": 3, "y": 1}},
+    {{"t": 0, "side": 1, "x": 3, "y": 6}},
+    {{"t": 1, "side": 1, "x": 1, "y": 5}},
+    {{"t": 2, "side": 1, "x": 5, "y": 5}},
+    {{"t": 3, "side": 1, "x": 3, "y": 5}}
+  ],
+  "tiers": [1, 1]
+}}"#);
+    let run = |seed: u64| -> (c_int, Vec<String>) {
+        let s = c(&spec(seed));
+        let b = srw_create(s.as_ptr());
+        assert!(!b.is_null());
+        let mut mv = [0 as c_char; 32];
+        let mut log = Vec::new();
+        for _ in 0..200 {
+            if srw_status(b) != 0 {
+                break;
+            }
+            let r = srw_ai_move(b, mv.as_mut_ptr(), 32);
+            assert!(r >= 0, "ai_move failed: {r}");
+            let m = buf_str(&mv);
+            assert_eq!(srw_apply(b, c(&m).as_ptr()), 0, "arbiter accepts {m}");
+            log.push(m);
+        }
+        let st = srw_status(b);
+        srw_destroy(b);
+        (st, log)
+    };
+    let (st1, log1) = run(13);
+    let (st2, log2) = run(13);
+    assert_ne!(st1, 0, "trio battle reaches a verdict");
+    assert_eq!(st1, st2);
+    assert_eq!(log1, log2, "masked-world AI stays deterministic (§10.1)");
+}

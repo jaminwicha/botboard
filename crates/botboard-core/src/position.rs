@@ -21,6 +21,21 @@ use crate::moves::{Effect, Move, MoveKind, NO_SQ};
 pub const T_NONE: u8 = 0;
 pub const T_WALL: u8 = 1;
 pub const T_PIT: u8 = 2;
+/// Owner-tagged mines (SRW Appendix B): T_MINE0 + side. Passable and
+/// non-blocking; an enemy landing takes 1 HP (lethal at 1) and spends it.
+pub const T_MINE0: u8 = 3;
+
+/// Terrain that blocks entry, rays, screens, and legs (mines do not).
+#[inline]
+pub fn terrain_blocks(t: u8) -> bool {
+    t == T_WALL || t == T_PIT
+}
+
+/// The mine's owner, if this cell holds one.
+#[inline]
+pub fn mine_owner(t: u8) -> Option<Side> {
+    (t >= T_MINE0).then(|| (t - T_MINE0) as Side)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Loc {
@@ -85,6 +100,8 @@ pub struct Undo {
     revived: Option<(usize, bool)>,
     /// Hack: (flipped piece index, its prior side).
     hacked: Option<(usize, Side)>,
+    /// Mine kill: (piece index, the square it died on).
+    mine_death: Option<(usize, u16)>,
     prior_ep: u16,
     prior_hash: u64,
 }
@@ -147,7 +164,7 @@ impl Position {
                 }
             }
             for sq in 0..self.terrain.len() {
-                if self.terrain[sq] != T_NONE {
+                if terrain_blocks(self.terrain[sq]) {
                     self.terrain_mask |= 1u128 << sq;
                 }
             }
@@ -166,13 +183,14 @@ impl Position {
     /// A cell a ray/screen/leg cannot pass and a piece cannot enter.
     #[inline]
     pub fn cell_obstructed(&self, sq: u16) -> bool {
-        self.board[sq as usize] >= 0 || self.terrain[sq as usize] != T_NONE
+        self.board[sq as usize] >= 0 || terrain_blocks(self.terrain[sq as usize])
     }
 
-    /// May a piece land here (ignoring occupancy)?
+    /// May a piece land here (ignoring occupancy)? Mines are open — that
+    /// is their whole point.
     #[inline]
     pub fn terrain_open(&self, sq: u16) -> bool {
-        self.terrain[sq as usize] == T_NONE
+        !terrain_blocks(self.terrain[sq as usize])
     }
 
     fn fwd(side: Side) -> i8 {
@@ -237,11 +255,38 @@ impl Position {
     fn set_terrain(&mut self, sq: u16, t: u8) {
         self.terrain[sq as usize] = t;
         if self.wide {
-            if t == T_NONE {
-                self.terrain_mask &= !(1u128 << sq);
-            } else {
+            if terrain_blocks(t) {
                 self.terrain_mask |= 1u128 << sq;
+            } else {
+                self.terrain_mask &= !(1u128 << sq);
             }
+        }
+    }
+
+    /// Spring an enemy mine under piece `mi` if it just landed on one:
+    /// the mine is spent (terrain cleared) and the trespasser takes 1 HP —
+    /// lethal at 1 (SRW Appendix B mine-layer).
+    fn trigger_mine(&mut self, g: &GameDef, mi: usize, u: &mut Undo) {
+        let Loc::Board(sq) = self.pieces[mi].loc else { return };
+        let Some(owner) = mine_owner(self.terrain[sq as usize]) else { return };
+        if owner == self.pieces[mi].side {
+            return;
+        }
+        debug_assert!(u.terrain_change.is_none(), "one terrain change per move");
+        u.terrain_change = Some((sq, self.terrain[sq as usize]));
+        self.xor_terrain(g, sq);
+        self.set_terrain(sq, T_NONE);
+        self.xor_terrain(g, sq);
+        if self.hp[mi] > 1 {
+            u.hp_changes.push((mi, self.hp[mi]));
+            self.xor_piece(g, mi);
+            self.hp[mi] -= 1;
+            self.xor_piece(g, mi);
+        } else {
+            self.xor_piece(g, mi);
+            self.lift(mi, sq);
+            self.pieces[mi].loc = Loc::Dead;
+            u.mine_death = Some((mi, sq));
         }
     }
 
@@ -377,6 +422,7 @@ impl Position {
                 terrain_change: None,
                 revived: None,
                 hacked: None,
+                mine_death: None,
                 prior_ep,
                 prior_hash,
             };
@@ -392,6 +438,7 @@ impl Position {
                 self.hp[idx] = g.types[mv.drop_type as usize].max_hp;
             }
             self.xor_piece(g, idx);
+            self.trigger_mine(g, idx, &mut u);
             self.advance_stm(g);
             return u;
         }
@@ -410,6 +457,7 @@ impl Position {
             terrain_change: None,
             revived: None,
             hacked: None,
+            mine_death: None,
             prior_ep,
             prior_hash,
         };
@@ -425,12 +473,16 @@ impl Position {
                         self.hp[ti] = (self.hp[ti] + amount).min(max);
                         self.xor_piece(g, ti);
                     }
-                    Effect::Wall | Effect::Pit => {
+                    Effect::Wall | Effect::Pit | Effect::Mine => {
                         u.terrain_change = Some((mv.to, self.terrain[mv.to as usize]));
                         self.xor_terrain(g, mv.to);
                         self.set_terrain(
                             mv.to,
-                            if mv.effect == Effect::Wall { T_WALL } else { T_PIT },
+                            match mv.effect {
+                                Effect::Wall => T_WALL,
+                                Effect::Pit => T_PIT,
+                                _ => T_MINE0 + self.stm,
+                            },
                         );
                         self.xor_terrain(g, mv.to);
                     }
@@ -443,6 +495,7 @@ impl Position {
                             self.move_piece(mi, mv.from, mv.aux);
                             self.pieces[mi].moved = true;
                             self.xor_piece(g, mi);
+                            self.trigger_mine(g, mi, &mut u);
                         }
                     }
                     Effect::Hack => {
@@ -500,6 +553,7 @@ impl Position {
                 u.hp_changes.push((mi, self.hp[mi]));
                 self.hp[mi] -= 1;
                 self.xor_piece(g, mi);
+                self.trigger_mine(g, mi, &mut u);
                 self.advance_stm(g);
                 return u;
             }
@@ -526,6 +580,8 @@ impl Position {
             }
             self.xor_piece(g, mi);
         }
+
+        self.trigger_mine(g, u.moving, &mut u);
 
         match mv.kind {
             MoveKind::DoubleStep => {
@@ -556,6 +612,9 @@ impl Position {
         let mv = &u.mv;
 
         if mv.kind == MoveKind::Drop {
+            if let Some((sq, prior)) = u.terrain_change {
+                self.set_terrain(sq, prior); // the spent mine returns
+            }
             self.lift(u.moving, mv.to);
             self.pieces[u.moving].loc = Loc::Hand(self.stm);
             self.pieces[u.moving].moved = u.prior_moved;
@@ -588,6 +647,12 @@ impl Position {
             self.lift(hi, mv.to);
             self.pieces[hi].side = side;
             self.place(hi, mv.to);
+        }
+
+        if let Some((mi, dsq)) = u.mine_death {
+            // Back from the crater; the mover-back block below (or the
+            // captured-restore for victims) finishes the rewind.
+            self.place(mi, dsq);
         }
 
         // Put the mover back wherever it now stands.
@@ -653,6 +718,10 @@ impl Position {
         for p in &self.pieces {
             let Loc::Board(psq) = p.loc else { continue };
             if p.side != by || psq == sq {
+                continue;
+            }
+            // A hologram projects no threat: it cannot capture or check.
+            if g.types[p.t as usize].hologram {
                 continue;
             }
             let (px, py) = g.board.xy(psq);
@@ -742,8 +811,8 @@ impl Position {
                 let mut cur = psq;
                 for _ in 1..steps {
                     cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
-                    if self.terrain[cur as usize] != T_NONE {
-                        continue 'hop; // terrain is not a screen; it blocks
+                    if terrain_blocks(self.terrain[cur as usize]) {
+                        continue 'hop; // blocking terrain is not a screen
                     }
                     if self.board[cur as usize] >= 0 {
                         screens += 1;

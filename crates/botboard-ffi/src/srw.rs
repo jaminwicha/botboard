@@ -47,7 +47,7 @@ use botboard_core::geometry::DirFilter;
 use botboard_core::ladder::{choose_move_traced, LadderConfig, LadderTrace, Rung};
 use botboard_core::movegen::{legal_moves, status, Status};
 use botboard_core::moves::{move_str, Effect, MoveKind, NO_SQ};
-use botboard_core::position::{Loc, Position, T_NONE, T_PIT, T_WALL};
+use botboard_core::position::{mine_owner, Loc, Position, T_MINE0, T_NONE, T_PIT, T_WALL};
 use botboard_core::rng::Rng;
 use botboard_core::search::Searcher;
 
@@ -78,6 +78,10 @@ pub struct SrwBattle {
     end_reason: c_int,
     /// Counters from the most recent `ai_move` ladder decision.
     last_trace: Option<LadderTrace>,
+    /// Presence masks (SRW §8.6 / Appendix B): revealed[observer][piece].
+    /// Stealth pieces start hidden from enemy observers; adjacency, taking
+    /// or dealing damage, and full recon reveal them permanently.
+    revealed: Vec<Vec<bool>>,
 }
 
 /// Competence tiers (SRW §6 dial 2): the ladder run at tuned strength.
@@ -155,6 +159,7 @@ fn parse_ability(j: &Json) -> Option<AbilityBit> {
         "laser" => Some(AbilityBit::Laser { range, retreat: j.bool_or("retreat", true) }),
         "resurrect" => Some(AbilityBit::Resurrect { range }),
         "hack" => Some(AbilityBit::Hack { range }),
+        "mine" => Some(AbilityBit::MineLayer { range }),
         _ => None,
     }
 }
@@ -182,6 +187,12 @@ fn parse_types(spec: &Json) -> Result<Vec<PieceTypeDef>, String> {
         }
         if tj.bool_or("overclock", false) {
             def = def.overclock();
+        }
+        if tj.bool_or("hologram", false) {
+            def = def.hologram();
+        }
+        if tj.bool_or("stealth", false) {
+            def = def.stealth();
         }
         let abilities: Vec<AbilityBit> = tj
             .get("abilities")
@@ -301,6 +312,28 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
     let searchers =
         (0..sides).map(|_| Searcher::new(&g, Eval::new(material.clone()))).collect();
 
+    // Presence masks: own pieces and non-stealth types are always seen;
+    // full recon (reveal_all intel) pierces stealth too — the spy-drone
+    // counter-play.
+    let mut revealed: Vec<Vec<bool>> = (0..sides as usize)
+        .map(|o| {
+            pos.pieces
+                .iter()
+                .map(|p| {
+                    p.side as usize == o || !g.types[p.t as usize].stealth
+                })
+                .collect()
+        })
+        .collect();
+    if let Some(intel) = spec.get("intel").and_then(|i| i.as_arr()) {
+        for ij in intel {
+            let o = ij.num("observer", 0.0) as usize;
+            if o < sides as usize && ij.bool_or("reveal_all", false) {
+                revealed[o].iter_mut().for_each(|r| *r = true);
+            }
+        }
+    }
+
     Ok(SrwBattle {
         pos,
         searchers,
@@ -314,11 +347,76 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
         over: None,
         end_reason: 0,
         last_trace: None,
+        revealed,
         g,
     })
 }
 
 impl SrwBattle {
+    /// The world side `s` gets to think in (§8.6 masks): ground truth
+    /// minus unrevealed enemy stealth pieces and unseen enemy mines. The
+    /// arbiter still adjudicates on truth — bumping into a cloaked robot
+    /// resolves as the strike it really is.
+    fn masked_world(&self, s: Side) -> Position {
+        let mut world = self.pos.clone();
+        for i in 0..world.pieces.len() {
+            let p = world.pieces[i];
+            if p.side != s
+                && self.g.types[p.t as usize].stealth
+                && !self.revealed[s as usize][i]
+            {
+                if let Loc::Board(sq) = p.loc {
+                    world.board[sq as usize] = -1;
+                    world.pieces[i].loc = Loc::Dead;
+                }
+            }
+        }
+        for sq in 0..world.terrain.len() {
+            if let Some(owner) = mine_owner(world.terrain[sq]) {
+                if owner != s {
+                    world.terrain[sq] = T_NONE;
+                }
+            }
+        }
+        world.rehash(&self.g);
+        world
+    }
+
+    /// Update presence masks after a real move: adjacency spots a cloaked
+    /// robot; taking or dealing damage blows its cover for everyone.
+    fn reveal_pass(&mut self, pre: &Position) {
+        // Damage in either direction reveals to all observers.
+        for i in 0..self.pos.pieces.len() {
+            let damaged = self.pos.hp[i] != pre.hp[i]
+                || (matches!(pre.pieces[i].loc, Loc::Board(_))
+                    && matches!(self.pos.pieces[i].loc, Loc::Dead));
+            if damaged {
+                for o in 0..self.revealed.len() {
+                    self.revealed[o][i] = true;
+                }
+            }
+        }
+        // Chebyshev adjacency to any enemy piece reveals — permanently.
+        for i in 0..self.pos.pieces.len() {
+            let p = self.pos.pieces[i];
+            let Loc::Board(sq) = p.loc else { continue };
+            if !self.g.types[p.t as usize].stealth {
+                continue;
+            }
+            let (x, y) = self.g.board.xy(sq);
+            for q in self.pos.pieces.iter() {
+                let Loc::Board(qsq) = q.loc else { continue };
+                if q.side == p.side {
+                    continue;
+                }
+                let (qx, qy) = self.g.board.xy(qsq);
+                if (qx - x).abs().max((qy - y).abs()) <= 1 {
+                    self.revealed[q.side as usize][i] = true;
+                }
+            }
+        }
+    }
+
     fn live_royal(&self, s: Side) -> bool {
         self.pos.pieces.iter().any(|p| {
             p.side == s
@@ -436,6 +534,7 @@ impl SrwBattle {
         for b in self.beliefs.iter_mut() {
             b.observe(&self.g, &pre, &mv);
         }
+        self.reveal_pass(&pre);
         self.history.push(self.pos.hash);
         if self.history.iter().filter(|&&h| h == self.pos.hash).count() >= 3 {
             self.over = Some(9);
@@ -457,9 +556,11 @@ impl SrwBattle {
         }
         let stm = self.pos.stm as usize;
         if self.g.sides == 2 {
-            let Some((mv, trace)) = choose_move_traced(
+            // Think in the masked world (hidden mines/stealth absent) …
+            let mut world = self.masked_world(stm as Side);
+            let Some((mut mv, trace)) = choose_move_traced(
                 &self.g,
-                &mut self.pos,
+                &mut world,
                 &self.beliefs[stm],
                 &mut self.searchers[stm],
                 &self.cfgs[stm],
@@ -467,6 +568,22 @@ impl SrwBattle {
             ) else {
                 return -2;
             };
+            // … but the arbiter rules on truth. A plan a cloaked robot
+            // blocks falls back to an informed re-think (the piece was
+            // brushed; the reveal passes will catch it).
+            if !legal_moves(&self.g, &mut self.pos).contains(&mv) {
+                let Some((tmv, _)) = choose_move_traced(
+                    &self.g,
+                    &mut self.pos,
+                    &self.beliefs[stm],
+                    &mut self.searchers[stm],
+                    &self.cfgs[stm],
+                    &mut self.rng,
+                ) else {
+                    return -2;
+                };
+                mv = tmv;
+            }
             let rung = trace.rung;
             self.last_trace = Some(trace);
             let r = write_str(&move_str(&self.g, &mv), buf, cap);
@@ -481,10 +598,18 @@ impl SrwBattle {
             }
         } else {
             let eval = self.searchers[stm].eval.clone();
-            let Some(mv) = choose_ffa_move(&self.g, &mut self.pos, &eval, &mut self.rng)
+            let mut world = self.masked_world(stm as Side);
+            let Some(mut mv) = choose_ffa_move(&self.g, &mut world, &eval, &mut self.rng)
             else {
                 return -2;
             };
+            if !legal_moves(&self.g, &mut self.pos).contains(&mv) {
+                let Some(tmv) = choose_ffa_move(&self.g, &mut self.pos, &eval, &mut self.rng)
+                else {
+                    return -2;
+                };
+                mv = tmv;
+            }
             let r = write_str(&move_str(&self.g, &mv), buf, cap);
             if r < 0 {
                 return r;
@@ -626,15 +751,40 @@ pub extern "C" fn srw_entropy(b: *mut SrwBattle, observer: c_int) -> f64 {
     b.beliefs.get(observer as usize).map_or(-1.0, |bl| bl.entropy())
 }
 
-/// Terrain at square: 0 none, 1 wall, 2 pit.
+/// Ground-truth terrain at square: 0 none, 1 wall, 2 pit, 3 mine.
 #[no_mangle]
 pub extern "C" fn srw_terrain(b: *mut SrwBattle, sq: c_int) -> c_int {
     let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
     b.pos.terrain.get(sq as usize).map_or(-2, |&t| match t {
         T_WALL => 1,
         T_PIT => 2,
-        T_NONE | _ => 0,
+        t if t >= T_MINE0 => 3,
+        _ => 0,
     })
+}
+
+/// Terrain as `observer` sees it: enemy mines are invisible (0) until
+/// they blow. 0 none, 1 wall, 2 pit, 3 own mine.
+#[no_mangle]
+pub extern "C" fn srw_terrain_for(b: *mut SrwBattle, observer: c_int, sq: c_int) -> c_int {
+    let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
+    b.pos.terrain.get(sq as usize).map_or(-2, |&t| match t {
+        T_WALL => 1,
+        T_PIT => 2,
+        t if mine_owner(t) == Some(observer as Side) => 3,
+        t if t >= T_MINE0 => 0,
+        _ => 0,
+    })
+}
+
+/// Is piece `i` present in `observer`'s view? Stealth pieces (Appendix B)
+/// are hidden from enemies until adjacency, damage, or full recon reveals
+/// them. 1 visible / 0 concealed.
+#[no_mangle]
+pub extern "C" fn srw_visible(b: *mut SrwBattle, observer: c_int, i: c_int) -> c_int {
+    let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
+    let Some(row) = b.revealed.get(observer as usize) else { return -2 };
+    row.get(i as usize).map_or(-3, |&v| v as c_int)
 }
 
 #[no_mangle]
@@ -660,7 +810,7 @@ pub extern "C" fn srw_legal_move(
 /// kind: 0 normal 1 double-step 2 en-passant 3 castle 4 drop 5 ability
 /// 6 compound; effect: 0 none 1 heal 2 wall 3 pit 4 laser 5 twice
 /// 6 resurrect (out[5] then carries the revived type id, not a promo)
-/// 7 hack.
+/// 7 hack 8 mine-lay.
 #[no_mangle]
 pub extern "C" fn srw_legal_info(b: *mut SrwBattle, i: c_int, out: *mut c_int) -> c_int {
     let Some(b) = (unsafe { b.as_mut() }) else { return -1 };
@@ -687,6 +837,7 @@ pub extern "C" fn srw_legal_info(b: *mut SrwBattle, i: c_int, out: *mut c_int) -
         Effect::Twice => 5,
         Effect::Resurrect => 6,
         Effect::Hack => 7,
+        Effect::Mine => 8,
     };
     unsafe {
         *out = if mv.from == NO_SQ { -1 } else { mv.from as c_int };

@@ -16,6 +16,8 @@ const LASERBOT: TypeId = 4; // leaper(0,1), laser range 3 with retreat
 const SCOUT: TypeId = 5; // leaper(0,1)+(1,1), overclock, 2 HP
 const NECRO: TypeId = 6; // leaper(0,1), resurrect range 1
 const HACKER: TypeId = 7; // leaper(0,1), hack range 2
+const DECOY: TypeId = 8; // hologram: leaper(0,1)+(1,1), no threat
+const SAPPER: TypeId = 9; // leaper(0,1), mine-layer range 1
 
 fn robot_types() -> Vec<PieceTypeDef> {
     vec![
@@ -35,6 +37,10 @@ fn robot_types() -> Vec<PieceTypeDef> {
             .abilities(vec![AbilityBit::Resurrect { range: 1 }]),
         PieceTypeDef::new("hacker", 'H', vec![MoveBit::leaper(0, 1)])
             .abilities(vec![AbilityBit::Hack { range: 2 }]),
+        PieceTypeDef::new("decoy", 'D', vec![MoveBit::leaper(0, 1), MoveBit::leaper(1, 1)])
+            .hologram(),
+        PieceTypeDef::new("sapper", 'P', vec![MoveBit::leaper(0, 1)])
+            .abilities(vec![AbilityBit::MineLayer { range: 1 }]),
     ]
 }
 
@@ -376,5 +382,89 @@ fn hack_never_touches_royals() {
         !legal_moves(&g, &mut pos).iter().any(|m| m.effect == Effect::Hack),
         "royals cannot be flipped — capture-the-controller is its own system"
     );
+}
+
+#[test]
+fn holograms_move_but_never_threaten() {
+    let g = robot_game(vec![
+        (KING, 0, 0, 0),
+        (KING, 1, 7, 7),
+        (DECOY, 0, 3, 3),
+        (TANK, 1, 3, 4), // adjacent enemy: a real piece would capture it
+    ]);
+    let mut pos = Position::startpos(&g);
+
+    let moves = legal_moves(&g, &mut pos);
+    let decoy_moves: Vec<_> =
+        moves.iter().filter(|m| m.from == g.board.sq(3, 3)).collect();
+    assert!(!decoy_moves.is_empty(), "the decoy still moves");
+    assert!(
+        decoy_moves.iter().all(|m| pos.piece_at(m.to).is_none()),
+        "a hologram never captures"
+    );
+    // And it projects no threat: the adjacent enemy square is not attacked.
+    assert!(!pos.is_attacked(&g, g.board.sq(3, 4), 0));
+
+    // It vanishes to a single hit.
+    pos.set_stm(&g, 1);
+    let di = pos.board[g.board.sq(3, 3) as usize] as usize;
+    pos.make(&g, &Move::normal(g.board.sq(3, 4), g.board.sq(3, 3)));
+    assert!(matches!(pos.pieces[di].loc, Loc::Dead), "decoys pop when hit");
+}
+
+#[test]
+fn mines_arm_spend_and_kill() {
+    let g = robot_game(vec![
+        (KING, 0, 0, 0),
+        (KING, 1, 7, 7),
+        (SAPPER, 0, 3, 3),
+        (SCOUT, 1, 4, 5),  // 2 HP: survives a mine with a scar
+        (TANK, 0, 3, 5),   // friendly: walks over its own side's mine
+    ]);
+    let mut pos = Position::startpos(&g);
+
+    // Lay a mine at d5 (adjacent to the sapper at d4).
+    let moves = legal_moves(&g, &mut pos);
+    let lay = moves
+        .iter()
+        .find(|m| m.effect == Effect::Mine && m.to == g.board.sq(3, 4))
+        .copied()
+        .expect("sapper offers mine-laying");
+    assert!(move_str(&g, &lay).contains("!mine:"));
+    let h0 = pos.hash;
+    let u = pos.make(&g, &lay);
+    assert!(pos.terrain[g.board.sq(3, 4) as usize] >= 3, "mine terrain laid");
+    assert_ne!(pos.hash, h0, "mines hash as terrain");
+    pos.unmake(&g, &u);
+    assert_eq!(pos.hash, h0);
+    pos.make(&g, &lay);
+
+    // The enemy scout steps on it: 2 HP -> 1, mine spent.
+    let si = pos.board[g.board.sq(4, 5) as usize] as usize;
+    let u2 = pos.make(&g, &Move::normal(g.board.sq(4, 5), g.board.sq(3, 4)));
+    assert_eq!(pos.hp[si], 1, "the trap bites for 1 HP");
+    assert_eq!(pos.terrain[g.board.sq(3, 4) as usize], 0, "the mine is spent");
+    pos.unmake(&g, &u2);
+    assert_eq!(pos.hp[si], 2, "unmake heals the scar");
+    assert!(pos.terrain[g.board.sq(3, 4) as usize] >= 3, "and re-arms the mine");
+
+    // At 1 HP the trap is lethal — and fully reversible.
+    pos.hp[si] = 1;
+    pos.rehash(&g);
+    let h1 = pos.hash;
+    let u3 = pos.make(&g, &Move::normal(g.board.sq(4, 5), g.board.sq(3, 4)));
+    assert!(matches!(pos.pieces[si].loc, Loc::Dead), "lethal at 1 HP");
+    assert!(pos.piece_at(g.board.sq(3, 4)).is_none(), "the crater is empty");
+    pos.unmake(&g, &u3);
+    assert_eq!(pos.hash, h1, "unmake climbs out of the crater");
+    assert!(matches!(pos.pieces[si].loc, Loc::Board(_)));
+
+    // Friendly pieces stroll over their own minefield.
+    pos.set_stm(&g, 0);
+    let ti = pos.board[g.board.sq(3, 5) as usize] as usize;
+    pos.make(&g, &Move::normal(g.board.sq(3, 5), g.board.sq(3, 4)));
+    assert!(matches!(pos.pieces[ti].loc, Loc::Board(_)));
+    assert_eq!(pos.hp[ti], 3, "own mines do not bite");
+    assert!(pos.terrain[g.board.sq(3, 4) as usize] >= 3, "and stay armed");
 }
 

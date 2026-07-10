@@ -141,4 +141,8 @@ pub enum AbilityBit {
     /// spell). The spec's "target predicate": non-royal at exactly 1 HP —
     /// its defenses are down. Deterministic, so search stays sound.
     Hack { range: u8 },
+    /// Lay an owner-tagged mine on an empty in-range square (SRW Appendix
+    /// B): passable, non-blocking; an enemy landing takes 1 HP (lethal at
+    /// 1) and the mine is spent. Concealment lives at the battle layer.
+    MineLayer { range: u8 },
 }
