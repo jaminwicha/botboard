@@ -57,6 +57,31 @@ the league is 4 members. Growing those is configuration + hardware on the
 same loops. Distributed multi-machine orchestration and GPU-batched inference
 remain ops work outside the engine's semantics.
 
+**Concrete scale ladder (July 2026 plan, in effort order):**
+
+1. **Bigger net, same loop** (hours, single machine): `train-net` with
+   H=128 over ~10× the v2 game corpus (`selfplay` at higher thread
+   count); promote to `chess_net_v3.bin` only if it beats v2 in the
+   existing league harness at equal node budgets. No code changes.
+2. **Wider league** (config): grow to 12–16 members with the §5 pool so
+   Nash averaging has spread; feeds better value targets for (1).
+3. **SRW-content curriculum** (small code): extend the self-play farm's
+   army sampler to draw from the SRW clan palettes (heal/mine/stealth/
+   hologram Bits included) so the shared evaluator learns the new
+   Axis-B vocabulary instead of meeting it cold at play time — the
+   generalizing-eval claim (§7.4) deserves a stress test against the
+   Appendix B set.
+4. **Process-parallel farm** (ops): N engine processes with disjoint
+   seed ranges appending to a shared game store; the deterministic
+   per-seed actor pool makes shard merges trivially reproducible.
+   Multi-machine is the same recipe over rsync/NFS.
+5. **GPU-batched inference** (last, biggest): only worth it after (1)
+   makes nets big enough to starve the CPU int path.
+
+Rungs 1–2 are pure configuration and can run unattended overnight;
+rung 3 is the first one that touches code and is the highest-leverage
+for SRW play quality.
+
 ## UI
 
 `botboard` CLI: `play` (interactive vs AI; `--hidden` for the imperfect-info
