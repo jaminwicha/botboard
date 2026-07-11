@@ -348,3 +348,25 @@ rung 3 (STATUS): refit the synergy term from a self-play corpus that
 includes the new Axis-B vocabulary. Note: pair reports reuse the
 mirror Judge thresholds, so their "lopsided mirror" flags are labels,
 not mirror claims.
+
+### Addendum (2026-07-11, later): mirage gate + five-clan round-robin
+
+The new Mirage Circuit clan (piercing lasers, mines, decoys, hover
+drones, EMP jammers, light stealth) passed its mirror gate — decisive
+33–67% cells at every budget, one single-seed 83% flag, no perf or
+inertness flags. The five-clan `pairs 14` round-robin (120 games):
+
+- **Ranking holds**: deepcore ≫ foundry ≈ veilworks ≈ mirage >
+  scrapline. Mirage sits mid-table — right for a depth-3+ clan —
+  except vs deepcore (0–100%: artillery deletes decoys pound-for-
+  pound). Tuning lever if wanted: EmpChance up from 0.1 — EMP suppresses
+  ability Bits, i.e. deepcore's lasers; mirage barely fields its own
+  counter today.
+- **The gate caught a real crash** (§13 doing its job): mirage's
+  stealth density produced masked-stalemate positions — every true
+  move touched hidden pieces, so the concealed world had no legal
+  moves and `ai_move` returned −2 mid-sweep. Fixed with an informed
+  re-think fallback (botboard 299a215); the rerun's 120 games ran
+  clean. A stale VetSweep-local dylib produced one false repro of the
+  crash post-fix — the deploy-copy risk documented in the July-10
+  addendum, now bitten twice.
