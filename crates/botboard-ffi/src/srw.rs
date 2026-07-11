@@ -600,14 +600,27 @@ impl SrwBattle {
         if self.g.sides == 2 {
             // Think in the masked world (hidden mines/stealth absent) …
             let mut world = self.masked_world(stm as Side);
-            let Some((mut mv, trace)) = choose_move_traced(
+            let masked_choice = choose_move_traced(
                 &self.g,
                 &mut world,
                 &self.beliefs[stm],
                 &mut self.searchers[stm],
                 &self.cfgs[stm],
                 &mut self.rng,
-            ) else {
+            );
+            // A masked stalemate (the only real moves touch hidden pieces)
+            // falls back to an informed re-think, like the blocked-plan
+            // case below — the arbiter knows moves exist.
+            let Some((mut mv, trace)) = masked_choice.or_else(|| {
+                choose_move_traced(
+                    &self.g,
+                    &mut self.pos,
+                    &self.beliefs[stm],
+                    &mut self.searchers[stm],
+                    &self.cfgs[stm],
+                    &mut self.rng,
+                )
+            }) else {
                 return -2;
             };
             // … but the arbiter rules on truth. A plan a cloaked robot
@@ -642,6 +655,7 @@ impl SrwBattle {
             let eval = self.searchers[stm].eval.clone();
             let mut world = self.masked_world(stm as Side);
             let Some(mut mv) = choose_ffa_move(&self.g, &mut world, &eval, &mut self.rng)
+                .or_else(|| choose_ffa_move(&self.g, &mut self.pos, &eval, &mut self.rng))
             else {
                 return -2;
             };
