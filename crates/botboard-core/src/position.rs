@@ -24,6 +24,16 @@ pub const T_PIT: u8 = 2;
 /// Owner-tagged mines (SRW Appendix B): T_MINE0 + side. Passable and
 /// non-blocking; an enemy landing takes 1 HP (lethal at 1) and spends it.
 pub const T_MINE0: u8 = 3;
+/// Ice (Appendix B): a rider entering keeps sliding until it hits a
+/// blocker or leaves the sheet — realized as destination rewriting in
+/// movegen, so make/unmake never see it.
+pub const T_ICE: u8 = 7;
+/// Tall grass (Appendix B): positional concealment — masking lives at
+/// the battle layer; the engine only stores the tile.
+pub const T_GRASS: u8 = 8;
+/// Acid (Appendix B): passable; any piece landing here takes 1 HP
+/// (lethal at 1). The pool persists.
+pub const T_ACID: u8 = 9;
 
 /// Terrain that blocks entry, rays, screens, and legs (mines do not).
 #[inline]
@@ -31,10 +41,10 @@ pub fn terrain_blocks(t: u8) -> bool {
     t == T_WALL || t == T_PIT
 }
 
-/// The mine's owner, if this cell holds one.
+/// The mine's owner, if this cell holds one (mines occupy 3..=6).
 #[inline]
 pub fn mine_owner(t: u8) -> Option<Side> {
-    (t >= T_MINE0).then(|| (t - T_MINE0) as Side)
+    (T_MINE0..T_MINE0 + 4).contains(&t).then(|| (t - T_MINE0) as Side)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -263,20 +273,30 @@ impl Position {
         }
     }
 
-    /// Spring an enemy mine under piece `mi` if it just landed on one:
-    /// the mine is spent (terrain cleared) and the trespasser takes 1 HP —
-    /// lethal at 1 (SRW Appendix B mine-layer).
+    /// Landing hazards (SRW Appendix B): spring an enemy mine (spent on
+    /// trigger) or wade into acid (persistent, bites every side). Either
+    /// way the lander takes 1 HP — lethal at 1.
     fn trigger_mine(&mut self, g: &GameDef, mi: usize, u: &mut Undo) {
         let Loc::Board(sq) = self.pieces[mi].loc else { return };
-        let Some(owner) = mine_owner(self.terrain[sq as usize]) else { return };
-        if owner == self.pieces[mi].side {
+        let t = self.terrain[sq as usize];
+        let bites = match mine_owner(t) {
+            Some(owner) => {
+                if owner == self.pieces[mi].side {
+                    return;
+                }
+                // The mine is spent.
+                debug_assert!(u.terrain_change.is_none(), "one terrain change per move");
+                u.terrain_change = Some((sq, t));
+                self.xor_terrain(g, sq);
+                self.set_terrain(sq, T_NONE);
+                self.xor_terrain(g, sq);
+                true
+            }
+            None => t == T_ACID,
+        };
+        if !bites {
             return;
         }
-        debug_assert!(u.terrain_change.is_none(), "one terrain change per move");
-        u.terrain_change = Some((sq, self.terrain[sq as usize]));
-        self.xor_terrain(g, sq);
-        self.set_terrain(sq, T_NONE);
-        self.xor_terrain(g, sq);
         if self.hp[mi] > 1 {
             u.hp_changes.push((mi, self.hp[mi]));
             self.xor_piece(g, mi);

@@ -18,7 +18,7 @@ const MAX_HAND: usize = 20;
 /// State buckets: bit 0 = moved flag, bits 1..4 = HP capped at 7.
 const BUCKETS: usize = 16;
 /// Terrain types keyed per cell (T_NONE hashes to nothing).
-const TERRAINS: usize = 7;
+const TERRAINS: usize = 10;
 
 #[derive(Clone, Debug)]
 pub struct Zobrist {

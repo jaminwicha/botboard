@@ -297,6 +297,25 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
         }
     }
 
+    // Appendix B ice: a rider landing on an empty sheet keeps sliding
+    // along its ray — destinations are rewritten here so make/unmake and
+    // hashing never know ice existed. Leapers land normally.
+    if pos.terrain.iter().any(|&t| t == crate::position::T_ICE) {
+        for m in out.iter_mut() {
+            slide_on_ice(g, pos, m);
+        }
+        // Two rides can now share a destination: keep the first.
+        let mut seen: Vec<Move> = Vec::with_capacity(out.len());
+        out.retain(|m| {
+            if seen.contains(m) {
+                false
+            } else {
+                seen.push(*m);
+                true
+            }
+        });
+    }
+
     // Holograms move but never threaten (SRW Appendix B): keep only their
     // quiet kernel steps — no captures, abilities, compounds, or specials.
     out.retain(|m| {
@@ -366,6 +385,59 @@ fn gen_castles(g: &GameDef, pos: &Position, ksq: u16, out: &mut Vec<Move>) {
             continue;
         }
         out.push(Move::special(ksq, dest, MoveKind::Castle, rsq));
+    }
+}
+
+/// Ice slide (Appendix B): rewrite a quiet rider move that lands on ice
+/// to its slide-out endpoint — the last ice cell before a blocker/edge,
+/// or the first open non-ice cell past the sheet.
+fn slide_on_ice(g: &GameDef, pos: &Position, mv: &mut Move) {
+    use crate::position::T_ICE;
+    if mv.kind != MoveKind::Normal || mv.promo.is_some() {
+        return;
+    }
+    if pos.board[mv.to as usize] >= 0 || pos.terrain[mv.to as usize] != T_ICE {
+        return;
+    }
+    let mover = pos.piece_at(mv.from).expect("mover exists");
+    let (fx, fy) = g.board.xy(mv.from);
+    let (tx, ty) = g.board.xy(mv.to);
+    let (dx, dy) = ((tx - fx) as i32, (ty - fy) as i32);
+    let gd = gcd(dx.unsigned_abs(), dy.unsigned_abs()) as i32;
+    if gd == 0 {
+        return;
+    }
+    let (sx, sy) = ((dx / gd) as i8, (dy / gd) as i8);
+    // Only sliders skid: the mover must ride in exactly this direction.
+    let ck = g.compiled(mover.t, mover.side);
+    let is_ride = ck
+        .rides
+        .iter()
+        .any(|r| r.mode.can_move() && r.d.dx == sx && r.d.dy == sy);
+    if !is_ride {
+        return;
+    }
+    let mut cur = mv.to;
+    loop {
+        let Some(next) = g.board.offset(cur, sx, sy) else { break };
+        if pos.board[next as usize] >= 0 || !pos.terrain_open(next) {
+            break; // stop on the last ice cell before the obstruction
+        }
+        if pos.terrain[next as usize] == T_ICE {
+            cur = next;
+            continue;
+        }
+        cur = next; // first open floor past the sheet: stop there
+        break;
+    }
+    mv.to = cur;
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
     }
 }
 

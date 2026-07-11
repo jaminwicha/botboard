@@ -47,7 +47,7 @@ use botboard_core::geometry::DirFilter;
 use botboard_core::ladder::{choose_move_traced, LadderConfig, LadderTrace, Rung};
 use botboard_core::movegen::{legal_moves, status, Status};
 use botboard_core::moves::{move_str, Effect, MoveKind, NO_SQ};
-use botboard_core::position::{mine_owner, Loc, Position, T_MINE0, T_NONE, T_PIT, T_WALL};
+use botboard_core::position::{mine_owner, Loc, Position, T_ACID, T_GRASS, T_ICE, T_MINE0, T_NONE, T_PIT, T_WALL};
 use botboard_core::rng::Rng;
 use botboard_core::search::Searcher;
 
@@ -259,13 +259,19 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
                 return Err("terrain out of range".into());
             }
             let sq = g.board.sq(x, y) as usize;
-            if pos.board[sq] >= 0 {
-                return Err("terrain on occupied cell".into());
-            }
-            pos.terrain[sq] = match cj.str_or("kind", "wall") {
+            let kind = match cj.str_or("kind", "wall") {
                 "pit" => T_PIT,
+                "ice" => T_ICE,
+                "grass" => T_GRASS,
+                "acid" => T_ACID,
                 _ => T_WALL,
             };
+            // Blocking terrain cannot share a cell with a piece; the
+            // passable kinds (ice, grass, acid) are stood upon by design.
+            if pos.board[sq] >= 0 && botboard_core::position::terrain_blocks(kind) {
+                return Err("blocking terrain on occupied cell".into());
+            }
+            pos.terrain[sq] = kind;
         }
         pos.rehash(&g);
     }
@@ -361,10 +367,7 @@ impl SrwBattle {
         let mut world = self.pos.clone();
         for i in 0..world.pieces.len() {
             let p = world.pieces[i];
-            if p.side != s
-                && self.g.types[p.t as usize].stealth
-                && !self.revealed[s as usize][i]
-            {
+            if p.side != s && !self.visible_to(s as usize, i) {
                 if let Loc::Board(sq) = p.loc {
                     world.board[sq as usize] = -1;
                     world.pieces[i].loc = Loc::Dead;
@@ -380,6 +383,34 @@ impl SrwBattle {
         }
         world.rehash(&self.g);
         world
+    }
+
+    /// Tall grass (Appendix B): live camouflage, not identity — a robot
+    /// standing in the stalks is unseen by observers with nobody adjacent.
+    /// Positional and memoryless: leave the grass and you are plain again,
+    /// slip back in and you vanish again.
+    fn concealed_by_grass(&self, observer: Side, i: usize) -> bool {
+        let p = self.pos.pieces[i];
+        let Loc::Board(sq) = p.loc else { return false };
+        if p.side == observer || self.pos.terrain[sq as usize] != T_GRASS {
+            return false;
+        }
+        let (x, y) = self.g.board.xy(sq);
+        !self.pos.pieces.iter().any(|q| {
+            let Loc::Board(qsq) = q.loc else { return false };
+            if q.side != observer {
+                return false;
+            }
+            let (qx, qy) = self.g.board.xy(qsq);
+            (qx - x).abs().max((qy - y).abs()) <= 1
+        })
+    }
+
+    /// One visibility truth for the FFI, the masked AI worlds, and the
+    /// renderer: the permanent stealth mask AND the live grass check.
+    fn visible_to(&self, observer: usize, i: usize) -> bool {
+        self.revealed[observer][i]
+            && !self.concealed_by_grass(observer as Side, i)
     }
 
     /// Update presence masks after a real move: adjacency spots a cloaked
@@ -751,28 +782,34 @@ pub extern "C" fn srw_entropy(b: *mut SrwBattle, observer: c_int) -> f64 {
     b.beliefs.get(observer as usize).map_or(-1.0, |bl| bl.entropy())
 }
 
-/// Ground-truth terrain at square: 0 none, 1 wall, 2 pit, 3 mine.
+/// Ground-truth terrain: 0 none, 1 wall, 2 pit, 3 mine, 4 ice,
+/// 5 tall grass, 6 acid.
 #[no_mangle]
 pub extern "C" fn srw_terrain(b: *mut SrwBattle, sq: c_int) -> c_int {
     let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
     b.pos.terrain.get(sq as usize).map_or(-2, |&t| match t {
         T_WALL => 1,
         T_PIT => 2,
-        t if t >= T_MINE0 => 3,
+        T_ICE => 4,
+        T_GRASS => 5,
+        T_ACID => 6,
+        t if mine_owner(t).is_some() => 3,
         _ => 0,
     })
 }
 
 /// Terrain as `observer` sees it: enemy mines are invisible (0) until
-/// they blow. 0 none, 1 wall, 2 pit, 3 own mine.
+/// they blow. 0 none, 1 wall, 2 pit, 3 own mine, 4 ice, 5 grass, 6 acid.
 #[no_mangle]
 pub extern "C" fn srw_terrain_for(b: *mut SrwBattle, observer: c_int, sq: c_int) -> c_int {
     let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
     b.pos.terrain.get(sq as usize).map_or(-2, |&t| match t {
         T_WALL => 1,
         T_PIT => 2,
+        T_ICE => 4,
+        T_GRASS => 5,
+        T_ACID => 6,
         t if mine_owner(t) == Some(observer as Side) => 3,
-        t if t >= T_MINE0 => 0,
         _ => 0,
     })
 }
@@ -784,7 +821,10 @@ pub extern "C" fn srw_terrain_for(b: *mut SrwBattle, observer: c_int, sq: c_int)
 pub extern "C" fn srw_visible(b: *mut SrwBattle, observer: c_int, i: c_int) -> c_int {
     let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
     let Some(row) = b.revealed.get(observer as usize) else { return -2 };
-    row.get(i as usize).map_or(-3, |&v| v as c_int)
+    if row.get(i as usize).is_none() {
+        return -3;
+    }
+    b.visible_to(observer as usize, i as usize) as c_int
 }
 
 #[no_mangle]

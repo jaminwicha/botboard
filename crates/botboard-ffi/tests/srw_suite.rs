@@ -398,3 +398,46 @@ fn trio_battles_run_to_verdict_deterministically() {
     assert_eq!(st1, st2);
     assert_eq!(log1, log2, "masked-world AI stays deterministic (§10.1)");
 }
+
+/// Tall grass (Appendix B) is live camouflage: memoryless and positional.
+/// A robot in the stalks vanishes from enemy view, reappears on contact,
+/// and vanishes again when the watcher walks away.
+#[test]
+fn tall_grass_conceals_and_reconceals() {
+    let spec = r#"{
+  "seed": 21, "max_plies": 60,
+  "board": {"w": 7, "h": 7},
+  "sides": 2,
+  "types": [
+    {"name": "ctrl", "glyph": "C", "royal": true,
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}]},
+    {"name": "runner", "glyph": "R",
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}]}
+  ],
+  "placements": [
+    {"t": 0, "side": 0, "x": 3, "y": 0},
+    {"t": 1, "side": 0, "x": 2, "y": 1},
+    {"t": 0, "side": 1, "x": 3, "y": 6},
+    {"t": 1, "side": 1, "x": 3, "y": 3}
+  ],
+  "terrain": [{"x": 3, "y": 3, "kind": "grass"}],
+  "tiers": [0, 0]
+}"#;
+    let b = srw_create(c(spec).as_ptr());
+    assert!(!b.is_null(), "grass setup must build");
+
+    // The enemy runner starts IN the grass at d4: hidden from side 0
+    // (nobody adjacent), plain to its own side.
+    assert_eq!(srw_visible(b, 0, 3), 0, "grass conceals");
+    assert_eq!(srw_visible(b, 1, 3), 1);
+
+    // Walk our runner adjacent (c2 -> c3 is chebyshev-1 of d4): seen.
+    assert_eq!(srw_apply(b, c("c2c3").as_ptr()), 0);
+    assert_eq!(srw_apply(b, c("d7c7").as_ptr()), 0); // enemy ctrl shuffles
+    assert_eq!(srw_visible(b, 0, 3), 1, "adjacency parts the stalks");
+
+    // We step away: hidden again.
+    assert_eq!(srw_apply(b, c("c3c2").as_ptr()), 0);
+    assert_eq!(srw_visible(b, 0, 3), 0, "grass re-conceals — no memory");
+    srw_destroy(b);
+}

@@ -6,7 +6,7 @@ use botboard_core::bits::{AbilityBit, MoveBit};
 use botboard_core::game::*;
 use botboard_core::movegen::{legal_moves};
 use botboard_core::moves::{move_str, Effect, Move, MoveKind, NO_SQ};
-use botboard_core::position::{Loc, Position, T_NONE, T_WALL};
+use botboard_core::position::{Loc, Position, T_ACID, T_ICE, T_NONE, T_WALL};
 
 const KING: TypeId = 0;
 const TANK: TypeId = 1; // rider(0,1), 3 HP armor
@@ -466,5 +466,89 @@ fn mines_arm_spend_and_kill() {
     assert!(matches!(pos.pieces[ti].loc, Loc::Board(_)));
     assert_eq!(pos.hp[ti], 3, "own mines do not bite");
     assert!(pos.terrain[g.board.sq(3, 4) as usize] >= 3, "and stay armed");
+}
+
+#[test]
+fn ice_slides_riders_but_not_leapers() {
+    // Tank is a file-rider; scout leaps. Ice sheet down the d-file.
+    let g = robot_game(vec![
+        (KING, 0, 0, 0),
+        (KING, 1, 7, 7),
+        (TANK, 0, 3, 1),
+        (SCOUT, 0, 5, 1),
+    ]);
+    let mut pos = Position::startpos(&g);
+    for y in [3u8, 4, 5] {
+        pos.terrain[g.board.sq(3, y) as usize] = T_ICE;
+        pos.terrain[g.board.sq(5, y - 1) as usize] = T_ICE;
+    }
+    pos.rehash(&g);
+
+    let moves = legal_moves(&g, &mut pos);
+    // The tank aiming onto the sheet skids to the first floor past it (d7).
+    assert!(
+        moves.iter().any(|m| m.from == g.board.sq(3, 1) && m.to == g.board.sq(3, 6)),
+        "rider slides across the whole sheet"
+    );
+    // No rider move may STOP on open mid-sheet ice.
+    assert!(
+        !moves
+            .iter()
+            .any(|m| m.from == g.board.sq(3, 1)
+                && (m.to == g.board.sq(3, 3) || m.to == g.board.sq(3, 4))),
+        "a slider cannot stop mid-sheet"
+    );
+    // The leaper lands on ice and just stands there.
+    assert!(
+        moves.iter().any(|m| m.from == g.board.sq(5, 1) && m.to == g.board.sq(5, 2)),
+        "leapers do not skid"
+    );
+
+    // A wall at the sheet's end parks the slider on the last ice cell.
+    pos.terrain[g.board.sq(3, 6) as usize] = T_WALL;
+    pos.rehash(&g);
+    let moves2 = legal_moves(&g, &mut pos);
+    assert!(
+        moves2.iter().any(|m| m.from == g.board.sq(3, 1) && m.to == g.board.sq(3, 5)),
+        "blocked slide stops on the final ice cell"
+    );
+}
+
+#[test]
+fn acid_bites_anyone_who_wades_in() {
+    let g = robot_game(vec![
+        (KING, 0, 0, 0),
+        (KING, 1, 7, 7),
+        (SCOUT, 0, 3, 3), // 2 HP
+        (MEDIC, 1, 5, 5), // 1 HP
+    ]);
+    let mut pos = Position::startpos(&g);
+    pos.terrain[g.board.sq(3, 4) as usize] = T_ACID;
+    pos.terrain[g.board.sq(5, 4) as usize] = T_ACID;
+    pos.rehash(&g);
+
+    // Friendly-to-nobody: the pool bites your own side too.
+    let si = pos.board[g.board.sq(3, 3) as usize] as usize;
+    let h0 = pos.hash;
+    let u = pos.make(&g, &Move::normal(g.board.sq(3, 3), g.board.sq(3, 4)));
+    assert_eq!(pos.hp[si], 1, "wading in costs 1 HP");
+    assert_eq!(
+        pos.terrain[g.board.sq(3, 4) as usize],
+        T_ACID,
+        "the pool persists"
+    );
+    pos.unmake(&g, &u);
+    assert_eq!(pos.hash, h0);
+    assert_eq!(pos.hp[si], 2);
+
+    // Lethal at 1 HP, fully reversible.
+    pos.set_stm(&g, 1);
+    let mi = pos.board[g.board.sq(5, 5) as usize] as usize;
+    let h1 = pos.hash;
+    let u2 = pos.make(&g, &Move::normal(g.board.sq(5, 5), g.board.sq(5, 4)));
+    assert!(matches!(pos.pieces[mi].loc, Loc::Dead), "the pool dissolves 1-HP waders");
+    pos.unmake(&g, &u2);
+    assert_eq!(pos.hash, h1);
+    assert!(matches!(pos.pieces[mi].loc, Loc::Board(_)));
 }
 
