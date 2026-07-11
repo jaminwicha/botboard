@@ -156,7 +156,11 @@ fn parse_ability(j: &Json) -> Option<AbilityBit> {
         "heal" => Some(AbilityBit::Heal { amount: j.num("amount", 1.0) as i16, range }),
         "wall" => Some(AbilityBit::CreateWall { range }),
         "pit" => Some(AbilityBit::DigPit { range }),
-        "laser" => Some(AbilityBit::Laser { range, retreat: j.bool_or("retreat", true) }),
+        "laser" => Some(AbilityBit::Laser {
+            range,
+            retreat: j.bool_or("retreat", true),
+            pierce: j.bool_or("pierce", false),
+        }),
         "resurrect" => Some(AbilityBit::Resurrect { range }),
         "hack" => Some(AbilityBit::Hack { range }),
         "mine" => Some(AbilityBit::MineLayer { range }),
@@ -193,6 +197,13 @@ fn parse_types(spec: &Json) -> Result<Vec<PieceTypeDef>, String> {
         }
         if tj.bool_or("stealth", false) {
             def = def.stealth();
+        }
+        if tj.bool_or("flight", false) {
+            def = def.flight();
+        }
+        let emp = tj.num("emp", 0.0) as u8;
+        if emp > 0 {
+            def = def.emp(emp);
         }
         let abilities: Vec<AbilityBit> = tj
             .get("abilities")

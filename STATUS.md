@@ -59,10 +59,12 @@ remain ops work outside the engine's semantics.
 
 **Concrete scale ladder (July 2026 plan, in effort order):**
 
-1. **Bigger net, same loop** (hours, single machine): `train-net` with
-   H=128 over ~10× the v2 game corpus (`selfplay` at higher thread
-   count); promote to `chess_net_v3.bin` only if it beats v2 in the
-   existing league harness at equal node budgets. No code changes.
+1. **Bigger corpus, same loop** — ✅ DONE (July 2026): v3 trained on a
+   10× corpus (2000 games / 12 epochs, 56k samples) and promoted after
+   beating v2 9–11–0 (72.5%) in the new paired-opening `netmatch` gate
+   (`artifacts/chess_net_v3.bin`). H stays the compile-time 32; making
+   H runtime-sized (Vec-backed nets) is the prerequisite for true
+   width scaling and belongs with rung 5's inference work.
 2. **Wider league** (config): grow to 12–16 members with the §5 pool so
    Nash averaging has spread; feeds better value targets for (1).
 3. **SRW-content curriculum** (small code): extend the self-play farm's

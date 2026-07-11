@@ -77,8 +77,12 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
             continue;
         }
         let ck = g.compiled(p.t, stm);
+        let flies = g.types[p.t as usize].flight;
 
-        let bb_active = use_bb && ck.bb.is_some();
+        // Flyers ignore pit obstruction, which the precompiled bitboard
+        // masks cannot express — those pieces walk the mailbox path
+        // whenever pits are on the board.
+        let bb_active = use_bb && ck.bb.is_some() && !(flies && pos.has_pit());
         if bb_active {
             let bb = ck.bb.as_ref().unwrap();
             for e in &bb.leaps[from as usize] {
@@ -140,13 +144,13 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
                 continue;
             }
             let Some(to) = g.board.offset(from, k.d.dx, k.d.dy) else { continue };
-            if !zone_ok(k.to_zone, to) || !pos.terrain_open(to) {
+            if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies) {
                 continue;
             }
             let blocked = k.blockers.iter().any(|b| {
                 g.board
                     .offset(from, b.dx, b.dy)
-                    .map_or(true, |bsq| pos.cell_obstructed(bsq))
+                    .map_or(true, |bsq| pos.cell_obstructed_for(bsq, flies))
             });
             if blocked {
                 continue;
@@ -174,7 +178,7 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
             }
             let mut cur = from;
             while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
-                if !zone_ok(k.to_zone, to) || !pos.terrain_open(to) {
+                if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies) {
                     break;
                 }
                 match pos.piece_at(to) {
@@ -205,8 +209,8 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
             let mut cur = from;
             let mut screened = false;
             while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
-                if !pos.terrain_open(to) {
-                    break; // terrain blocks; it is never a screen
+                if !pos.terrain_open_for(to, flies) {
+                    break; // blocking terrain is never a screen
                 }
                 match pos.piece_at(to) {
                     None => cur = to,
@@ -417,10 +421,11 @@ fn slide_on_ice(g: &GameDef, pos: &Position, mv: &mut Move) {
     if !is_ride {
         return;
     }
+    let flies = g.types[mover.t as usize].flight;
     let mut cur = mv.to;
     loop {
         let Some(next) = g.board.offset(cur, sx, sy) else { break };
-        if pos.board[next as usize] >= 0 || !pos.terrain_open(next) {
+        if pos.board[next as usize] >= 0 || !pos.terrain_open_for(next, flies) {
             break; // stop on the last ice cell before the obstruction
         }
         if pos.terrain[next as usize] == T_ICE {
@@ -445,6 +450,19 @@ fn gcd(a: u32, b: u32) -> u32 {
 fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Vec<Move>) {
     let stm = pos.stm;
     let (fx, fy) = g.board.xy(from);
+    // EMP aura (Appendix B): inside an enemy emitter's radius, ability
+    // Bits are dead circuitry — no action Bits generate at all.
+    for e in &pos.pieces {
+        let Loc::Board(esq) = e.loc else { continue };
+        let r = g.types[e.t as usize].emp_aura;
+        if e.side == stm || r == 0 {
+            continue;
+        }
+        let (ex, ey) = g.board.xy(esq);
+        if (ex - fx).abs().max((ey - fy).abs()) as u8 <= r {
+            return;
+        }
+    }
     for a in &g.types[t as usize].abilities {
         match *a {
             AbilityBit::Heal { amount, range } => {
@@ -529,9 +547,11 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                     }
                 }
             }
-            AbilityBit::Laser { range, retreat } => {
+            AbilityBit::Laser { range, retreat, pierce } => {
                 // A bounded capture-at-range rider that never vacates the
-                // origin (§3.2 ranged effects).
+                // origin (§3.2 ranged effects). A piercing beam ignores
+                // occupancy on its ray (Appendix B) — every enemy along it
+                // is a target; terrain still stops the beam.
                 for (dx, dy) in
                     [(0i8, 1i8), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
                 {
@@ -561,7 +581,9 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                                 };
                                 out.push(Move::ability(from, nsq, Effect::Laser, aux));
                             }
-                            break;
+                            if !pierce {
+                                break;
+                            }
                         }
                         cur = nsq;
                     }
@@ -599,6 +621,9 @@ fn gen_overclock(g: &GameDef, pos: &Position, from: u16, out: &mut Vec<Move>) {
 /// Kernel-only pseudo moves of the piece standing on `from` (no specials,
 /// abilities, drops, or nested compounds).
 fn pseudo_kernel_moves_of(g: &GameDef, pos: &Position, from: u16) -> Vec<Move> {
+    let flies = pos
+        .piece_at(from)
+        .map_or(false, |p| g.types[p.t as usize].flight);
     let Some(p) = pos.piece_at(from) else { return Vec::new() };
     if p.side != pos.stm {
         return Vec::new();
@@ -612,11 +637,11 @@ fn pseudo_kernel_moves_of(g: &GameDef, pos: &Position, from: u16) -> Vec<Move> {
             continue;
         }
         let Some(to) = g.board.offset(from, k.d.dx, k.d.dy) else { continue };
-        if !zone_ok(k.to_zone, to) || !pos.terrain_open(to) {
+        if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies) {
             continue;
         }
         if k.blockers.iter().any(|b| {
-            g.board.offset(from, b.dx, b.dy).map_or(true, |bsq| pos.cell_obstructed(bsq))
+            g.board.offset(from, b.dx, b.dy).map_or(true, |bsq| pos.cell_obstructed_for(bsq, flies))
         }) {
             continue;
         }
@@ -634,7 +659,7 @@ fn pseudo_kernel_moves_of(g: &GameDef, pos: &Position, from: u16) -> Vec<Move> {
         }
         let mut cur = from;
         while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
-            if !zone_ok(k.to_zone, to) || !pos.terrain_open(to) {
+            if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies) {
                 break;
             }
             match pos.piece_at(to) {

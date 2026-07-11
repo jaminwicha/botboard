@@ -41,6 +41,16 @@ pub fn terrain_blocks(t: u8) -> bool {
     t == T_WALL || t == T_PIT
 }
 
+/// `terrain_blocks` under a terrain permission: flight ignores pits.
+#[inline]
+pub fn terrain_stops(t: u8, flies: bool) -> bool {
+    if flies {
+        t == T_WALL
+    } else {
+        terrain_blocks(t)
+    }
+}
+
 /// The mine's owner, if this cell holds one (mines occupy 3..=6).
 #[inline]
 pub fn mine_owner(t: u8) -> Option<Side> {
@@ -88,6 +98,8 @@ pub struct Position {
     pub occ_all: u128,
     pub occ_side: Vec<u128>,
     pub terrain_mask: u128,
+    /// Number of pit cells (kept in sync by set_terrain/rehash).
+    pit_count: u16,
     wide: bool,
 }
 
@@ -130,6 +142,7 @@ impl Position {
             occ_all: 0,
             occ_side: vec![0; g.sides as usize],
             terrain_mask: 0,
+            pit_count: 0,
             wide: g.use_bitboards && g.board.ncells() <= 128,
         };
         for &(t, side, sq, moved) in list {
@@ -158,6 +171,8 @@ impl Position {
     /// out-of-band edits (tests, determinization, manual setup).
     pub fn rehash(&mut self, g: &GameDef) {
         self.hash = g.zobrist.full_hash(self);
+        self.pit_count =
+            self.terrain.iter().filter(|&&t| t == T_PIT).count() as u16;
         if self.wide {
             self.occ_all = 0;
             self.occ_side.iter_mut().for_each(|m| *m = 0);
@@ -196,11 +211,45 @@ impl Position {
         self.board[sq as usize] >= 0 || terrain_blocks(self.terrain[sq as usize])
     }
 
+    /// `cell_obstructed` with a terrain permission: flyers pass over pits
+    /// (Appendix B hover/flight); walls stop everyone.
+    #[inline]
+    pub fn cell_obstructed_for(&self, sq: u16, flies: bool) -> bool {
+        if self.board[sq as usize] >= 0 {
+            return true;
+        }
+        let t = self.terrain[sq as usize];
+        if flies {
+            t == T_WALL
+        } else {
+            terrain_blocks(t)
+        }
+    }
+
     /// May a piece land here (ignoring occupancy)? Mines are open — that
     /// is their whole point.
     #[inline]
     pub fn terrain_open(&self, sq: u16) -> bool {
         !terrain_blocks(self.terrain[sq as usize])
+    }
+
+    /// `terrain_open` with a terrain permission: a flyer may hover on a
+    /// pit square.
+    #[inline]
+    pub fn terrain_open_for(&self, sq: u16, flies: bool) -> bool {
+        let t = self.terrain[sq as usize];
+        if flies {
+            t != T_WALL
+        } else {
+            !terrain_blocks(t)
+        }
+    }
+
+    /// Any pits on the board? Gates the wide-bitboard fast path for
+    /// flyers (whose kernels must ignore pit obstruction).
+    #[inline]
+    pub fn has_pit(&self) -> bool {
+        self.pit_count > 0
     }
 
     fn fwd(side: Side) -> i8 {
@@ -263,6 +312,12 @@ impl Position {
 
     #[inline]
     fn set_terrain(&mut self, sq: u16, t: u8) {
+        if self.terrain[sq as usize] == T_PIT {
+            self.pit_count -= 1;
+        }
+        if t == T_PIT {
+            self.pit_count += 1;
+        }
         self.terrain[sq as usize] = t;
         if self.wide {
             if terrain_blocks(t) {
@@ -744,13 +799,14 @@ impl Position {
             if g.types[p.t as usize].hologram {
                 continue;
             }
+            let aflies = g.types[p.t as usize].flight;
             let (px, py) = g.board.xy(psq);
             let (dx, dy) = ((tx - px) as i32, (ty - py) as i32);
             let ck = g.compiled(p.t, p.side);
             let zone_ok = |z: Option<usize>, s: Side, at: u16| {
                 z.map_or(true, |zi| g.zones[zi].contains(s, at))
             };
-            let bb_active = use_bb && ck.bb.is_some();
+            let bb_active = use_bb && ck.bb.is_some() && !(aflies && self.has_pit());
             if bb_active {
                 let bb = ck.bb.as_ref().unwrap();
                 for e in &bb.leaps[psq as usize] {
@@ -789,7 +845,7 @@ impl Position {
                 let blocked = k.blockers.iter().any(|b| {
                     g.board
                         .offset(psq, b.dx, b.dy)
-                        .map_or(true, |bsq| self.cell_obstructed(bsq))
+                        .map_or(true, |bsq| self.cell_obstructed_for(bsq, aflies))
                 });
                 if !blocked {
                     return true;
@@ -811,7 +867,7 @@ impl Position {
                 let mut cur = psq;
                 for _ in 1..steps {
                     cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
-                    if self.cell_obstructed(cur) {
+                    if self.cell_obstructed_for(cur, aflies) {
                         continue 'ride;
                     }
                 }
@@ -831,7 +887,7 @@ impl Position {
                 let mut cur = psq;
                 for _ in 1..steps {
                     cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
-                    if terrain_blocks(self.terrain[cur as usize]) {
+                    if terrain_stops(self.terrain[cur as usize], aflies) {
                         continue 'hop; // blocking terrain is not a screen
                     }
                     if self.board[cur as usize] >= 0 {

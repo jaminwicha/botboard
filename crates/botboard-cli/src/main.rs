@@ -267,6 +267,83 @@ fn cmd_league(g: &GameDef, name: &str, args: &[String]) {
     println!("(written to league_profiles.json)");
 }
 
+/// Promotion gate (scale-ladder rung 1): two checkpoints play a paired-
+/// opening match — every random opening is played twice with colors
+/// swapped, so the stronger evaluator, not the draw of openings, decides.
+fn cmd_netmatch(g: &GameDef, name: &str, args: &[String]) {
+    let pairs: u32 = opt(args, "--pairs", 10);
+    let depth: i32 = opt(args, "--depth", 4);
+    let nodes: u64 = opt(args, "--nodes", 20_000);
+    let seed: u64 = opt(args, "--seed", 3);
+    let a_path: String = opt(args, "--a", String::new());
+    let b_path: String = opt(args, "--b", String::new());
+    let load = |path: &str| -> Eval {
+        let material = material_for(g, name);
+        if path.is_empty() {
+            return Eval::new(material);
+        }
+        let data = std::fs::read(path).expect("read net checkpoint");
+        let fnet =
+            botboard_core::nnue::FloatNet::from_bytes(&data).expect("parse checkpoint");
+        Eval::with_net(material, botboard_core::nnue::QuantNet::from_float(g, &fnet))
+    };
+    let (mut wa, mut wb, mut dr) = (0u32, 0u32, 0u32);
+    for pair in 0..pairs {
+        // A short random opening, replayed for both color assignments.
+        let mut rng = Rng::new(seed.wrapping_add(pair as u64 * 7919));
+        let mut opening: Vec<botboard_core::moves::Move> = Vec::new();
+        {
+            let mut pos = Position::startpos(g);
+            for _ in 0..4 {
+                let ms = legal_moves(g, &mut pos);
+                if ms.is_empty() {
+                    break;
+                }
+                let mv = ms[(rng.next_u64() % ms.len() as u64) as usize];
+                pos.make(g, &mv);
+                opening.push(mv);
+            }
+        }
+        for a_first in [true, false] {
+            let mut sa = Searcher::new(g, load(&a_path));
+            let mut sb = Searcher::new(g, load(&b_path));
+            let mut pos = Position::startpos(g);
+            for mv in &opening {
+                pos.make(g, mv);
+            }
+            let mut plies = 0;
+            let verdict = loop {
+                match botboard_core::movegen::status(g, &mut pos) {
+                    botboard_core::movegen::Status::Win(side) => break Some(side),
+                    botboard_core::movegen::Status::Draw => break None,
+                    botboard_core::movegen::Status::Ongoing => {}
+                }
+                if plies >= 200 {
+                    break None;
+                }
+                let a_to_move = (pos.stm == 0) == a_first;
+                let s = if a_to_move { &mut sa } else { &mut sb };
+                let Some(mv) = s.search(g, &mut pos, depth, nodes).best else {
+                    break None;
+                };
+                pos.make(g, &mv);
+                plies += 1;
+            };
+            match verdict {
+                Some(side) if (side == 0) == a_first => wa += 1,
+                Some(_) => wb += 1,
+                None => dr += 1,
+            }
+        }
+        println!("pair {pair}: A {wa}  B {wb}  draws {dr}");
+    }
+    let total = wa + wb + dr;
+    println!(
+        "netmatch: A ({a_path}) {wa} — {dr} — {wb} B ({b_path})  score {:.1}%",
+        100.0 * (wa as f64 + dr as f64 * 0.5) / total as f64
+    );
+}
+
 fn cmd_armies(args: &[String]) {
     let budget: f64 = opt(args, "--budget", 20.0);
     let seed: u64 = opt(args, "--seed", 1);
@@ -396,6 +473,7 @@ fn main() {
         "selfplay" => cmd_selfplay(&g, variant, &rest),
         "cost" => cmd_cost(&g, variant),
         "league" => cmd_league(&g, variant, &rest),
+        "netmatch" => cmd_netmatch(&g, variant, &rest),
         _ => eprintln!("unknown command: {cmd}"),
     }
 }

@@ -160,6 +160,12 @@ pub struct PieceTypeDef {
     /// Concealed presence (SRW Appendix B stealth): hidden from opponents'
     /// search worlds until revealed — masking lives at the battle layer.
     pub stealth: bool,
+    /// Terrain permission (SRW Appendix B hover/flight): pits neither
+    /// block this piece's paths nor bar its landings; walls still do.
+    pub flight: bool,
+    /// EMP aura radius (Appendix B): enemies within chebyshev range
+    /// cannot use their ability Bits; 0 = no aura.
+    pub emp_aura: u8,
 }
 
 impl PieceTypeDef {
@@ -180,6 +186,8 @@ impl PieceTypeDef {
             overclock: false,
             hologram: false,
             stealth: false,
+            flight: false,
+            emp_aura: 0,
         }
     }
     pub fn specials(mut self, s: Vec<SpecialBit>) -> Self {
@@ -204,6 +212,14 @@ impl PieceTypeDef {
     }
     pub fn stealth(mut self) -> Self {
         self.stealth = true;
+        self
+    }
+    pub fn flight(mut self) -> Self {
+        self.flight = true;
+        self
+    }
+    pub fn emp(mut self, radius: u8) -> Self {
+        self.emp_aura = radius;
         self
     }
     pub fn royal(mut self) -> Self {

@@ -115,6 +115,9 @@ pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
     if ty.stealth {
         m_utility *= 1.4; // Appendix B: concealment multiplier
     }
+    if ty.flight {
+        m_utility *= 1.1; // Appendix B: terrain-permission multiplier
+    }
     let mut s_nerfs = 0.0;
     let mut s_flat = 0.0;
     for a in &ty.abilities {
@@ -128,6 +131,9 @@ pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
             crate::bits::AbilityBit::MineLayer { .. } => s_flat += 2.0,
             _ => {}
         }
+    }
+    if ty.emp_aura > 0 {
+        s_flat += 6.5; // Appendix B EMP aura prior
     }
     if ty.hologram {
         // A decoy's value is the bluff, not the body (Appendix B +2.5).

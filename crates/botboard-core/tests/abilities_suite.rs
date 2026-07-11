@@ -6,7 +6,7 @@ use botboard_core::bits::{AbilityBit, MoveBit};
 use botboard_core::game::*;
 use botboard_core::movegen::{legal_moves};
 use botboard_core::moves::{move_str, Effect, Move, MoveKind, NO_SQ};
-use botboard_core::position::{Loc, Position, T_ACID, T_ICE, T_NONE, T_WALL};
+use botboard_core::position::{Loc, Position, T_ACID, T_ICE, T_NONE, T_PIT, T_WALL};
 
 const KING: TypeId = 0;
 const TANK: TypeId = 1; // rider(0,1), 3 HP armor
@@ -18,6 +18,9 @@ const NECRO: TypeId = 6; // leaper(0,1), resurrect range 1
 const HACKER: TypeId = 7; // leaper(0,1), hack range 2
 const DECOY: TypeId = 8; // hologram: leaper(0,1)+(1,1), no threat
 const SAPPER: TypeId = 9; // leaper(0,1), mine-layer range 1
+const DRONE: TypeId = 10; // flight: rider(0,1) hover unit
+const PIERCER: TypeId = 11; // piercing laser r3, no retreat
+const JAMMER: TypeId = 12; // EMP aura r2
 
 fn robot_types() -> Vec<PieceTypeDef> {
     vec![
@@ -29,7 +32,7 @@ fn robot_types() -> Vec<PieceTypeDef> {
         PieceTypeDef::new("engineer", 'E', vec![MoveBit::leaper(0, 1)])
             .abilities(vec![AbilityBit::CreateWall { range: 1 }]),
         PieceTypeDef::new("laserbot", 'L', vec![MoveBit::leaper(0, 1)])
-            .abilities(vec![AbilityBit::Laser { range: 3, retreat: true }]),
+            .abilities(vec![AbilityBit::Laser { range: 3, retreat: true, pierce: false }]),
         PieceTypeDef::new("scout", 'S', vec![MoveBit::leaper(0, 1), MoveBit::leaper(1, 1)])
             .hp(2)
             .overclock(),
@@ -41,6 +44,10 @@ fn robot_types() -> Vec<PieceTypeDef> {
             .hologram(),
         PieceTypeDef::new("sapper", 'P', vec![MoveBit::leaper(0, 1)])
             .abilities(vec![AbilityBit::MineLayer { range: 1 }]),
+        PieceTypeDef::new("drone", 'F', vec![MoveBit::rider(0, 1)]).flight(),
+        PieceTypeDef::new("piercer", 'Z', vec![MoveBit::leaper(0, 1)])
+            .abilities(vec![AbilityBit::Laser { range: 3, retreat: false, pierce: true }]),
+        PieceTypeDef::new("jammer", 'J', vec![MoveBit::leaper(0, 1)]).emp(2),
     ]
 }
 
@@ -550,5 +557,130 @@ fn acid_bites_anyone_who_wades_in() {
     pos.unmake(&g, &u2);
     assert_eq!(pos.hash, h1);
     assert!(matches!(pos.pieces[mi].loc, Loc::Board(_)));
+}
+
+#[test]
+fn flight_crosses_pits_that_ground_units_cannot() {
+    // A pit splits the d-file: the grounded tank stops, the drone soars.
+    let g = robot_game(vec![
+        (KING, 0, 0, 0),
+        (KING, 1, 7, 7),
+        (TANK, 0, 3, 1),
+        (DRONE, 0, 5, 1),
+    ]);
+    let mut pos = Position::startpos(&g);
+    pos.terrain[g.board.sq(3, 3) as usize] = T_PIT;
+    pos.terrain[g.board.sq(5, 3) as usize] = T_PIT;
+    pos.rehash(&g);
+
+    let moves = legal_moves(&g, &mut pos);
+    // The tank's file ride stops under the pit.
+    assert!(
+        !moves.iter().any(|m| m.from == g.board.sq(3, 1) && m.to == g.board.sq(3, 5)),
+        "grounded riders cannot pass a pit"
+    );
+    // The drone rides straight over it — and may even hover on it.
+    assert!(
+        moves.iter().any(|m| m.from == g.board.sq(5, 1) && m.to == g.board.sq(5, 5)),
+        "flight passes over pits"
+    );
+    assert!(
+        moves.iter().any(|m| m.from == g.board.sq(5, 1) && m.to == g.board.sq(5, 3)),
+        "flight may hover on a pit square"
+    );
+
+    // Attack maps agree: the drone threatens past the pit, the tank not.
+    pos.set_stm(&g, 1);
+    assert!(pos.is_attacked(&g, g.board.sq(5, 6), 0), "flying threat crosses the pit");
+    assert!(!pos.is_attacked(&g, g.board.sq(3, 6), 0), "grounded threat is cut");
+
+    // Walls still stop everyone.
+    pos.terrain[g.board.sq(5, 4) as usize] = T_WALL;
+    pos.rehash(&g);
+    pos.set_stm(&g, 0);
+    let moves2 = legal_moves(&g, &mut pos);
+    assert!(
+        !moves2.iter().any(|m| m.from == g.board.sq(5, 1) && m.to == g.board.sq(5, 5)),
+        "walls ground even flyers"
+    );
+}
+
+#[test]
+fn piercing_lasers_shoot_through_the_screen() {
+    // Friendly tank screens the enemy: an ordinary laser is blocked, a
+    // piercing beam ignores occupancy on its ray (Appendix B).
+    let g = robot_game(vec![
+        (KING, 0, 0, 0),
+        (KING, 1, 7, 7),
+        (PIERCER, 0, 4, 2),
+        (TANK, 0, 4, 3),   // friendly screen on the ray
+        (TANK, 1, 4, 4),   // target behind it
+        (LASERBOT, 0, 2, 2),
+        (TANK, 0, 2, 3),   // same screen shape for the ordinary laser
+        (TANK, 1, 2, 4),
+    ]);
+    let mut pos = Position::startpos(&g);
+    let moves = legal_moves(&g, &mut pos);
+    assert!(
+        moves.iter().any(|m| m.effect == Effect::Laser
+            && m.from == g.board.sq(4, 2)
+            && m.to == g.board.sq(4, 4)),
+        "the piercing beam reaches through the friendly screen"
+    );
+    assert!(
+        !moves.iter().any(|m| m.effect == Effect::Laser
+            && m.from == g.board.sq(2, 2)
+            && m.to == g.board.sq(2, 4)),
+        "the ordinary laser is stopped by its screen"
+    );
+}
+
+#[test]
+fn emp_aura_suppresses_enemy_ability_bits() {
+    // A jammer at d4 (radius 2): the enemy medic inside the field cannot
+    // heal; the same medic outside the field can. Friendlies unaffected.
+    let g = robot_game(vec![
+        (KING, 0, 0, 0),
+        (KING, 1, 7, 7),
+        (JAMMER, 0, 3, 3),
+        (MEDIC, 1, 4, 4),  // inside the aura (chebyshev 1)
+        (TANK, 1, 4, 5),   // its damaged patient
+        (MEDIC, 1, 7, 0),  // far medic, well outside radius 2
+        (TANK, 1, 7, 1),   // its damaged patient
+        (MEDIC, 0, 2, 2),  // friendly medic inside its own jammer's field
+        (TANK, 0, 2, 3),
+    ]);
+    let mut pos = Position::startpos(&g);
+    for sq in [g.board.sq(4, 5), g.board.sq(7, 1), g.board.sq(2, 3)] {
+        let i = pos.board[sq as usize] as usize;
+        pos.hp[i] = 1;
+    }
+    pos.rehash(&g);
+
+    // Friendly abilities generate normally (the aura only bites enemies).
+    let ours = legal_moves(&g, &mut pos);
+    assert!(
+        ours.iter().any(|m| matches!(m.effect, Effect::Heal(_))),
+        "own medic unaffected by own jammer"
+    );
+
+    // Same position, enemy to move: the medic in the field is jammed,
+    // the far medic heals freely, and jammed robots still MOVE.
+    pos.set_stm(&g, 1);
+    let theirs = legal_moves(&g, &mut pos);
+    assert!(
+        !theirs.iter().any(|m| matches!(m.effect, Effect::Heal(_))
+            && m.from == g.board.sq(4, 4)),
+        "EMP suppresses enemy ability Bits inside the field"
+    );
+    assert!(
+        theirs.iter().any(|m| matches!(m.effect, Effect::Heal(_))
+            && m.from == g.board.sq(7, 0)),
+        "outside the aura, abilities work"
+    );
+    assert!(
+        theirs.iter().any(|m| m.from == g.board.sq(4, 4)),
+        "only action Bits are jammed — movement survives"
+    );
 }
 
