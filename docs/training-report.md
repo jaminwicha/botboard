@@ -294,3 +294,57 @@ seeds {31,32}, tier 1) with the qsearch fix in place, ~35 min total:
 - Mover asymmetry remains clan-dependent (side 0 starved for scrapline/
   veilworks at low budgets, side 0 *favored* for deepcore at 14/20) — a
   uniform second-player compensation would cut both ways; left open.
+
+## Addendum (2026-07-11): post-content re-vet, cross-clan probe, rulings
+
+Full mirror grid rerun (`VetSweep`, tier 1, 144 games, ~16 min) after
+the July-10/11 content wave (controller spells, reputation, mines/
+holograms/stealth, ice/grass/acid — generator now rolls stealth and
+hologram flags, shifting every clan's army draws):
+
+| clan | s0-win range | draw range | plies | flags |
+|---|---|---|---|---|
+| scrapline | 17–33% | 33–67% | 102–139 | — |
+| foundry | 33–50% | 0–33% | 20–29 | — |
+| veilworks | 17–67% | 17–83% | 32–52 | — |
+| deepcore | 17–100% | 0–67% | 6–38 | 14/31 + 20/31 lopsided/blowout |
+
+Every clan now produces decisive mirrors at every budget — the July
+"inert armies" and chronic 0%-side-0 rows are gone. Scrapline slogs
+shortened (from 130–185 to ~102–139 mean plies).
+
+**Ruling — mover asymmetry (July suggestion 4): no compensation.**
+The July pattern (side 0 winless nearly everywhere) was substantially
+an *information* asymmetry, not tempo: the second player observes one
+public action before its first decision, sharpening its belief and
+frequently dropping it into a cheaper, stronger ladder rung (directly
+observed while profiling the qsearch DNF — side 0 fought at R2
+~60 ms/move while side 1 sat in R1 at ~8 ms). The current grid is
+direction-mixed (deepcore mirrors favor the FIRST mover, to the point
+of 5.7-ply blowouts on one seed) and seed-noisy. A uniform
+second-player bonus would overcorrect half the clans; deepcore's
+blowouts are palette sharpness, watched via campaign telemetry.
+
+**New: cross-clan round-robin** (`VetSweep pairs 14` over the new
+`Vetting.VetPair` — the first inter-clan fairness measurement):
+
+| matchup (A vs B) | A-wins | draws | verdict |
+|---|---|---|---|
+| scrapline vs foundry | 17% | 17–33% | foundry clearly ahead |
+| scrapline vs veilworks | 0–17% | 33–100% | veilworks ahead or drawn |
+| scrapline vs deepcore | 0% | 0% | deepcore total |
+| foundry vs veilworks | 33–67% | 17–67% | balanced |
+| foundry vs deepcore | 17–33% | 0–17% | deepcore ahead |
+| veilworks vs deepcore | 0% | 0–17% | deepcore total |
+
+**Ruling — inter-clan hierarchy: keep, for now.** At equal budget the
+palettes rank deepcore ≫ foundry ≈ veilworks > scrapline — the anchored
+cost prior does not fully hold the line ACROSS palettes. But the
+hierarchy tracks the clans' depth bands (scrapline early, deepcore
+deep), so campaign progression absorbs it: a player never fights
+deepcore on a scrapline-era budget, and the one within-band pairing
+(foundry/veilworks) is balanced. The proper correction is scale-ladder
+rung 3 (STATUS): refit the synergy term from a self-play corpus that
+includes the new Axis-B vocabulary. Note: pair reports reuse the
+mirror Judge thresholds, so their "lopsided mirror" flags are labels,
+not mirror claims.
