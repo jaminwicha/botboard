@@ -144,3 +144,51 @@ reference abilities by id. `Effect` enum → `EffectId(u16)` index;
   Maker Mode gains custom-effect composition.
 
 Each stage is behavior-preserving until Stage 4 adds authoring.
+
+## Stage 1 as built (July 2026) — deviations and notes
+
+Landed in `ops.rs` (micro-op layer + op log) and `effects.rs` (registry
+stdlib); `make_impl`'s ability arm is one interpreter loop over the
+row's `ops` then `self_ops`; `unmake` is a single backwards replay of
+the move's op log (the bespoke per-kind rewind ordering is gone).
+Deviations from the design table above:
+
+- **`SwapWithCaster` stays one op** (not two `Relocate`s): an atomic
+  two-piece exchange cannot decompose into sequential relocations
+  without a temp square mid-transaction; it carries a single `Swapped`
+  undo record.
+- **`TransformType` is an undo record, not yet an interpreted op**:
+  promotion fuses into the fast path's relocate bracket
+  (`op_relocate_promo`, one hash bracket per plain move — the
+  `[Relocate(+CaptureAt(to))]` fast path). It becomes a standalone op
+  when move kinds turn into stdlib scripts (Stage 2).
+- **`SetEphemeral` remains the make-prologue `prior_ep` snapshot** plus
+  the DoubleStep arm; same Stage-2 promotion path as `TransformType`.
+- **`TerrainStep` carries an inherent emptiness guard**: it only erodes
+  an *unoccupied* destructible block. This lets the laser row sequence
+  `[TerrainStep, CaptureAt(To)]` with no conditional — an occupant
+  (e.g. a driller inside the block) shields the block and takes the
+  strike instead, bit-exact to the old arm's `if empty && is_block`.
+- **One laser row serves both retreat variants**: `Relocate` to `Aux`
+  no-ops when the move carries no aux square, so
+  `self_ops: [Relocate(From→Aux, hazard)]` covers `retreat: false` too.
+- **`HpAdd` has no floor-death**: Stage-1 users (heal +n capped,
+  overclock self −1) never reach 0 by generation guarantee; kill paths
+  are `CaptureAt` and the landing-hazard hook.
+- **Landing hazards stay a post-op hook** (mine/acid; unchanged
+  behavior quirks preserved: castle rooks and resurrected pieces do NOT
+  trigger hazards; swap bites caster then partner). Their mutations
+  flow through the shared op undo records. Terrain rows are Stage 3.
+- **`Effect` keeps its enum shape** as the stable wire/notation/FFI
+  surface; its variants are the stdlib row ids (`effects::row` maps 1:1,
+  `effects::ability_row` maps the `AbilityBit` authoring surface).
+  Ability parameters stay on `AbilityBit` (ranges, pierce) and on the
+  move itself (heal amount, retreat square, revived type) this stage,
+  so the stdlib rows are static.
+- **Undo shrank to `{op log, prior_ep, prior_hash}`**: the old
+  special-purpose records (captured/captured2/partner/revived/hacked/
+  hp_changes/terrain_changes/mine_deaths) folded 1:1 into `OpUndo`
+  variants. The log has 4 inline slots (heap spill only for long
+  scripts), so the dominant script never allocates; measured perft is
+  slightly *faster* than pre-refactor (interleaved A/B, chess/xiangqi/
+  shogi all within +2–3%).

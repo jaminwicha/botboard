@@ -15,8 +15,9 @@
 //! restores the recorded prior key in O(1). Debug builds assert equality
 //! with the full recompute after every make.
 
-use crate::game::{CaptureFate, GameDef, Side, TypeId};
+use crate::game::{GameDef, Side, TypeId};
 use crate::moves::{Effect, Move, MoveKind, NO_SQ};
+use crate::ops::{OpCtx, OpLog};
 
 pub const T_NONE: u8 = 0;
 pub const T_WALL: u8 = 1;
@@ -138,31 +139,13 @@ pub struct Position {
     wide: bool,
 }
 
+/// Per-move undo: the micro-op log (Bits 2.0 Stage 1 — every mutation a
+/// move makes is an op record in application order; unmake replays it
+/// backwards) plus the O(1) move-level snapshots. The old special-purpose
+/// records (captured/partner/revived/hacked/hp_changes/terrain_changes/
+/// mine_deaths) folded 1:1 into `crate::ops::OpUndo` variants.
 pub struct Undo {
-    mv: Move,
-    moving: usize,
-    prior_t: TypeId,
-    prior_moved: bool,
-    /// Where the mover actually stood before the move (strikes don't move).
-    prior_sq: u16,
-    captured: Option<(usize, Piece)>,
-    /// Second-step capture of a compound.
-    captured2: Option<(usize, Piece)>,
-    /// Second piece of a two-piece script — castle rook, swap partner, or
-    /// push victim: (index, prior square, prior moved).
-    partner: Option<(usize, u16, bool)>,
-    /// (piece index, prior hp) — strikes, heals, overclock self-damage.
-    hp_changes: Vec<(usize, i16)>,
-    /// (square, prior terrain), in application order. Usually 0 or 1
-    /// entries; a laser that cracks a block and then retreats onto an
-    /// enemy mine, or a push that springs a mine, needs the list.
-    terrain_changes: Vec<(u16, u8)>,
-    /// Resurrect: (revived piece index, its prior `moved` flag).
-    revived: Option<(usize, bool)>,
-    /// Hack: (flipped piece index, its prior side).
-    hacked: Option<(usize, Side)>,
-    /// Mine/acid kills: (piece index, the square it died on).
-    mine_deaths: Vec<(usize, u16)>,
+    ops: OpLog,
     prior_ep: u16,
     prior_hash: u64,
 }
@@ -307,7 +290,7 @@ impl Position {
     /// before and once after mutating any of its keyed state; off-board
     /// pieces contribute nothing, so hand/dead transitions pair naturally.
     #[inline]
-    fn xor_piece(&mut self, g: &GameDef, i: usize) {
+    pub(crate) fn xor_piece(&mut self, g: &GameDef, i: usize) {
         if let Loc::Board(sq) = self.pieces[i].loc {
             let p = &self.pieces[i];
             self.hash ^= g.zobrist.piece_key(
@@ -321,18 +304,18 @@ impl Position {
     }
 
     #[inline]
-    fn xor_hand(&mut self, g: &GameDef, s: usize, t: usize) {
+    pub(crate) fn xor_hand(&mut self, g: &GameDef, s: usize, t: usize) {
         self.hash ^= g.zobrist.hand_key(s, t, self.hands[s][t] as usize);
     }
 
     #[inline]
-    fn xor_terrain(&mut self, g: &GameDef, sq: u16) {
+    pub(crate) fn xor_terrain(&mut self, g: &GameDef, sq: u16) {
         self.hash ^= g.zobrist.terrain_key(self.terrain[sq as usize], sq as usize);
     }
 
     /// Put piece `i` on `sq` (mailbox + masks + loc).
     #[inline]
-    fn place(&mut self, i: usize, sq: u16) {
+    pub(crate) fn place(&mut self, i: usize, sq: u16) {
         self.board[sq as usize] = i as i32;
         self.pieces[i].loc = Loc::Board(sq);
         if self.wide {
@@ -343,7 +326,7 @@ impl Position {
 
     /// Remove piece `i` from `sq` (mailbox + masks; caller sets loc).
     #[inline]
-    fn lift(&mut self, i: usize, sq: u16) {
+    pub(crate) fn lift(&mut self, i: usize, sq: u16) {
         self.board[sq as usize] = -1;
         if self.wide {
             self.occ_all &= !(1u128 << sq);
@@ -352,7 +335,7 @@ impl Position {
     }
 
     #[inline]
-    fn set_terrain(&mut self, sq: u16, t: u8) {
+    pub(crate) fn set_terrain(&mut self, sq: u16, t: u8) {
         let old = self.terrain[sq as usize];
         if old == T_PIT {
             self.pit_count -= 1;
@@ -373,42 +356,6 @@ impl Position {
             } else {
                 self.terrain_mask &= !(1u128 << sq);
             }
-        }
-    }
-
-    /// Landing hazards (SRW Appendix B): spring an enemy mine (spent on
-    /// trigger) or wade into acid (persistent, bites every side). Either
-    /// way the lander takes 1 HP — lethal at 1.
-    fn trigger_mine(&mut self, g: &GameDef, mi: usize, u: &mut Undo) {
-        let Loc::Board(sq) = self.pieces[mi].loc else { return };
-        let t = self.terrain[sq as usize];
-        let bites = match mine_owner(t) {
-            Some(owner) => {
-                if owner == self.pieces[mi].side {
-                    return;
-                }
-                // The mine is spent.
-                u.terrain_changes.push((sq, t));
-                self.xor_terrain(g, sq);
-                self.set_terrain(sq, T_NONE);
-                self.xor_terrain(g, sq);
-                true
-            }
-            None => t == T_ACID,
-        };
-        if !bites {
-            return;
-        }
-        if self.hp[mi] > 1 {
-            u.hp_changes.push((mi, self.hp[mi]));
-            self.xor_piece(g, mi);
-            self.hp[mi] -= 1;
-            self.xor_piece(g, mi);
-        } else {
-            self.xor_piece(g, mi);
-            self.lift(mi, sq);
-            self.pieces[mi].loc = Loc::Dead;
-            u.mine_deaths.push((mi, sq));
         }
     }
 
@@ -452,51 +399,6 @@ impl Position {
         }
     }
 
-    /// Apply a capture-or-strike against the occupant of `sq`.
-    /// Returns (captured record, killed).
-    fn hit(
-        &mut self,
-        g: &GameDef,
-        sq: u16,
-        undo_hp: &mut Vec<(usize, i16)>,
-    ) -> (Option<(usize, Piece)>, bool) {
-        let ci = self.board[sq as usize];
-        if ci < 0 {
-            return (None, false);
-        }
-        let ci = ci as usize;
-        if self.hp[ci] > 1 {
-            // Armor strike (§3.2): decrement HP, victim stays.
-            undo_hp.push((ci, self.hp[ci]));
-            self.xor_piece(g, ci);
-            self.hp[ci] -= 1;
-            self.xor_piece(g, ci);
-            return (None, false);
-        }
-        let prior = self.pieces[ci];
-        self.xor_piece(g, ci);
-        self.lift(ci, sq);
-        match g.policy.capture_fate {
-            CaptureFate::Destroy => self.pieces[ci].loc = Loc::Dead,
-            CaptureFate::ToHand => {
-                let base = self.pieces[ci].base;
-                self.pieces[ci].t = base;
-                self.pieces[ci].side = self.stm;
-                self.pieces[ci].loc = Loc::Hand(self.stm);
-                self.xor_hand(g, self.stm as usize, base as usize);
-                self.hands[self.stm as usize][base as usize] += 1;
-                self.xor_hand(g, self.stm as usize, base as usize);
-            }
-        }
-        // Off-board now: xor_piece contributes nothing (paired naturally).
-        (Some((ci, prior)), true)
-    }
-
-    fn move_piece(&mut self, mi: usize, from: u16, to: u16) {
-        self.lift(mi, from);
-        self.place(mi, to);
-    }
-
     pub fn make(&mut self, g: &GameDef, mv: &Move) -> Undo {
         #[cfg(debug_assertions)]
         self.assert_consistent("make-entry");
@@ -519,358 +421,123 @@ impl Position {
         u
     }
 
+    /// One move = one op script (Bits 2.0 Stage 1). The dominant script
+    /// `[Relocate(+CaptureAt(victim))]` — plain moves, promotions, en
+    /// passant, locust, castle — keeps a specialized non-interpreted
+    /// path; abilities run ONE interpreter loop over their registry row
+    /// (no per-effect match); drops and compounds call the same shared
+    /// ops directly. Every mutation lands in the op log in application
+    /// order, hash-bracketed inside the op.
     fn make_impl(&mut self, g: &GameDef, mv: &Move) -> Undo {
-        let prior_ep = self.ep;
-        let prior_hash = self.hash;
+        let mut u = Undo { ops: OpLog::new(), prior_ep: self.ep, prior_hash: self.hash };
         self.hash ^= g.zobrist.ep_key(self.ep);
         self.ep = NO_SQ;
 
-        if mv.kind == MoveKind::Drop {
-            let idx = self
-                .pieces
-                .iter()
-                .position(|p| p.loc == Loc::Hand(self.stm) && p.t == mv.drop_type)
-                .expect("drop with empty hand");
-            let mut u = Undo {
-                mv: *mv,
-                moving: idx,
-                prior_t: self.pieces[idx].t,
-                prior_moved: self.pieces[idx].moved,
-                prior_sq: NO_SQ,
-                captured: None,
-                captured2: None,
-                partner: None,
-                hp_changes: Vec::new(),
-                terrain_changes: Vec::new(),
-                revived: None,
-                hacked: None,
-                mine_deaths: Vec::new(),
-                prior_ep,
-                prior_hash,
-            };
-            self.xor_hand(g, self.stm as usize, mv.drop_type as usize);
-            self.hands[self.stm as usize][mv.drop_type as usize] -= 1;
-            self.xor_hand(g, self.stm as usize, mv.drop_type as usize);
-            // From hand (no key) to board (keyed): single trailing XOR.
-            self.place(idx, mv.to);
-            self.pieces[idx].moved = true;
-            // A dropped piece re-enters at full HP for its type.
-            if self.hp[idx] != g.types[mv.drop_type as usize].max_hp {
-                u.hp_changes.push((idx, self.hp[idx]));
-                self.hp[idx] = g.types[mv.drop_type as usize].max_hp;
-            }
-            self.xor_piece(g, idx);
-            self.trigger_mine(g, idx, &mut u);
-            self.advance_stm(g);
-            return u;
-        }
-
-        let mi = self.board[mv.from as usize] as usize;
-        let mut u = Undo {
-            mv: *mv,
-            moving: mi,
-            prior_t: self.pieces[mi].t,
-            prior_moved: self.pieces[mi].moved,
-            prior_sq: mv.from,
-            captured: None,
-            captured2: None,
-            partner: None,
-            hp_changes: Vec::new(),
-            terrain_changes: Vec::new(),
-            revived: None,
-            hacked: None,
-            mine_deaths: Vec::new(),
-            prior_ep,
-            prior_hash,
-        };
-
         match mv.kind {
+            MoveKind::Drop => {
+                // PlaceFrom(hand): the same source-pool op resurrect
+                // flows through with the dead pool.
+                let idx = self
+                    .pieces
+                    .iter()
+                    .position(|p| p.loc == Loc::Hand(self.stm) && p.t == mv.drop_type)
+                    .expect("drop with empty hand");
+                self.op_place_from_hand(g, idx, mv.to, &mut u.ops);
+                self.hazard_landing(g, idx, &mut u.ops);
+            }
             MoveKind::Ability => {
-                match mv.effect {
-                    Effect::Heal(amount) => {
-                        let ti = self.board[mv.to as usize] as usize;
-                        u.hp_changes.push((ti, self.hp[ti]));
-                        let max = g.types[self.pieces[ti].t as usize].max_hp;
-                        self.xor_piece(g, ti);
-                        self.hp[ti] = (self.hp[ti] + amount).min(max);
-                        self.xor_piece(g, ti);
-                    }
-                    Effect::Wall | Effect::Pit | Effect::Mine => {
-                        u.terrain_changes.push((mv.to, self.terrain[mv.to as usize]));
-                        self.xor_terrain(g, mv.to);
-                        self.set_terrain(
-                            mv.to,
-                            match mv.effect {
-                                Effect::Wall => T_WALL,
-                                Effect::Pit => T_PIT,
-                                _ => T_MINE0 + self.stm,
-                            },
-                        );
-                        self.xor_terrain(g, mv.to);
-                    }
-                    Effect::Laser => {
-                        let t = self.terrain[mv.to as usize];
-                        if self.board[mv.to as usize] < 0 && is_block(t) {
-                            // Terrain damage: the block drops one tier;
-                            // T_BLOCK1 clears to bare floor.
-                            let next = if t == T_BLOCK1 { T_NONE } else { t - 1 };
-                            u.terrain_changes.push((mv.to, t));
-                            self.xor_terrain(g, mv.to);
-                            self.set_terrain(mv.to, next);
-                            self.xor_terrain(g, mv.to);
-                        } else {
-                            let (cap, _killed) = self.hit(g, mv.to, &mut u.hp_changes);
-                            u.captured = cap;
-                        }
-                        if mv.aux != NO_SQ {
-                            // Coupled retreat (§3.4): part of the atomic script.
-                            self.xor_piece(g, mi);
-                            self.move_piece(mi, mv.from, mv.aux);
-                            self.pieces[mi].moved = true;
-                            self.xor_piece(g, mi);
-                            self.trigger_mine(g, mi, &mut u);
-                        }
-                    }
-                    Effect::Swap => {
-                        // Atomic two-piece exchange: caster from↔to.
-                        let pi = self.board[mv.to as usize] as usize;
-                        u.partner = Some((pi, mv.to, self.pieces[pi].moved));
-                        self.xor_piece(g, mi);
-                        self.xor_piece(g, pi);
-                        self.lift(mi, mv.from);
-                        self.lift(pi, mv.to);
-                        self.place(mi, mv.to);
-                        self.place(pi, mv.from);
-                        self.pieces[mi].moved = true;
-                        self.pieces[pi].moved = true;
-                        self.xor_piece(g, mi);
-                        self.xor_piece(g, pi);
-                        // Both relocations are landings: hazards bite.
-                        self.trigger_mine(g, mi, &mut u);
-                        self.trigger_mine(g, pi, &mut u);
-                    }
-                    Effect::Push => {
-                        // Shove the enemy at `to` onto `aux` (movegen only
-                        // generates the move when aux is open and empty).
-                        let pi = self.board[mv.to as usize] as usize;
-                        u.partner = Some((pi, mv.to, self.pieces[pi].moved));
-                        self.xor_piece(g, pi);
-                        self.move_piece(pi, mv.to, mv.aux);
-                        self.pieces[pi].moved = true;
-                        self.xor_piece(g, pi);
-                        // The shoved piece lands: mines/acid bite it.
-                        self.trigger_mine(g, pi, &mut u);
-                    }
-                    Effect::Hack => {
-                        // Flip the target to the caster's side. Masks track
-                        // side, so lift under the old side and re-place
-                        // under the new; the hash brackets the whole flip.
-                        let ti = self.board[mv.to as usize] as usize;
-                        u.hacked = Some((ti, self.pieces[ti].side));
-                        self.xor_piece(g, ti);
-                        self.lift(ti, mv.to);
-                        self.pieces[ti].side = self.stm;
-                        self.place(ti, mv.to);
-                        self.xor_piece(g, ti);
-                    }
-                    Effect::Resurrect => {
-                        // Revive the first dead friendly of the named type
-                        // (identity within a type is interchangeable, so
-                        // lowest index keeps it deterministic) at 1 HP.
-                        let ri = self
-                            .pieces
-                            .iter()
-                            .position(|p| {
-                                p.side == self.stm
-                                    && p.t == mv.drop_type
-                                    && p.loc == Loc::Dead
-                            })
-                            .expect("resurrect with no dead piece of that type");
-                        u.revived = Some((ri, self.pieces[ri].moved));
-                        u.hp_changes.push((ri, self.hp[ri]));
-                        // Dead pieces are unkeyed: mutate fully, then one
-                        // trailing XOR keys the revived state.
-                        self.hp[ri] = 1;
-                        self.place(ri, mv.to);
-                        self.pieces[ri].moved = true;
-                        self.xor_piece(g, ri);
-                    }
-                    _ => {}
+                // The interpreter: the effect's registry row, target ops
+                // then self ops, each hash-bracketed with exact undo.
+                let row = crate::effects::row(mv.effect);
+                let ctx = OpCtx {
+                    from: mv.from,
+                    to: mv.to,
+                    aux: mv.aux,
+                    amount: match mv.effect {
+                        Effect::Heal(n) => n,
+                        _ => 0,
+                    },
+                    side: self.stm,
+                    drop_type: mv.drop_type,
+                };
+                for op in row.ops {
+                    self.apply_op(g, op, &ctx, &mut u.ops);
                 }
-                self.advance_stm(g);
-                return u;
+                for op in row.self_ops {
+                    self.apply_op(g, op, &ctx, &mut u.ops);
+                }
             }
             MoveKind::Compound => {
                 // Overclock ⟨move, move, self −1 HP⟩ (§3.4): step 1 is a
-                // non-capture move from→to; step 2 to→aux may capture/strike.
-                self.xor_piece(g, mi);
-                self.move_piece(mi, mv.from, mv.to);
-                self.xor_piece(g, mi);
-                let (cap2, killed2) = self.hit(g, mv.aux, &mut u.hp_changes);
-                u.captured2 = cap2;
-                self.xor_piece(g, mi);
+                // non-capture move from→to; step 2 to→aux may capture or
+                // strike (a strike leaves the mover on `to`).
+                let mi = self.board[mv.from as usize] as usize;
+                self.op_relocate(g, mi, mv.to, &mut u.ops);
+                let killed2 = self.op_capture_at(g, mv.aux, &mut u.ops);
                 if killed2 || self.board[mv.aux as usize] < 0 {
-                    self.move_piece(mi, mv.to, mv.aux);
+                    self.op_relocate(g, mi, mv.aux, &mut u.ops);
                 }
-                self.pieces[mi].moved = true;
-                u.hp_changes.push((mi, self.hp[mi]));
-                self.hp[mi] -= 1;
-                self.xor_piece(g, mi);
-                self.trigger_mine(g, mi, &mut u);
-                self.advance_stm(g);
-                return u;
+                self.op_hp_add(g, mi, -1, false, &mut u.ops);
+                self.hazard_landing(g, mi, &mut u.ops);
             }
-            _ => {}
-        }
-
-        // Aux-victim moves (en passant, locust hop) hit the screen square,
-        // not the landing square.
-        let victim_sq = if matches!(mv.kind, MoveKind::EnPassant | MoveKind::Locust) {
-            mv.aux
-        } else {
-            mv.to
-        };
-        let mut moved_to_dest = true;
-        if mv.kind != MoveKind::Castle && self.board[victim_sq as usize] >= 0 {
-            let (cap, killed) = self.hit(g, victim_sq, &mut u.hp_changes);
-            u.captured = cap;
-            if !killed && (victim_sq == mv.to || mv.kind == MoveKind::Locust) {
-                // Strike on an armored piece: the attacker stays put. A
-                // locust striking an armored screen chips it at range and
-                // does not leap.
-                moved_to_dest = false;
+            _ => {
+                // Fast path. Aux-victim moves (en passant, locust hop)
+                // hit the screen square, not the landing square — the
+                // same CaptureAt(aux) op either way.
+                let mi = self.board[mv.from as usize] as usize;
+                let victim_sq = if matches!(mv.kind, MoveKind::EnPassant | MoveKind::Locust) {
+                    mv.aux
+                } else {
+                    mv.to
+                };
+                let mut moved_to_dest = true;
+                if mv.kind != MoveKind::Castle && self.board[victim_sq as usize] >= 0 {
+                    let killed = self.op_capture_at(g, victim_sq, &mut u.ops);
+                    if !killed && (victim_sq == mv.to || mv.kind == MoveKind::Locust) {
+                        // Strike on an armored piece: the attacker stays
+                        // put. A locust striking an armored screen chips
+                        // it at range and does not leap.
+                        moved_to_dest = false;
+                    }
+                }
+                if moved_to_dest {
+                    self.op_relocate_promo(g, mi, mv.to, mv.promo, &mut u.ops);
+                }
+                self.hazard_landing(g, mi, &mut u.ops);
+                match mv.kind {
+                    MoveKind::DoubleStep => {
+                        // The SetEphemeral producer; its undo rides the
+                        // move-level prior_ep snapshot.
+                        let (x, y1) = g.board.xy(mv.from);
+                        let (_, y2) = g.board.xy(mv.to);
+                        self.ep = g.board.sq(x as u8, ((y1 + y2) / 2) as u8);
+                        self.hash ^= g.zobrist.ep_key(self.ep);
+                    }
+                    MoveKind::Castle => {
+                        // Partner relocation: the same op the swap and
+                        // push partners flow through.
+                        let ri = self.board[mv.aux as usize] as usize;
+                        let rook_to = (mv.from + mv.to) / 2;
+                        self.op_relocate(g, ri, rook_to, &mut u.ops);
+                    }
+                    _ => {}
+                }
             }
-        }
-
-        if moved_to_dest {
-            self.xor_piece(g, mi);
-            self.move_piece(mi, mv.from, mv.to);
-            self.pieces[mi].moved = true;
-            if let Some(pt) = mv.promo {
-                self.pieces[mi].t = pt;
-            }
-            self.xor_piece(g, mi);
-        }
-
-        self.trigger_mine(g, u.moving, &mut u);
-
-        match mv.kind {
-            MoveKind::DoubleStep => {
-                let (x, y1) = g.board.xy(mv.from);
-                let (_, y2) = g.board.xy(mv.to);
-                self.ep = g.board.sq(x as u8, ((y1 + y2) / 2) as u8);
-                self.hash ^= g.zobrist.ep_key(self.ep);
-            }
-            MoveKind::Castle => {
-                let ri = self.board[mv.aux as usize] as usize;
-                let rook_to = (mv.from + mv.to) / 2;
-                u.partner = Some((ri, mv.aux, self.pieces[ri].moved));
-                self.xor_piece(g, ri);
-                self.move_piece(ri, mv.aux, rook_to);
-                self.pieces[ri].moved = true;
-                self.xor_piece(g, ri);
-            }
-            _ => {}
         }
 
         self.advance_stm(g);
         u
     }
 
+    /// Replay the move's op log backwards — each record exactly inverts
+    /// its op, so the bespoke per-kind rewind ordering is gone — then
+    /// restore the O(1) move-level snapshots.
     pub fn unmake(&mut self, g: &GameDef, u: &Undo) {
         self.stm = (self.stm + g.sides - 1) % g.sides;
         self.ep = u.prior_ep;
-        let mv = &u.mv;
-
-        if mv.kind == MoveKind::Drop {
-            for &(sq, prior) in u.terrain_changes.iter().rev() {
-                self.set_terrain(sq, prior); // the spent mine returns
-            }
-            self.lift(u.moving, mv.to);
-            self.pieces[u.moving].loc = Loc::Hand(self.stm);
-            self.pieces[u.moving].moved = u.prior_moved;
-            self.hands[self.stm as usize][mv.drop_type as usize] += 1;
-            for &(i, hp) in u.hp_changes.iter().rev() {
-                self.hp[i] = hp;
-            }
-            self.hash = u.prior_hash;
-            return;
+        for op in u.ops.rev_iter() {
+            self.revert_op(op);
         }
-
-        for &(sq, prior) in u.terrain_changes.iter().rev() {
-            self.set_terrain(sq, prior);
-        }
-
-        for &(mi, dsq) in u.mine_deaths.iter().rev() {
-            // Back from the crater; the mover-back / partner / captured
-            // restores below finish the rewind. Runs before the partner
-            // block so a hazard-killed swap partner or push victim is on
-            // board again when its relocation unwinds.
-            self.place(mi, dsq);
-        }
-
-        if let Some((ri, rsq, rmoved)) = u.partner {
-            match mv.effect {
-                Effect::Swap => {
-                    // Both halves of the exchange step back atomically;
-                    // the mover-back block below then finds the mover
-                    // already home.
-                    self.lift(ri, mv.from);
-                    self.lift(u.moving, mv.to);
-                    self.place(ri, rsq);
-                    self.place(u.moving, mv.from);
-                }
-                Effect::Push => {
-                    if let Loc::Board(cur) = self.pieces[ri].loc {
-                        self.lift(ri, cur);
-                    }
-                    self.place(ri, rsq);
-                }
-                _ => {
-                    let rook_to = (mv.from + mv.to) / 2;
-                    self.lift(ri, rook_to);
-                    self.place(ri, rsq);
-                }
-            }
-            self.pieces[ri].moved = rmoved;
-        }
-
-        if let Some((ri, rmoved)) = u.revived {
-            self.lift(ri, mv.to);
-            self.pieces[ri].loc = Loc::Dead;
-            self.pieces[ri].moved = rmoved;
-        }
-
-        if let Some((hi, side)) = u.hacked {
-            self.lift(hi, mv.to);
-            self.pieces[hi].side = side;
-            self.place(hi, mv.to);
-        }
-
-        // Put the mover back wherever it now stands.
-        if let Loc::Board(cur) = self.pieces[u.moving].loc {
-            if cur != u.prior_sq {
-                self.lift(u.moving, cur);
-                self.place(u.moving, u.prior_sq);
-            }
-        }
-        self.pieces[u.moving].moved = u.prior_moved;
-        self.pieces[u.moving].t = u.prior_t;
-
-        for &(i, hp) in u.hp_changes.iter().rev() {
-            self.hp[i] = hp;
-        }
-
-        for cap in [&u.captured2, &u.captured].into_iter().flatten() {
-            let (ci, prior) = *cap;
-            if let Loc::Hand(s) = self.pieces[ci].loc {
-                self.hands[s as usize][self.pieces[ci].t as usize] -= 1;
-            }
-            self.pieces[ci] = prior;
-            let Loc::Board(vsq) = prior.loc else { unreachable!() };
-            self.place(ci, vsq);
-        }
-
         self.hash = u.prior_hash;
     }
 
