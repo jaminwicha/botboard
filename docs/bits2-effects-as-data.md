@@ -24,11 +24,23 @@ authored, validated, and shipped as JSON — same as armies.
 3. **Determinism unchanged.** No op may consult a clock or unseeded
    randomness. Target selection is exhaustive generation (movegen), not
    sampling.
-4. **Specials stay named.** Castling, en-passant, double-step, drops,
-   overclock compounds remain the spec's §3.3 *special generators* —
-   they are history-dependent state machines, not stateless effect
-   scripts, and are already atomic components in the spec's taxonomy.
-   (Documented decision; revisit only with a concrete need.)
+4. **Moves unify too — kinds become scripts.** §3.4 already states a
+   move is "a single Move whose application script has several steps";
+   Bits 2.0 makes that literal. The specials decompose fully:
+   - Castle = partner-binding (type+unmoved+rank) · gates (unmoved ×2,
+     path-clear, path-not-attacked) · ops [Relocate(self,+2),
+     Relocate(partner, mid)]
+   - En passant = ephemeral-state gate · ops [Relocate, CaptureAt(aux)]
+   - Locust = the same op script as en passant, hop-targeted
+   - Double-step = zone gate · ops [Relocate(2), SetEphemeral(mid, 1)]
+     — the producer of the state en passant consumes
+   - Drop / Resurrect = the same PlaceFrom op over different source
+     pools (hand vs dead)
+   - Promotion = zone gate · ops [Relocate, TransformType]
+   - Overclock = sequenced kernel steps · self op HpAdd(−1)
+   `MoveKind` survives only as a stable FFI display code recording
+   which stdlib script generated a move. A specialized fast path for
+   the dominant script `[Relocate(+CaptureAt(to))]` keeps perft flat.
 
 ## Ability model
 
@@ -49,16 +61,25 @@ AbilityDef {
 
 ### Micro-op set (closed, engine-owned, each with exact undo)
 
+Shared by ability scripts AND move-application scripts:
+
 | op | semantics | undo record |
 |---|---|---|
-| `HpAdd(n, cap_max)` | heal/damage, floor 0 = death via standard path | hp_changes / mine_deaths |
+| `Relocate(piece_ref, dest_rule)` | mover/partner/target relocation | mover / partner records |
+| `CaptureAt(sq)` | strike-or-kill at a square (≠ dest ok: ep, locust) | captured / hp_changes |
+| `PlaceFrom(pool, sq)` | enter from hand or dead pool | drop / revived records |
+| `TransformType(t)` | promotion / demotion | prior_t |
+| `SetEphemeral(sq, ttl)` | ep-style one-ply markers | prior_ep (generalized) |
+| `HpAdd(n, cap_max)` | heal/damage, floor 0 = death | hp_changes / mine_deaths |
 | `SetTerrain(kind_or_owner)` | lay/clear terrain | terrain_changes |
-| `TerrainStep(-1)` | block erosion (tiered kinds) | terrain_changes |
+| `TerrainStep(-1)` | block erosion | terrain_changes |
 | `FlipSide` | hack | hacked |
-| `RelocateAway(d)` | push (away-vector from caster) | mover-relocation record |
 | `SwapWithCaster` | swap | partner |
-| `ReviveHere(type_choice)` | resurrect | revived |
-| `SelfStep(away)` | retreat (legality-gated at generation) | standard mover path |
+
+Gates (generation-time predicates): zone, hp-band (exist today),
+moved-flag, ephemeral-state match, path-clear, path-not-attacked.
+Bindings: second-piece selection (castle partner). Sources: board |
+hand | dead. Sequencing: ordered op list; compounds nest move-steps.
 
 Shipped abilities become registry rows (e.g. Heal = target Friendly,
 range r, pred [Damaged], ops [HpAdd(+n, cap)]). Laser = target Enemy
@@ -109,11 +130,17 @@ reference abilities by id. `Effect` enum → `EffectId(u16)` index;
 
 ## Staging
 
-- **Stage 1**: ability registry + micro-op interpreter; stdlib rows;
-  enum retired; parity gates green. (Engine-internal; no new features.)
-- **Stage 2**: terrain registry the same way.
-- **Stage 3**: JSON-defined custom abilities/terrains over the FFI +
-  SRW `data/abilities.json`, `data/terrains.json`; Maker Mode gains
-  custom-effect composition (game-side follow-up).
+- **Stage 1**: the micro-op interpreter inside make/unmake — ability
+  effects become stdlib op-scripts; the aux-victim (ep/locust) and
+  partner (castle/swap) machinery unify onto shared ops; Effect enum
+  retired to registry ids. Fast path for `[Relocate(+CaptureAt(to))]`.
+  Parity gates: every suite bit-identical, perft trio flat.
+- **Stage 2**: generation side — gates/bindings/sources as data;
+  MoveKind reduced to a display code; specials become stdlib move
+  scripts (castle/ep/double-step/drop rows).
+- **Stage 3**: terrain registry rows (blocks/on-land/carry/conceal).
+- **Stage 4**: JSON authoring over the FFI + SRW data files
+  (`abilities.json`, `terrains.json`, `moves.json`) with validation;
+  Maker Mode gains custom-effect composition.
 
-Each stage is behavior-preserving until Stage 3 adds authoring.
+Each stage is behavior-preserving until Stage 4 adds authoring.
