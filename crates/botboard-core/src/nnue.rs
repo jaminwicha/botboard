@@ -20,11 +20,18 @@ use crate::game::{GameDef, Side, TypeId};
 use crate::position::{Loc, Position};
 use crate::rng::Rng;
 
-pub const D: usize = 12; // descriptor dims
+pub const D: usize = 21; // descriptor dims (v2: SRW ability vocabulary)
 pub const P: usize = 4; // positional basis dims
 pub const F: usize = D * P; // per-perspective feature dims
 pub const IN: usize = 2 * F; // own + enemy perspectives
 pub const H: usize = 32; // hidden units
+
+/// v1 descriptor shape (BBNET001 checkpoints): 12 dims, ability vocabulary
+/// summarized as a bare `abilities.len()/4` at dim 10. Kept for backward
+/// checkpoint loading only.
+const D_V1: usize = 12;
+const F_V1: usize = D_V1 * P;
+const IN_V1: usize = 2 * F_V1;
 
 /// Fixed-point scales for the deterministic grade.
 const QIN: i32 = 64; // input fraction bits: value × 64
@@ -32,8 +39,15 @@ const QW: i32 = 64; // weight fraction bits
 
 /// Bit-derived descriptor of a piece type (§7.4): pure function of the
 /// compiled kernels and type flags — integer-derived, so both grades see
-/// exactly representable values.
+/// exactly representable values (every dim is a rational with denominator
+/// dividing QIN, so ×64 quantizes without rounding error).
+///
+/// v2 layout: dims 0–9 are the v1 movement/armor block unchanged; dims
+/// 10–15 replace v1's bare `abilities.len()/4` with one signal per Axis-B
+/// ability kind (§3.2); dims 16–19 are the Appendix-B flags (stealth,
+/// flight, hologram, EMP aura); dim 20 is the bias.
 pub fn descriptor(g: &GameDef, t: TypeId, side: Side) -> [f32; D] {
+    use crate::bits::AbilityBit;
     let ck = g.compiled(t, side);
     let ty = &g.types[t as usize];
     let nl = ck.leaps.len() as f32;
@@ -52,6 +66,29 @@ pub fn descriptor(g: &GameDef, t: TypeId, side: Side) -> [f32; D] {
             + ck.rides.iter().filter(|k| !k.mode.can_capture()).count(),
         nl + nr,
     );
+    // Per-ability-kind signals: reach-normalized where reach is the value
+    // (heal amount, laser range + pierce bonus), presence/count elsewhere.
+    let (mut heal, mut laser, mut wallpit, mut mine, mut res, mut hack) =
+        (0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
+    for a in &ty.abilities {
+        match *a {
+            AbilityBit::Heal { amount, .. } => {
+                heal = heal.max((amount as f32 / 2.0).min(2.0))
+            }
+            AbilityBit::Laser { range, pierce, .. } => {
+                // §4.1's pierce logic in feature form: an occupancy-blind
+                // beam reaches like a longer one.
+                let reach = range as f32 + if pierce { 2.0 } else { 0.0 };
+                laser = laser.max((reach / 4.0).min(2.0));
+            }
+            AbilityBit::CreateWall { .. } | AbilityBit::DigPit { .. } => {
+                wallpit = (wallpit + 0.5).min(1.0)
+            }
+            AbilityBit::MineLayer { .. } => mine = 1.0,
+            AbilityBit::Resurrect { .. } => res = 1.0,
+            AbilityBit::Hack { .. } => hack = 1.0,
+        }
+    }
     [
         (nl / 8.0).min(2.0),
         (nr / 8.0).min(2.0),
@@ -63,7 +100,16 @@ pub fn descriptor(g: &GameDef, t: TypeId, side: Side) -> [f32; D] {
         ty.royal as u8 as f32,
         (ty.max_hp as f32 / 4.0).min(2.0),
         ty.overclock as u8 as f32,
-        (ty.abilities.len() as f32 / 4.0).min(2.0),
+        heal,
+        laser,
+        wallpit,
+        mine,
+        res,
+        hack,
+        ty.stealth as u8 as f32,
+        ty.flight as u8 as f32,
+        ty.hologram as u8 as f32,
+        (ty.emp_aura as f32 / 2.0).min(2.0),
         1.0, // bias feature
     ]
 }
@@ -178,7 +224,7 @@ impl FloatNet {
 impl FloatNet {
     /// Versioned checkpoint (Training Spec §8): little-endian f32s.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = b"BBNET001".to_vec();
+        let mut out = b"BBNET002".to_vec();
         out.extend((IN as u32).to_le_bytes());
         out.extend((H as u32).to_le_bytes());
         for v in self.w1.iter().chain(self.b1.iter()).chain(self.w2.iter()) {
@@ -189,7 +235,10 @@ impl FloatNet {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
-        if data.len() < 16 || &data[0..8] != b"BBNET001" {
+        if data.len() >= 16 && &data[0..8] == b"BBNET001" {
+            return Self::from_bytes_v1(data);
+        }
+        if data.len() < 16 || &data[0..8] != b"BBNET002" {
             return Err("bad magic".into());
         }
         let rd = |i: usize| u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
@@ -210,6 +259,53 @@ impl FloatNet {
             w2: take(H),
             b2: f.next().unwrap(),
         })
+    }
+
+    /// Backward loading of BBNET001 checkpoints: w1 rows are per-input-dim,
+    /// so the surviving v1 dims (movement/armor 0–9 and the bias) remap to
+    /// their v2 feature indices and every new dim gets a zero row — new
+    /// features then contribute nothing, reproducing the v1 net exactly on
+    /// any content whose v1 ability-count feature was zero (true of every
+    /// shipped BBNET001 checkpoint: all chess, where no type has abilities).
+    /// The dropped bare-count row is superseded by the v2 per-kind dims and
+    /// was gradient-dead on ability-free training data anyway (`sgd_step`
+    /// skips zero features).
+    fn from_bytes_v1(data: &[u8]) -> Result<Self, String> {
+        let rd = |i: usize| u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+        if rd(8) as usize != IN_V1 || rd(12) as usize != H {
+            return Err("v1 dimension mismatch".into());
+        }
+        let need = 16 + (IN_V1 * H + H + H + 1) * 4;
+        if data.len() != need {
+            return Err(format!("expected {need} bytes (v1), got {}", data.len()));
+        }
+        let mut f = data[16..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()));
+        let mut take = |n: usize| (0..n).map(|_| f.next().unwrap()).collect::<Vec<f32>>();
+        let w1_v1 = take(IN_V1 * H);
+        let b1 = take(H);
+        let w2 = take(H);
+        let b2 = f.next().unwrap();
+        let mut w1 = vec![0f32; IN * H];
+        for persp in 0..2 {
+            for di in 0..D_V1 {
+                // v1 dim → v2 dim: 0–9 identity, 11 (bias) → D−1,
+                // 10 (bare ability count) dropped.
+                let ndi = match di {
+                    0..=9 => di,
+                    11 => D - 1,
+                    _ => continue,
+                };
+                for j in 0..P {
+                    let old = persp * F_V1 + di * P + j;
+                    let new = persp * F + ndi * P + j;
+                    w1[new * H..(new + 1) * H]
+                        .copy_from_slice(&w1_v1[old * H..(old + 1) * H]);
+                }
+            }
+        }
+        Ok(FloatNet { w1, b1, w2, b2 })
     }
 }
 
@@ -401,6 +497,105 @@ pub fn train_from_selfplay(
             // Outcome from the sample's side-to-move perspective.
             let z = if pos.stm == 0 { *z0 } else { 1.0 - *z0 };
             sum += net.sgd_step(g, pos, z, lr);
+        }
+        let avg = sum / samples.len().max(1) as f32;
+        if e == 0 {
+            first = avg;
+        }
+        last = avg;
+    }
+    TrainReport { samples: samples.len(), first_loss: first, last_loss: last }
+}
+
+/// SRW-content training (STATUS scale rung 3): the same recipe as
+/// `train_from_selfplay`, but every game draws a fresh sampled robot
+/// GameDef from the full Appendix-B vocabulary (`random_robot_army`), with
+/// the linear cost Eval as the teacher on both sides. The descriptors are
+/// Bit-derived (§7.4), so one net trains across all the sampled defs and
+/// generalizes to armies it never saw. Deterministic per seed.
+pub fn train_srw_from_selfplay(
+    net: &mut FloatNet,
+    weights: &crate::cost::CostWeights,
+    budget: f64,
+    games: u32,
+    depth: i32,
+    epochs: u32,
+    lr: f32,
+    seed: u64,
+) -> TrainReport {
+    use crate::eval::Eval;
+    use crate::movegen::legal_moves;
+    use crate::search::Searcher;
+    use crate::selfplay::random_robot_army;
+
+    // Collect (def index, position, outcome-from-side0) samples; each
+    // sample keeps its GameDef because descriptors are per-def.
+    let mut defs: Vec<GameDef> = Vec::new();
+    let mut samples: Vec<(usize, Position, f32)> = Vec::new();
+    for gi in 0..games {
+        let mut rng = Rng::new(seed + gi as u64);
+        let (g, gen) = random_robot_army(budget, &mut rng, weights);
+        // Material straight from the sampled costs (royal 0): the teacher.
+        let mut material = vec![0i32; g.types.len()];
+        for p in &gen {
+            material[p.type_id as usize] = (p.cost * 100.0).round() as i32;
+        }
+        let mut s0 = Searcher::new(&g, Eval::new(material.clone()));
+        let mut s1 = Searcher::new(&g, Eval::new(material));
+        let mut pos = Position::startpos(&g);
+        let mut snaps: Vec<Position> = Vec::new();
+        let mut outcome = 0.5f32;
+        let mut history: Vec<u64> = Vec::new();
+        for ply in 0..160 {
+            let moves = legal_moves(&g, &mut pos);
+            if moves.is_empty() {
+                let stm = pos.stm;
+                let in_check = pos.royal_attacked(&g, stm);
+                let loss = in_check
+                    || g.policy.stalemate == crate::game::StalematePolicy::Loss;
+                outcome = if !loss {
+                    0.5
+                } else if stm == 0 {
+                    0.0
+                } else {
+                    1.0
+                };
+                break;
+            }
+            let mv = if ply < 6 {
+                moves[rng.below(moves.len())]
+            } else {
+                let s: &mut Searcher = if pos.stm == 0 { &mut s0 } else { &mut s1 };
+                s.history = history.clone();
+                s.search(&g, &mut pos, depth, 30_000).best.unwrap_or(moves[0])
+            };
+            pos.make(&g, &mv);
+            history.push(pos.hash);
+            if history.iter().filter(|&&h| h == pos.hash).count() >= 3 {
+                break; // draw, outcome stays 0.5
+            }
+            if ply >= 6 && ply % 3 == 0 {
+                snaps.push(pos.clone());
+            }
+        }
+        let di = defs.len();
+        defs.push(g);
+        for sp in snaps {
+            samples.push((di, sp, outcome));
+        }
+    }
+
+    // SGD epochs (shuffled deterministically), each sample against its def.
+    let mut order: Vec<usize> = (0..samples.len()).collect();
+    let mut rng = Rng::new(seed ^ 0xA11CE);
+    let (mut first, mut last) = (0f32, 0f32);
+    for e in 0..epochs {
+        rng.shuffle(&mut order);
+        let mut sum = 0f32;
+        for &i in &order {
+            let (di, pos, z0) = &samples[i];
+            let z = if pos.stm == 0 { *z0 } else { 1.0 - *z0 };
+            sum += net.sgd_step(&defs[*di], pos, z, lr);
         }
         let avg = sum / samples.len().max(1) as f32;
         if e == 0 {

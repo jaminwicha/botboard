@@ -314,6 +314,149 @@ pub fn random_army(
     (def, gen)
 }
 
+/// SRW-content generate step (STATUS scale rung 3; SRW Appendix B): sample
+/// the full robot vocabulary — armor 1–3, overclock, stealth, flight, EMP
+/// auras, hologram decoys (movement-only, 1 HP), and Axis-B ability Bits
+/// (heal / wall / pit / laser ±pierce ±retreat / mine / resurrect / hack) —
+/// at roughly the SRW clan palettes' rates (abilities ~30%, flags 5–20%),
+/// priced by the cost prior and packed symmetric under budget like
+/// `random_army`. Deterministic per rng seed.
+pub fn random_robot_army(
+    g_budget: f64,
+    rng: &mut Rng,
+    weights: &CostWeights,
+) -> (GameDef, Vec<GeneratedPiece>) {
+    use crate::bits::{AbilityBit, Mode, MoveBit};
+    use crate::game::*;
+    use crate::geometry::DirFilter;
+
+    let board = BoardDef { w: 8, h: 8 };
+    let mut types = vec![PieceTypeDef::new(
+        "controller",
+        'K',
+        vec![MoveBit::leaper(0, 1), MoveBit::leaper(1, 1)],
+    )
+    .royal()];
+    let glyphs = ['A', 'B', 'C', 'D'];
+    for i in 0..4usize {
+        // Movement: 1–2 Bits from the shared vocabulary.
+        let mut bits = Vec::new();
+        for _ in 0..[1usize, 2][rng.below(2)] {
+            let (m, n) = [(0i8, 1i8), (1, 1), (1, 2), (0, 2), (2, 2), (1, 3), (2, 3)]
+                [rng.below(7)];
+            let mut b = if rng.unit_f64() < 0.5 {
+                MoveBit::leaper(m, n)
+            } else {
+                MoveBit::rider(m, n)
+            };
+            if rng.unit_f64() < 0.25 {
+                b = b.dirs(DirFilter::Forward);
+            }
+            if rng.unit_f64() < 0.15 {
+                b = b.mode(if rng.unit_f64() < 0.5 { Mode::Move } else { Mode::Capture });
+            }
+            bits.push(b);
+        }
+        let mut def = PieceTypeDef::new("bot", glyphs[i], bits);
+        if rng.unit_f64() < 0.05 {
+            // Hologram decoy: movement-only bluff at 1 HP, nothing else.
+            types.push(def.hologram());
+            continue;
+        }
+        let hp = {
+            let r = rng.unit_f64();
+            if r < 0.55 {
+                1
+            } else if r < 0.85 {
+                2
+            } else {
+                3
+            }
+        };
+        if hp > 1 {
+            def = def.hp(hp);
+        }
+        if rng.unit_f64() < 0.10 {
+            def = def.overclock();
+        }
+        if rng.unit_f64() < 0.10 {
+            def = def.stealth();
+        }
+        if rng.unit_f64() < 0.10 {
+            def = def.flight();
+        }
+        if rng.unit_f64() < 0.05 {
+            def = def.emp(2);
+        }
+        if rng.unit_f64() < 0.30 {
+            let range12 = 1 + rng.below(2) as u8;
+            let ability = match rng.below(7) {
+                0 => AbilityBit::Heal { amount: 1, range: range12 },
+                1 => AbilityBit::CreateWall { range: range12 },
+                2 => AbilityBit::DigPit { range: range12 },
+                3 => AbilityBit::Laser {
+                    range: 2 + rng.below(2) as u8,
+                    retreat: rng.unit_f64() < 0.5,
+                    pierce: rng.unit_f64() < 0.25,
+                },
+                4 => AbilityBit::MineLayer { range: 1 },
+                5 => AbilityBit::Resurrect { range: 2 },
+                _ => AbilityBit::Hack { range: range12 },
+            };
+            def = def.abilities(vec![ability]);
+        }
+        types.push(def);
+    }
+
+    let policy = Policy {
+        stalemate: StalematePolicy::Loss, // a stuck robot army powers down
+        capture_fate: CaptureFate::Destroy,
+        turn: TurnPolicy::Alternate,
+        pass: PassPolicy::Forbidden,
+    };
+
+    // Provisional def to price the generated types.
+    let gdef = GameDef::new(board, 2, types.clone(), Vec::new(), policy.clone(), vec![]);
+    let mut gen: Vec<GeneratedPiece> = (1..types.len())
+        .map(|t| GeneratedPiece {
+            bits_desc: format!("{:?} {:?}", types[t].bits, types[t].abilities),
+            type_id: t as TypeId,
+            cost: cost_prior(&gdef, t as TypeId, weights),
+        })
+        .collect();
+
+    // Pack a symmetric (mirrored) army under budget: controllers + pieces.
+    let mut start = vec![(0 as TypeId, 0 as Side, 4u8, 0u8), (0, 1, 4, 7)];
+    let mut spent = 0.0;
+    let cols = [3u8, 5, 2, 6, 1, 7, 0];
+    let mut ci = 0;
+    let mut guard = 0;
+    while ci < cols.len() && guard < 64 {
+        guard += 1;
+        let pick = rng.below(gen.len());
+        if spent + gen[pick].cost > g_budget {
+            match gen.iter().position(|p| spent + p.cost <= g_budget) {
+                Some(j) => {
+                    spent += gen[j].cost;
+                    start.push((gen[j].type_id, 0, cols[ci], 0));
+                    start.push((gen[j].type_id, 1, cols[ci], 7));
+                    ci += 1;
+                }
+                None => break,
+            }
+        } else {
+            spent += gen[pick].cost;
+            start.push((gen[pick].type_id, 0, cols[ci], 0));
+            start.push((gen[pick].type_id, 1, cols[ci], 7));
+            ci += 1;
+        }
+    }
+
+    let def = GameDef::new(board, 2, types, Vec::new(), policy, start);
+    gen.sort_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap());
+    (def, gen)
+}
+
 /// The self-play farm's actor pool (Training Spec §10) in-process:
 /// deterministic per seed regardless of thread count — each seeded game is
 /// independent, so records assemble in seed order. Scales the correction

@@ -399,6 +399,82 @@ fn trio_battles_run_to_verdict_deterministically() {
     assert_eq!(log1, log2, "masked-world AI stays deterministic (§10.1)");
 }
 
+/// The optional `"net"` setup field (§10.6 into the battle surface): a
+/// checkpoint loads, quantizes against the battle's GameDef, powers every
+/// side's searcher, and same-seed battles still replay identically. A
+/// missing or corrupt checkpoint fails the build — never a silent
+/// fallback to the linear eval.
+#[test]
+fn net_checkpoint_powers_battles_deterministically() {
+    let dir = std::env::temp_dir().join("botboard_srw_net_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("tiny_net.bin");
+    let net = botboard_core::nnue::FloatNet::new(7);
+    std::fs::write(&path, net.to_bytes()).unwrap();
+    let net_path = path.to_str().unwrap().to_string();
+
+    let spec = |seed: u64, net: &str| {
+        format!(
+            r#"{{
+  "seed": {seed}, "max_plies": 80,
+  "board": {{"w": 6, "h": 6}},
+  "sides": 2,
+  "types": [
+    {{"name": "ctrl", "glyph": "C", "royal": true,
+     "moves": [{{"geom": "leaper", "m": 0, "n": 1}}, {{"geom": "leaper", "m": 1, "n": 1}}]}},
+    {{"name": "lance", "glyph": "L", "hp": 2,
+     "moves": [{{"geom": "rider", "m": 0, "n": 1, "mode": "move"}}],
+     "abilities": [{{"kind": "laser", "range": 2, "retreat": true}}]}}
+  ],
+  "placements": [
+    {{"t": 0, "side": 0, "x": 3, "y": 0}},
+    {{"t": 1, "side": 0, "x": 1, "y": 0}},
+    {{"t": 0, "side": 1, "x": 3, "y": 5}},
+    {{"t": 1, "side": 1, "x": 1, "y": 5}}
+  ],
+  "tiers": [0, 0],
+  "net": "{net}"
+}}"#
+        )
+    };
+
+    let run = |seed: u64| -> (c_int, Vec<String>) {
+        let s = c(&spec(seed, &net_path));
+        let b = srw_create(s.as_ptr());
+        assert!(!b.is_null(), "battle with net checkpoint must build");
+        let mut mv = [0 as c_char; 32];
+        let mut log = Vec::new();
+        for _ in 0..200 {
+            if srw_status(b) != 0 {
+                break;
+            }
+            let r = srw_ai_move(b, mv.as_mut_ptr(), 32);
+            assert!(r >= 0, "ai_move failed: {r}");
+            let m = buf_str(&mv);
+            assert_eq!(srw_apply(b, c(&m).as_ptr()), 0);
+            log.push(m);
+        }
+        let st = srw_status(b);
+        srw_destroy(b);
+        (st, log)
+    };
+    let (st1, log1) = run(7);
+    let (st2, log2) = run(7);
+    assert_ne!(st1, 0, "net-powered battle reaches a verdict");
+    assert_eq!(st1, st2, "same seed ⇒ same verdict with net on");
+    assert_eq!(log1, log2, "same seed ⇒ identical move log with net on (§10.1)");
+
+    // Nonexistent path: build error, not silent fallback.
+    let bad = c(&spec(7, "/nonexistent/dir/net.bin"));
+    assert!(srw_create(bad.as_ptr()).is_null(), "missing checkpoint must fail build");
+
+    // Corrupt bytes: same.
+    let junk = dir.join("junk_net.bin");
+    std::fs::write(&junk, b"not a checkpoint").unwrap();
+    let bad2 = c(&spec(7, junk.to_str().unwrap()));
+    assert!(srw_create(bad2.as_ptr()).is_null(), "corrupt checkpoint must fail build");
+}
+
 /// Tall grass (Appendix B) is live camouflage: memoryless and positional.
 /// A robot in the stalks vanishes from enemy view, reappears on contact,
 /// and vanishes again when the watcher walks away.

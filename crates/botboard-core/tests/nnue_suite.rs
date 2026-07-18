@@ -6,7 +6,7 @@
 use botboard_core::cost::{fit_weights, material_table, Anchor};
 use botboard_core::eval::Eval;
 use botboard_core::movegen::legal_moves;
-use botboard_core::nnue::{train_from_selfplay, FloatNet, QuantNet};
+use botboard_core::nnue::{descriptor, train_from_selfplay, FloatNet, QuantNet, D, F, H, P};
 use botboard_core::position::Position;
 use botboard_core::rng::Rng;
 use botboard_core::search::Searcher;
@@ -164,6 +164,159 @@ fn generalizes_to_unseen_procedural_pieces() {
         v1 < v0,
         "side 0 to move must value losing a piece lower: {v0} -> {v1}"
     );
+
+    // And on SRW-content armies (scale rung 3): the v2 descriptors cover
+    // the ability vocabulary, so a sampled robot army — stealth, lasers,
+    // holograms and all — evaluates through the same weights.
+    let mut rng = Rng::new(4242);
+    let (g3, _) = botboard_core::selfplay::random_robot_army(14.0, &mut rng, &w);
+    let q3 = QuantNet::from_float(&g3, &net);
+    let pos3 = Position::startpos(&g3);
+    let v3 = q3.eval(&g3, &pos3);
+    assert!(v3.abs() < 3000, "sane range on robot armies: {v3}");
+}
+
+/// Descriptor v2 (§7.4): the SRW ability vocabulary — per-kind ability
+/// signals, Appendix-B flags, EMP radius — is visible to the net, and
+/// every new dim quantizes exactly at ×64 (§10.6).
+#[test]
+fn descriptor_v2_covers_the_srw_vocabulary() {
+    use botboard_core::bits::{AbilityBit, MoveBit};
+    use botboard_core::game::{
+        BoardDef, CaptureFate, GameDef, PassPolicy, PieceTypeDef, Policy,
+        StalematePolicy, TurnPolicy,
+    };
+    let step = || vec![MoveBit::leaper(0, 1)];
+    let types = vec![
+        PieceTypeDef::new("ctrl", 'K', step()).royal(),
+        PieceTypeDef::new("shade", 'S', step()).stealth(),
+        PieceTypeDef::new("hover", 'H', step()).flight(),
+        PieceTypeDef::new("decoy", 'Y', step()).hologram(),
+        PieceTypeDef::new("pulse", 'E', step()).emp(2),
+        PieceTypeDef::new("medic", 'M', step())
+            .abilities(vec![AbilityBit::Heal { amount: 2, range: 1 }]),
+        PieceTypeDef::new("lance", 'L', step()).abilities(vec![AbilityBit::Laser {
+            range: 2,
+            retreat: true,
+            pierce: true,
+        }]),
+        PieceTypeDef::new("mason", 'B', step()).abilities(vec![
+            AbilityBit::CreateWall { range: 1 },
+            AbilityBit::DigPit { range: 1 },
+        ]),
+        PieceTypeDef::new("sapper", 'P', step())
+            .abilities(vec![AbilityBit::MineLayer { range: 1 }]),
+        PieceTypeDef::new("necro", 'N', step())
+            .abilities(vec![AbilityBit::Resurrect { range: 2 }]),
+        PieceTypeDef::new("hacker", 'X', step())
+            .abilities(vec![AbilityBit::Hack { range: 1 }]),
+    ];
+    let g = GameDef::new(
+        BoardDef { w: 8, h: 8 },
+        2,
+        types,
+        Vec::new(),
+        Policy {
+            stalemate: StalematePolicy::Loss,
+            capture_fate: CaptureFate::Destroy,
+            turn: TurnPolicy::Alternate,
+            pass: PassPolicy::Forbidden,
+        },
+        Vec::new(),
+    );
+    let d = |t: u8| descriptor(&g, t, 0);
+    assert_eq!(d(0)[7], 1.0, "royal flag");
+    assert_eq!(d(1)[16], 1.0, "stealth dim");
+    assert_eq!(d(2)[17], 1.0, "flight dim");
+    assert_eq!(d(3)[18], 1.0, "hologram dim");
+    assert_eq!(d(4)[19], 1.0, "EMP radius 2 normalizes to 1");
+    assert_eq!(d(5)[10], 1.0, "heal amount 2 normalizes to 1");
+    assert_eq!(d(6)[11], 1.0, "laser range 2 + pierce bonus 2 → 4/4");
+    assert_eq!(d(7)[12], 1.0, "wall + pit builder saturates");
+    assert_eq!(d(8)[13], 1.0, "mine-layer dim");
+    assert_eq!(d(9)[14], 1.0, "resurrect dim");
+    assert_eq!(d(10)[15], 1.0, "hack dim");
+    // A bare mover shows nothing in the vocabulary block…
+    for i in 10..=19 {
+        assert_eq!(d(1)[i], if i == 16 { 1.0 } else { 0.0 });
+    }
+    // …and every vocabulary dim is exactly representable ×64 (§10.6).
+    for t in 0..g.types.len() as u8 {
+        for (i, v) in d(t).iter().enumerate().skip(10) {
+            let q = v * 64.0;
+            assert_eq!(q, q.round(), "dim {i} of type {t} not exact ×64: {v}");
+        }
+    }
+}
+
+/// Training Spec §8 back-compat: BBNET001 checkpoints (12-dim descriptors)
+/// load through the legacy remap — surviving rows land on their v2 feature
+/// indices, new-vocabulary rows are zero, and the dropped bare ability-count
+/// row (gradient-dead on all shipped chess checkpoints) is discarded. The
+/// round trip against a v2 net with zeroed vocabulary rows must be exact.
+#[test]
+fn bbnet001_checkpoints_load_via_the_legacy_remap() {
+    const D_V1: usize = 12;
+    const F_V1: usize = D_V1 * P;
+
+    // A v2 net that a v1 net could express: vocabulary rows zeroed.
+    let mut a = FloatNet::new(3);
+    for persp in 0..2 {
+        for di in 10..(D - 1) {
+            for j in 0..P {
+                let idx = persp * F + di * P + j;
+                a.w1[idx * H..(idx + 1) * H].fill(0.0);
+            }
+        }
+    }
+
+    // Its BBNET001 projection: dims 0–9 identity, dim 11 = bias (v2 D−1);
+    // dim 10 (bare ability count) filled with junk the loader must drop.
+    let mut w1v1 = vec![0f32; 2 * F_V1 * H];
+    for persp in 0..2 {
+        for di in 0..D_V1 {
+            let ndi = match di {
+                0..=9 => di,
+                11 => D - 1,
+                _ => continue,
+            };
+            for j in 0..P {
+                let old = persp * F_V1 + di * P + j;
+                let new = persp * F + ndi * P + j;
+                w1v1[old * H..(old + 1) * H]
+                    .copy_from_slice(&a.w1[new * H..(new + 1) * H]);
+            }
+        }
+        for j in 0..P {
+            let old = persp * F_V1 + 10 * P + j;
+            w1v1[old * H..(old + 1) * H].fill(123.0);
+        }
+    }
+    let mut bytes = b"BBNET001".to_vec();
+    bytes.extend((2 * F_V1 as u32).to_le_bytes());
+    bytes.extend((H as u32).to_le_bytes());
+    for v in w1v1.iter().chain(a.b1.iter()).chain(a.w2.iter()) {
+        bytes.extend(v.to_le_bytes());
+    }
+    bytes.extend(a.b2.to_le_bytes());
+
+    let b = FloatNet::from_bytes(&bytes).expect("legacy BBNET001 must load");
+    assert_eq!(a.w1, b.w1, "remapped + zero-padded w1 is exact");
+    assert_eq!(a.b1, b.b1);
+    assert_eq!(a.w2, b.w2);
+    assert_eq!(a.b2, b.b2);
+
+    // The v2 container round-trips bit-exact too.
+    let c = FloatNet::from_bytes(&a.to_bytes()).expect("BBNET002 round trip");
+    assert_eq!(a.w1, c.w1);
+    assert_eq!(a.b2, c.b2);
+
+    // And the deterministic grades agree everywhere the weights agree.
+    let (g, _) = chess_setup();
+    let qa = QuantNet::from_float(&g, &a);
+    let qb = QuantNet::from_float(&g, &b);
+    let pos = Position::startpos(&g);
+    assert_eq!(qa.eval(&g, &pos), qb.eval(&g, &pos));
 }
 
 /// The net plugs in behind Eval and the searcher still finds tactics.

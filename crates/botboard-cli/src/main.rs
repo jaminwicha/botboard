@@ -9,6 +9,10 @@
 //!   cost <variant>                                      cost-model report
 //!   league <variant> [--games N]                        population + Nash
 //!   armies [--budget B] [--seed S]                      generate + price
+//!   train-net <variant> [--games N --epochs E --out F]  net training
+//!   train-net srw [--games N --epochs E --budget B --out F]
+//!                             sampled-robot-army training + promotion probe
+//!   netmatch <variant> --a A.bin --b B.bin [--pairs N]   paired-opening gate
 
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
@@ -344,6 +348,114 @@ fn cmd_netmatch(g: &GameDef, name: &str, args: &[String]) {
     );
 }
 
+/// `train-net srw` (STATUS scale rung 3): train the shared evaluator on
+/// the full SRW ability vocabulary — every self-play game draws a fresh
+/// sampled robot GameDef (2 sides, 8×8, mirrored armies under budget) with
+/// the linear cost Eval as teacher — then run the promotion probe: net vs
+/// linear over paired sampled armies (same armies + same opening, colors
+/// swapped, the netmatch pairing idea) and report PROMOTE/HOLD by ≥55%.
+fn cmd_train_srw(args: &[String]) {
+    let games: u32 = opt(args, "--games", 200);
+    let epochs: u32 = opt(args, "--epochs", 8);
+    let budget: f64 = opt(args, "--budget", 14.0);
+    let seed: u64 = opt(args, "--seed", 11);
+    let out: String = opt(args, "--out", "srw_net_v1.bin".into());
+    let w = botboard_core::cost::CostWeights { w_move: 0.35, w_attack: 0.35 };
+
+    let mut net = botboard_core::nnue::FloatNet::new(7);
+    println!("training on {games} sampled robot armies (budget {budget}, {epochs} epochs)…");
+    let t0 = Instant::now();
+    let rep = botboard_core::nnue::train_srw_from_selfplay(
+        &mut net, &w, budget, games, 2, epochs, 0.01, seed,
+    );
+    println!(
+        "samples: {}  loss: {:.4} → {:.4}  ({:.1}s)",
+        rep.samples,
+        rep.first_loss,
+        rep.last_loss,
+        t0.elapsed().as_secs_f64()
+    );
+    std::fs::write(&out, net.to_bytes()).expect("write checkpoint");
+    println!("checkpoint written to {out} (deterministic grade derives at load)");
+
+    // Promotion probe: quantized net vs the linear teacher, 12 paired
+    // sampled armies, depth 3 / 20k nodes. Fresh seed range so the probe
+    // armies are disjoint from the training draws.
+    let pairs: u32 = opt(args, "--probe-pairs", 12);
+    println!("\npromotion probe: net vs linear over {pairs} paired armies…");
+    let (mut wn, mut wl, mut dr) = (0u32, 0u32, 0u32);
+    for p in 0..pairs {
+        let probe_seed = seed ^ 0x5157_0000 ^ (p as u64 * 7919);
+        let mut rng = Rng::new(probe_seed);
+        let (g, gen) = botboard_core::selfplay::random_robot_army(budget, &mut rng, &w);
+        let mut material = vec![0i32; g.types.len()];
+        for gp in &gen {
+            material[gp.type_id as usize] = (gp.cost * 100.0).round() as i32;
+        }
+        let qnet = botboard_core::nnue::QuantNet::from_float(&g, &net);
+        let eval_net = Eval::with_net(material.clone(), qnet);
+        let eval_lin = Eval::new(material);
+        // A short shared opening, replayed for both color assignments.
+        let mut opening: Vec<botboard_core::moves::Move> = Vec::new();
+        {
+            let mut pos = Position::startpos(&g);
+            for _ in 0..4 {
+                let ms = legal_moves(&g, &mut pos);
+                if ms.is_empty() {
+                    break;
+                }
+                let mv = ms[rng.below(ms.len())];
+                pos.make(&g, &mv);
+                opening.push(mv);
+            }
+        }
+        for net_first in [true, false] {
+            let mut sn = Searcher::new(&g, eval_net.clone());
+            let mut sl = Searcher::new(&g, eval_lin.clone());
+            let mut pos = Position::startpos(&g);
+            for mv in &opening {
+                pos.make(&g, mv);
+            }
+            let mut history: Vec<u64> = Vec::new();
+            let mut plies = 0;
+            let verdict = loop {
+                match status(&g, &mut pos) {
+                    Status::Win(side) => break Some(side),
+                    Status::Draw => break None,
+                    Status::Ongoing => {}
+                }
+                if plies >= 200 {
+                    break None;
+                }
+                let net_to_move = (pos.stm == 0) == net_first;
+                let s = if net_to_move { &mut sn } else { &mut sl };
+                s.history = history.clone();
+                let Some(mv) = s.search(&g, &mut pos, 3, 20_000).best else {
+                    break None;
+                };
+                pos.make(&g, &mv);
+                history.push(pos.hash);
+                if history.iter().filter(|&&h| h == pos.hash).count() >= 3 {
+                    break None;
+                }
+                plies += 1;
+            };
+            match verdict {
+                Some(side) if (side == 0) == net_first => wn += 1,
+                Some(_) => wl += 1,
+                None => dr += 1,
+            }
+        }
+        println!("army pair {p}: net {wn}  linear {wl}  draws {dr}");
+    }
+    let total = (wn + wl + dr).max(1);
+    let score = 100.0 * (wn as f64 + dr as f64 * 0.5) / total as f64;
+    println!(
+        "probe: net {wn} — {dr} — {wl} linear  score {score:.1}%  → {}",
+        if score >= 55.0 { "PROMOTE" } else { "HOLD" }
+    );
+}
+
 fn cmd_armies(args: &[String]) {
     let budget: f64 = opt(args, "--budget", 20.0);
     let seed: u64 = opt(args, "--seed", 1);
@@ -408,6 +520,9 @@ fn main() {
     }
     if cmd == "train-net" {
         let variant = args.get(2).map(String::as_str).unwrap_or("chess");
+        if variant == "srw" {
+            return cmd_train_srw(&args[3.min(args.len())..]);
+        }
         let g = game_for(variant);
         let rest: Vec<String> = args[3.min(args.len())..].to_vec();
         let games: u32 = opt(&rest, "--games", 24);

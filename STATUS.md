@@ -31,7 +31,7 @@ additionally assert incremental hash/mirror consistency on every make).
 | §8.8 Recon = belief collapse → cheaper rungs; **codex persistence + rematch warm-start** | ✅ belief JSON roundtrip; rematch starts strictly sharper | `codex.rs`, `tests/systems_suite.rs` |
 | §10.1 Determinism — core owns rules/state/RNG | ✅ same-seed ⇒ identical games (tested, incl. FFA and OOS) | `rng.rs` |
 | §10.2 C ABI | ✅ opaque handle, coarse commands, ctypes-smoke-tested | `crates/botboard-ffi` |
-| §10.6 Determinism grades + **quantization parity (named obligation)** | ✅ deterministic grade = int16/i32 fixed-point net inference, bit-exact (tested); performance grade = f32 training; parity: ≥90% chosen-move agreement, ≤20cp drift (tested); checkpoints (BBNET001) | `nnue.rs`, `tests/nnue_suite.rs` |
+| §10.6 Determinism grades + **quantization parity (named obligation)** | ✅ deterministic grade = int16/i32 fixed-point net inference, bit-exact (tested); performance grade = f32 training; parity: ≥90% chosen-move agreement, ≤20cp drift (tested); checkpoints (BBNET002, legacy BBNET001 loads) | `nnue.rs`, `tests/nnue_suite.rs` |
 
 ## Training spec (Botboard_Training_Spec.md)
 
@@ -43,7 +43,7 @@ additionally assert incremental hash/mirror consistency on every make).
 | §5 Population/league, diversity, Nash averaging | ✅ | `league.rs` |
 | §6 Gate training | ✅ rung-agreement labels, monotone conservative fit | `training.rs` |
 | §7 Co-evolution — generate → measure → select → correct | ✅ random-army generation priced under budget; value + synergy correction | `selfplay.rs`, `cost.rs` |
-| §8 Libraries & profiles — versioned, core-owned | ✅ net checkpoints (BBNET001), league profiles JSON, codex JSON | `nnue.rs`, `league.rs`, `codex.rs` |
+| §8 Libraries & profiles — versioned, core-owned | ✅ net checkpoints (BBNET002; BBNET001 loads via legacy remap), league profiles JSON, codex JSON | `nnue.rs`, `league.rs`, `codex.rs` |
 | §9 Two deployments over one C ABI | ✅ CLI game side + ctypes training side | `botboard-ffi`, `botboard-cli` |
 | §10 Infrastructure — actors/learners | ✅ in-process **parallel actor pool** (thread-scoped, deterministic per seed at any thread count — tested); distributed multi-machine deployment is an ops scale-out of the same loop | `selfplay.rs::parallel_selfplay` |
 | §11 Evaluation — cost gate, rung consistency, parity, population health | ✅ all tested | test suites |
@@ -67,12 +67,24 @@ remain ops work outside the engine's semantics.
    width scaling and belongs with rung 5's inference work.
 2. **Wider league** (config): grow to 12–16 members with the §5 pool so
    Nash averaging has spread; feeds better value targets for (1).
-3. **SRW-content curriculum** (small code): extend the self-play farm's
-   army sampler to draw from the SRW clan palettes (heal/mine/stealth/
-   hologram Bits included) so the shared evaluator learns the new
-   Axis-B vocabulary instead of meeting it cold at play time — the
-   generalizing-eval claim (§7.4) deserves a stress test against the
-   Appendix B set.
+3. **SRW-content curriculum** — ✅ DONE (July 2026): descriptor v2
+   (D 12→21) gives the net per-ability-kind signals (heal/laser+pierce/
+   wall-pit/mine/resurrect/hack) plus the Appendix-B flags (stealth,
+   flight, hologram, EMP radius); checkpoints bumped to BBNET002 with
+   exact legacy loading of BBNET001 (surviving rows remap, new rows
+   zero). `random_robot_army` samples the full vocabulary at clan-
+   palette-ish rates under budget; `train-net srw` trains over freshly
+   sampled defs per game and runs a paired-army promotion probe (net
+   vs linear teacher, colors swapped, ≥55% to PROMOTE). The SRW FFI
+   setup accepts `"net": <checkpoint>` — quantized per battle GameDef,
+   bad paths fail the build. Honest numbers: `srw_net_v1.bin`
+   (400 games / 8 epochs, 8k samples) probed 3–18–3 = 50.0% **HOLD**;
+   a 2000/12 run probed 37.5%, worse — the linear teacher is a strong
+   baseline on armies its own cost prior priced, so promotion waits on
+   a better recipe (deeper teacher games, value targets past 160
+   plies, or H growth), not more of the same corpus. The pipes are
+   what this rung delivers. See `nnue.rs`, `selfplay.rs`,
+   `botboard-ffi/src/srw.rs`, `artifacts/srw_net_v1.bin`.
 4. **Process-parallel farm** (ops): N engine processes with disjoint
    seed ranges appending to a shared game store; the deterministic
    per-seed actor pool makes shard merges trivially reproducible.

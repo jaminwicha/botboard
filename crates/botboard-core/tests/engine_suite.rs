@@ -152,3 +152,90 @@ fn random_army_generation_prices_and_packs() {
     let mut pos = Position::startpos(&g);
     assert!(!legal_moves(&g, &mut pos).is_empty());
 }
+
+/// The SRW-content sampler (STATUS scale rung 3): deterministic per seed,
+/// budget-respecting, playable, and — across seeds — actually drawing from
+/// the full Appendix-B vocabulary (flags AND ability Bits), not just
+/// movement.
+#[test]
+fn random_robot_army_samples_the_full_vocabulary() {
+    use botboard_core::selfplay::random_robot_army;
+    let w = botboard_core::cost::CostWeights { w_move: 0.35, w_attack: 0.35 };
+    let budget = 14.0;
+
+    // Same seed ⇒ identical armies (start layout, costs, playable).
+    let sample = |seed: u64| {
+        let mut rng = Rng::new(seed);
+        random_robot_army(budget, &mut rng, &w)
+    };
+    let (ga, gen_a) = sample(9);
+    let (gb, gen_b) = sample(9);
+    assert_eq!(ga.start, gb.start, "same seed ⇒ same army (§10.1)");
+    for (a, b) in gen_a.iter().zip(gen_b.iter()) {
+        assert_eq!(a.type_id, b.type_id);
+        assert_eq!(a.cost, b.cost);
+        assert!(a.cost >= 1.0, "cost floor (§4.1)");
+    }
+    let mut pos = Position::startpos(&ga);
+    assert!(!legal_moves(&ga, &mut pos).is_empty());
+
+    // Budget respected: placed non-royal pieces (one flank) fit under it.
+    let cost_of = |gen: &[botboard_core::selfplay::GeneratedPiece], t| {
+        gen.iter().find(|p| p.type_id == t).map(|p| p.cost).unwrap_or(0.0)
+    };
+    let spent: f64 = ga
+        .start
+        .iter()
+        .filter(|&&(t, side, _, _)| side == 0 && t != 0)
+        .map(|&(t, _, _, _)| cost_of(&gen_a, t))
+        .sum();
+    assert!(spent <= budget, "spent {spent} over budget {budget}");
+
+    // Vocabulary coverage over many seeds: every flag and every ability
+    // kind must appear at its palette-ish rate, and hologram decoys must
+    // hold their movement-only 1-HP contract.
+    use botboard_core::bits::AbilityBit;
+    let mut seen = [0u32; 11]; // hp>1 oc stealth flight holo emp heal laser wall/pit mine res+hack
+    for seed in 0..80u64 {
+        let (g, _) = sample(seed);
+        for ty in &g.types[1..] {
+            if ty.max_hp > 1 {
+                seen[0] += 1;
+            }
+            if ty.overclock {
+                seen[1] += 1;
+            }
+            if ty.stealth {
+                seen[2] += 1;
+            }
+            if ty.flight {
+                seen[3] += 1;
+            }
+            if ty.hologram {
+                seen[4] += 1;
+                assert_eq!(ty.max_hp, 1, "hologram decoys are 1 HP");
+                assert!(ty.abilities.is_empty(), "hologram decoys are movement-only");
+            }
+            if ty.emp_aura > 0 {
+                seen[5] += 1;
+                assert_eq!(ty.emp_aura, 2);
+            }
+            for a in &ty.abilities {
+                match a {
+                    AbilityBit::Heal { .. } => seen[6] += 1,
+                    AbilityBit::Laser { .. } => seen[7] += 1,
+                    AbilityBit::CreateWall { .. } | AbilityBit::DigPit { .. } => {
+                        seen[8] += 1
+                    }
+                    AbilityBit::MineLayer { .. } => seen[9] += 1,
+                    AbilityBit::Resurrect { .. } | AbilityBit::Hack { .. } => {
+                        seen[10] += 1
+                    }
+                }
+            }
+        }
+    }
+    for (i, &n) in seen.iter().enumerate() {
+        assert!(n > 0, "vocabulary slot {i} never sampled across 80 armies");
+    }
+}

@@ -27,9 +27,17 @@
 //!   "terrain": [{"x": 3, "y": 4, "kind": "wall"}],
 //!   "intel": [{"observer": 1, "known_types": [1], "reveal_all": false}],
 //!   "tiers": [1, 1],
-//!   "material": [0, 210]
+//!   "material": [0, 210],
+//!   "net": "artifacts/srw_net_v1.bin"
 //! }
 //! ```
+//!
+//! `"net"` (optional): path to a BBNET checkpoint (§10.6). The float
+//! weights quantize against THIS battle's GameDef — descriptors are
+//! Bit-derived (§7.4), so one checkpoint serves any composed army — and
+//! every side's searcher evaluates with the deterministic-grade net.
+//! A missing or invalid checkpoint is a build error, never a silent
+//! fallback to the linear eval.
 
 use std::ffi::{c_char, c_int, CStr};
 use std::ptr;
@@ -261,6 +269,22 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
         _ => material_table(&g, &W),
     };
 
+    // Optional deterministic-grade net (§10.6): quantized against this
+    // battle's GameDef so the Bit-derived descriptors (§7.4) match the
+    // composed types. Bad path or bad bytes fail the build — no silent
+    // fallback.
+    let qnet = match spec.get("net") {
+        None => None,
+        Some(v) => {
+            let path = v.as_str().ok_or("net must be a checkpoint path string")?;
+            let data = std::fs::read(path)
+                .map_err(|e| format!("net checkpoint {path}: {e}"))?;
+            let fnet = botboard_core::nnue::FloatNet::from_bytes(&data)
+                .map_err(|e| format!("net checkpoint {path}: {e}"))?;
+            Some(botboard_core::nnue::QuantNet::from_float(&g, &fnet))
+        }
+    };
+
     let mut pos = Position::startpos(&g);
     if let Some(cells) = spec.get("terrain").and_then(|t| t.as_arr()) {
         for cj in cells {
@@ -326,8 +350,17 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
         })
         .collect();
 
-    let searchers =
-        (0..sides).map(|_| Searcher::new(&g, Eval::new(material.clone()))).collect();
+    let searchers = (0..sides)
+        .map(|_| {
+            Searcher::new(
+                &g,
+                match &qnet {
+                    Some(q) => Eval::with_net(material.clone(), q.clone()),
+                    None => Eval::new(material.clone()),
+                },
+            )
+        })
+        .collect();
 
     // Presence masks: own pieces and non-stealth types are always seen;
     // full recon (reveal_all intel) pierces stealth too — the spy-drone
