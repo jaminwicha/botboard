@@ -723,13 +723,21 @@ impl Position {
             _ => {}
         }
 
-        let victim_sq = if mv.kind == MoveKind::EnPassant { mv.aux } else { mv.to };
+        // Aux-victim moves (en passant, locust hop) hit the screen square,
+        // not the landing square.
+        let victim_sq = if matches!(mv.kind, MoveKind::EnPassant | MoveKind::Locust) {
+            mv.aux
+        } else {
+            mv.to
+        };
         let mut moved_to_dest = true;
         if mv.kind != MoveKind::Castle && self.board[victim_sq as usize] >= 0 {
             let (cap, killed) = self.hit(g, victim_sq, &mut u.hp_changes);
             u.captured = cap;
-            if !killed && victim_sq == mv.to {
-                // Strike on an armored piece: the attacker stays put.
+            if !killed && (victim_sq == mv.to || mv.kind == MoveKind::Locust) {
+                // Strike on an armored piece: the attacker stays put. A
+                // locust striking an armored screen chips it at range and
+                // does not leap.
                 moved_to_dest = false;
             }
         }
@@ -984,6 +992,9 @@ impl Position {
                 if !zone_ok(k.from_zone, p.side, psq) || !zone_ok(k.to_zone, p.side, sq) {
                     continue;
                 }
+                if k.max_steps != 0 && steps > k.max_steps as i32 {
+                    continue; // range-limited rider: target beyond its reach
+                }
                 let mut cur = psq;
                 for _ in 1..steps {
                     cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
@@ -997,31 +1008,96 @@ impl Position {
                 if !hp_gate_ok(k.min_hp, k.max_hp, ahp) {
                     continue;
                 }
-                if !pred_ok(k.target) {
+                if !k.mode.can_capture() {
                     continue;
                 }
                 let Some(steps) = ray_steps(dx, dy, k.d.dx as i32, k.d.dy as i32) else {
                     continue;
                 };
-                if !zone_ok(k.from_zone, p.side, psq) || !zone_ok(k.to_zone, p.side, sq) {
+                if !zone_ok(k.from_zone, p.side, psq) {
                     continue;
                 }
-                let mut screens = 0;
-                let mut cur = psq;
-                for _ in 1..steps {
-                    cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
-                    if terrain_stops(self.terrain[cur as usize], aflies, adrills) {
-                        continue 'hop; // blocking terrain is not a screen
-                    }
-                    if self.board[cur as usize] >= 0 {
-                        screens += 1;
-                        if screens > 1 {
-                            continue 'hop;
+                match k.landing {
+                    // Cannon: `sq` is capturable at any range past exactly
+                    // one screen strictly between.
+                    crate::bits::HopMode::CannonAtRange => {
+                        if !pred_ok(k.target) || !zone_ok(k.to_zone, p.side, sq) {
+                            continue;
+                        }
+                        let mut screens = 0;
+                        let mut cur = psq;
+                        for _ in 1..steps {
+                            cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
+                            if terrain_stops(self.terrain[cur as usize], aflies, adrills) {
+                                continue 'hop; // blocking terrain is not a screen
+                            }
+                            if self.board[cur as usize] >= 0 {
+                                screens += 1;
+                                if screens > 1 {
+                                    continue 'hop;
+                                }
+                            }
+                        }
+                        if screens == 1 {
+                            return true;
                         }
                     }
-                }
-                if screens == 1 {
-                    return true;
+                    // Grasshopper: `sq` is capturable iff it lies exactly
+                    // one step beyond the ray's first screen — the cell
+                    // just before `sq` occupied, everything nearer empty.
+                    crate::bits::HopMode::BeyondScreen => {
+                        if steps < 2 || !pred_ok(k.target) || !zone_ok(k.to_zone, p.side, sq) {
+                            continue;
+                        }
+                        let mut cur = psq;
+                        for i in 1..steps {
+                            cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
+                            if terrain_stops(self.terrain[cur as usize], aflies, adrills) {
+                                continue 'hop;
+                            }
+                            let occupied = self.board[cur as usize] >= 0;
+                            if occupied != (i == steps - 1) {
+                                continue 'hop; // screen must sit exactly there
+                            }
+                        }
+                        return true;
+                    }
+                    // Locust: the capture geometry targets the SCREEN —
+                    // `sq` itself is the first piece on the ray and the
+                    // square beyond it must be an open, empty landing.
+                    crate::bits::HopMode::Locust => {
+                        if self.board[sq as usize] < 0 || !pred_ok(k.target) {
+                            continue; // an empty square cannot be the victim
+                        }
+                        // A victim tucked inside terrain the attacker's ray
+                        // cannot enter (a driller in a block) is unreachable
+                        // — mirror of movegen's screen-cell terrain check.
+                        if terrain_stops(self.terrain[sq as usize], aflies, adrills) {
+                            continue;
+                        }
+                        let mut cur = psq;
+                        let mut clear = true;
+                        for _ in 1..steps {
+                            cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
+                            if terrain_stops(self.terrain[cur as usize], aflies, adrills)
+                                || self.board[cur as usize] >= 0
+                            {
+                                clear = false;
+                                break;
+                            }
+                        }
+                        if !clear {
+                            continue;
+                        }
+                        let Some(land) = g.board.offset(sq, k.d.dx, k.d.dy) else { continue };
+                        if self.board[land as usize] >= 0
+                            || terrain_stops(self.terrain[land as usize], aflies, adrills)
+                            || !zone_ok(k.to_zone, p.side, land)
+                        {
+                            continue;
+                        }
+                        return true;
+                    }
                 }
             }
         }

@@ -17,6 +17,10 @@ pub enum MoveKind {
     /// A multi-step effect script generated as ONE move (§3.4): atomic,
     /// piece-local. Overclock: from→to then to→aux, self −1 HP.
     Compound,
+    /// Locust hop (§3.1 landing mode): capture the screen at `aux`, land
+    /// on the empty square `to` immediately beyond — en-passant-style
+    /// aux-victim machinery, checkers atom.
+    Locust,
 }
 
 /// Which Axis-B effect an Ability/Compound move applies.
@@ -136,6 +140,15 @@ pub fn move_str(g: &GameDef, mv: &Move) -> String {
             }
             s
         }
+        // Locust: destination plus the captured screen ("e2e5xe4") — kept
+        // distinct from plain "e2e5" so a piece owning both a leaper and a
+        // locust hopper never aliases two different moves to one string.
+        MoveKind::Locust => format!(
+            "{}{}x{}",
+            sq_name(g, mv.from),
+            sq_name(g, mv.to),
+            sq_name(g, mv.aux)
+        ),
         MoveKind::Compound => format!(
             "{}{}+{}{}",
             sq_name(g, mv.from),

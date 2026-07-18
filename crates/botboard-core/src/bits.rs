@@ -5,14 +5,30 @@
 
 use crate::geometry::DirFilter;
 
-/// Axis-A geometry primitives (§3.1). The hopper is the one-screen,
-/// capture-landing family member (xiangqi cannon); further landing modes are
-/// later-phase content.
+/// Axis-A geometry primitives (§3.1). The hopper is the one-screen family
+/// member, parameterized by landing mode (`HopMode`).
 #[derive(Clone, Copy, Debug)]
 pub enum Geometry {
     Leaper(i8, i8),
     Rider(i8, i8),
     Hopper(i8, i8),
+}
+
+/// Hopper landing modes (§3.1's "hopper family parameterized by screen
+/// count and landing mode"; screen count is fixed at one in this batch).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HopMode {
+    /// Xiangqi cannon: after exactly one screen, capture at any distance
+    /// beyond it. Capture-only by geometry (the paired rider Bit supplies
+    /// quiet movement).
+    CannonAtRange,
+    /// Grasshopper: land on the square IMMEDIATELY beyond the screen —
+    /// onto empty (if the Bit can move) or capturing an enemy there (if
+    /// the Bit can capture).
+    BeyondScreen,
+    /// Locust (the checkers atom): capture the SCREEN itself — which must
+    /// be an enemy — landing on the empty square immediately beyond it.
+    Locust,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,6 +84,11 @@ pub struct MoveBit {
     pub min_hp: i16,
     /// State gate (§3.1): kernel active only when hp ≤ max_hp (0 = no bound).
     pub max_hp: i16,
+    /// Hopper landing mode; ignored by leapers and riders.
+    pub landing: HopMode,
+    /// Range limit for riders in steps along the ray (0 = unlimited).
+    /// The R4 "short rook" atom; ignored by leapers and hoppers.
+    pub max_steps: u8,
 }
 
 impl MoveBit {
@@ -82,6 +103,8 @@ impl MoveBit {
             target: TargetPred::Any,
             min_hp: 0,
             max_hp: 0,
+            landing: HopMode::CannonAtRange,
+            max_steps: 0,
         }
     }
     pub fn leaper(m: i8, n: i8) -> Self {
@@ -125,6 +148,21 @@ impl MoveBit {
     }
     pub fn max_hp(mut self, hp: i16) -> Self {
         self.max_hp = hp;
+        self
+    }
+    /// Set the hopper landing mode. `BeyondScreen` (the grasshopper) also
+    /// widens the hopper's default capture-only mode to `Both` — override
+    /// with `.mode(..)` after this call if a narrower Bit is wanted.
+    pub fn landing(mut self, l: HopMode) -> Self {
+        self.landing = l;
+        if l == HopMode::BeyondScreen {
+            self.mode = Mode::Both;
+        }
+        self
+    }
+    /// Cap a rider at `n` steps along each ray (0 = unlimited).
+    pub fn max_steps(mut self, n: u8) -> Self {
+        self.max_steps = n;
         self
     }
 }

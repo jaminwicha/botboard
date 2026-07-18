@@ -194,11 +194,22 @@ fn random_robot_army_samples_the_full_vocabulary() {
     // Vocabulary coverage over many seeds: every flag and every ability
     // kind must appear at its palette-ish rate, and hologram decoys must
     // hold their movement-only 1-HP contract.
-    use botboard_core::bits::AbilityBit;
-    let mut seen = [0u32; 11]; // hp>1 oc stealth flight holo emp heal laser wall/pit mine res+hack
+    use botboard_core::bits::{AbilityBit, Geometry};
+    // hp>1 oc stealth flight holo emp heal laser wall/pit mine res+hack
+    // swap+push hopper-bits capped-riders
+    let mut seen = [0u32; 14];
     for seed in 0..80u64 {
         let (g, _) = sample(seed);
         for ty in &g.types[1..] {
+            for b in &ty.bits {
+                match b.geom {
+                    // Batch 3: hopper landing modes at low rates…
+                    Geometry::Hopper(..) => seen[12] += 1,
+                    // …and range-limited riders (the R4 atom).
+                    Geometry::Rider(..) if b.max_steps > 0 => seen[13] += 1,
+                    _ => {}
+                }
+            }
             if ty.max_hp > 1 {
                 seen[0] += 1;
             }
@@ -231,9 +242,8 @@ fn random_robot_army_samples_the_full_vocabulary() {
                     AbilityBit::Resurrect { .. } | AbilityBit::Hack { .. } => {
                         seen[10] += 1
                     }
-                    // Batch-2 abilities are not yet in the army sampler's
-                    // vocabulary; nothing to count here.
-                    AbilityBit::Swap { .. } | AbilityBit::Push { .. } => {}
+                    // Batch-2 abilities joined the palette in batch 3.
+                    AbilityBit::Swap { .. } | AbilityBit::Push { .. } => seen[11] += 1,
                 }
             }
         }

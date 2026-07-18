@@ -1,7 +1,7 @@
 //! Game definition: board, zones, piece types, policy layer, and the
 //! compile step from authoring Bits to runtime kernels (spec §5, §7.3).
 
-use crate::bits::{AbilityBit, Geometry, Mode, MoveBit, PathRule, SpecialBit, TargetPred};
+use crate::bits::{AbilityBit, Geometry, HopMode, Mode, MoveBit, PathRule, SpecialBit, TargetPred};
 use crate::geometry::{symmetric_deltas, Delta};
 
 pub type Side = u8;
@@ -286,12 +286,21 @@ pub struct RideK {
     /// HP gates (§3.1 state condition), 0 = unbounded.
     pub min_hp: i16,
     pub max_hp: i16,
+    /// Range cap in steps along the ray (0 = unlimited) — the R4 atom.
+    pub max_steps: u8,
 }
 
-/// One-screen capture hopper (xiangqi cannon).
+/// One-screen hopper, parameterized by landing mode: xiangqi cannon
+/// (capture at range beyond the screen), grasshopper (land immediately
+/// beyond), or locust (capture the screen, land beyond).
 #[derive(Clone, Debug)]
 pub struct HopK {
     pub d: Delta,
+    /// Landing behavior. `CannonAtRange` and `Locust` are capture-only by
+    /// geometry; `BeyondScreen` honors `mode` (quiet landing and/or
+    /// capture on the square just past the screen).
+    pub landing: HopMode,
+    pub mode: Mode,
     pub from_zone: Option<usize>,
     pub to_zone: Option<usize>,
     pub target: TargetPred,
@@ -457,9 +466,12 @@ impl GameDef {
                         target: bit.target,
                         min_hp: bit.min_hp,
                         max_hp: bit.max_hp,
+                        max_steps: bit.max_steps,
                     }),
                     Geometry::Hopper(..) => ck.hops.push(HopK {
                         d,
+                        landing: bit.landing,
+                        mode: bit.mode,
                         from_zone: bit.from_zone,
                         to_zone: bit.to_zone,
                         target: bit.target,
@@ -482,12 +494,15 @@ impl GameDef {
                     && k.min_hp == 0
                     && k.max_hp == 0
             };
+            // Range-limited riders stay on the mailbox path too: the
+            // precomputed full-length rays cannot express the step cap.
             let plain_ride = |k: &RideK| {
                 k.from_zone.is_none()
                     && k.to_zone.is_none()
                     && k.target == TargetPred::Any
                     && k.min_hp == 0
                     && k.max_hp == 0
+                    && k.max_steps == 0
             };
             ck.leap_plain = ck.leaps.iter().map(plain_leap).collect();
             ck.ride_plain = ck.rides.iter().map(plain_ride).collect();

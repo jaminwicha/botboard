@@ -42,6 +42,15 @@
 //! driller-passable) and `"conv_n"` / `"conv_e"` / `"conv_s"` /
 //! `"conv_w"` (conveyor belts; N is +y, side 0's forward).
 //!
+//! Additive vocabulary (batch 3, the fairy-chess atoms): per-move
+//! `"landing": "cannon" | "beyond" | "locust"` selects the hopper landing
+//! mode (default `"cannon"` — the xiangqi behavior; `"beyond"` is the
+//! grasshopper, defaulting the Bit's mode to both move and capture;
+//! `"locust"` captures the screen itself, landing just past it — its
+//! moves render as `"e2e5xe4"` and surface as kind 7 in
+//! `srw_legal_info`); per-move `"max_steps": N` caps a rider at N steps
+//! along each ray (0/absent = unlimited — the R4 short-rook atom).
+//!
 //! `"net"` (optional): path to a BBNET checkpoint (§10.6). The float
 //! weights quantize against THIS battle's GameDef — descriptors are
 //! Bit-derived (§7.4), so one checkpoint serves any composed army — and
@@ -53,7 +62,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::ptr;
 
 use botboard_core::belief::Belief;
-use botboard_core::bits::{AbilityBit, Mode, MoveBit, PathRule};
+use botboard_core::bits::{AbilityBit, HopMode, Mode, MoveBit, PathRule};
 use botboard_core::cost::{cost_prior, material_table, CostWeights};
 use botboard_core::eval::Eval;
 use botboard_core::ffa::choose_ffa_move;
@@ -151,7 +160,21 @@ fn parse_move_bit(j: &Json) -> Option<MoveBit> {
         "hopper" => MoveBit::hopper(m, n),
         _ => MoveBit::leaper(m, n),
     };
-    b = b.mode(match j.str_or("mode", "both") {
+    // Hopper landing mode (batch 3): "cannon" (default, xiangqi-compatible),
+    // "beyond" (grasshopper), "locust" (capture the screen). Applied before
+    // the mode key so an explicit "mode" still overrides the grasshopper's
+    // widened default.
+    b = match j.str_or("landing", "cannon") {
+        "beyond" => b.landing(HopMode::BeyondScreen),
+        "locust" => b.landing(HopMode::Locust),
+        _ => b,
+    };
+    let default_mode = match b.mode {
+        Mode::Move => "move",
+        Mode::Capture => "capture",
+        Mode::Both => "both",
+    };
+    b = b.mode(match j.str_or("mode", default_mode) {
         "move" => Mode::Move,
         "capture" => Mode::Capture,
         _ => Mode::Both,
@@ -177,6 +200,11 @@ fn parse_move_bit(j: &Json) -> Option<MoveBit> {
     let max_hp = j.num("max_hp", 0.0) as i16;
     if max_hp > 0 {
         b = b.max_hp(max_hp);
+    }
+    // Range-limited rider (batch 3): 0/absent = unlimited.
+    let max_steps = j.num("max_steps", 0.0) as u8;
+    if max_steps > 0 {
+        b = b.max_steps(max_steps);
     }
     Some(b)
 }
@@ -957,7 +985,8 @@ pub extern "C" fn srw_legal_move(
 
 /// out[6] = [from(-1 drop), to, kind, aux(-1 none), effect, promo(-1 none)].
 /// kind: 0 normal 1 double-step 2 en-passant 3 castle 4 drop 5 ability
-/// 6 compound; effect: 0 none 1 heal 2 wall 3 pit 4 laser (a laser whose
+/// 6 compound 7 locust hop (captures the screen at `aux`, landing on the
+/// empty `to` beyond it); effect: 0 none 1 heal 2 wall 3 pit 4 laser (a laser whose
 /// `to` holds no piece is terrain damage on a destructible block) 5 twice
 /// 6 resurrect (out[5] then carries the revived type id, not a promo)
 /// 7 hack 8 mine-lay 9 swap (exchange caster with the friendly at `to`)
@@ -978,6 +1007,7 @@ pub extern "C" fn srw_legal_info(b: *mut SrwBattle, i: c_int, out: *mut c_int) -
         MoveKind::Drop => 4,
         MoveKind::Ability => 5,
         MoveKind::Compound => 6,
+        MoveKind::Locust => 7,
     };
     let effect = match mv.effect {
         Effect::None => 0,

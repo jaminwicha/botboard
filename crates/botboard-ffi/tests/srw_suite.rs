@@ -614,3 +614,109 @@ fn batch2_vocabulary_over_the_abi() {
     assert_eq!(pi[0], 2, "swapper now on c1");
     srw_destroy(b);
 }
+
+/// Vocabulary batch 3 over the C ABI: hopper landing modes (`"landing"`:
+/// grasshopper `"beyond"`, checkers-style `"locust"`) and range-limited
+/// riders (`"max_steps"`) reach the battle surface as additive schema —
+/// composed here as a grasshopper+locust robot skirmish with a
+/// deterministic full-battle replay.
+#[test]
+fn batch3_grasshopper_locust_battle_over_the_abi() {
+    let spec = |seed: u64| format!(r#"{{
+  "seed": {seed}, "max_plies": 120,
+  "board": {{"w": 7, "h": 7}},
+  "sides": 2,
+  "types": [
+    {{"name": "ctrl", "glyph": "C", "royal": true,
+     "moves": [{{"geom": "leaper", "m": 0, "n": 1}}, {{"geom": "leaper", "m": 1, "n": 1}}]}},
+    {{"name": "ghopper", "glyph": "G",
+     "moves": [{{"geom": "hopper", "m": 0, "n": 1, "landing": "beyond"}},
+                {{"geom": "hopper", "m": 1, "n": 1, "landing": "beyond"}}]}},
+    {{"name": "locust", "glyph": "L",
+     "moves": [{{"geom": "hopper", "m": 0, "n": 1, "landing": "locust"}},
+                {{"geom": "hopper", "m": 1, "n": 1, "landing": "locust"}}]}},
+    {{"name": "runner", "glyph": "R", "moves": [{{"geom": "leaper", "m": 0, "n": 1}}]}},
+    {{"name": "shortr", "glyph": "S",
+     "moves": [{{"geom": "rider", "m": 0, "n": 1, "max_steps": 2}}]}}
+  ],
+  "placements": [
+    {{"t": 0, "side": 0, "x": 0, "y": 0}},
+    {{"t": 2, "side": 0, "x": 3, "y": 1}},
+    {{"t": 1, "side": 0, "x": 2, "y": 0}},
+    {{"t": 3, "side": 0, "x": 2, "y": 1}},
+    {{"t": 4, "side": 0, "x": 5, "y": 0}},
+    {{"t": 0, "side": 1, "x": 6, "y": 6}},
+    {{"t": 2, "side": 1, "x": 3, "y": 5}},
+    {{"t": 1, "side": 1, "x": 4, "y": 6}},
+    {{"t": 3, "side": 1, "x": 3, "y": 3}},
+    {{"t": 4, "side": 1, "x": 1, "y": 6}}
+  ],
+  "tiers": [0, 0]
+}}"#);
+    let b = srw_create(c(&spec(23)).as_ptr());
+    assert!(!b.is_null(), "batch-3 setup must build (additive schema)");
+
+    // Collect side 0's legal moves with kind codes.
+    let n = srw_legal_count(b);
+    assert!(n > 0);
+    let mut strs = Vec::new();
+    let mut kinds = Vec::new();
+    let mut mv = [0 as c_char; 32];
+    let mut info = [0 as c_int; 6];
+    for i in 0..n {
+        assert!(srw_legal_move(b, i, mv.as_mut_ptr(), 32) > 0);
+        strs.push(buf_str(&mv));
+        assert_eq!(srw_legal_info(b, i, info.as_mut_ptr()), 0);
+        kinds.push([info[0], info[1], info[2], info[3]]);
+    }
+    // Locust d2: hops the enemy runner at d4, capturing IT and landing d5
+    // — surfaced as kind 7 with the screen in aux.
+    let li = strs.iter().position(|s| s == "d2d5xd4").expect("locust move over the ABI");
+    assert_eq!(kinds[li][2], 7, "locust kind code");
+    assert_eq!(kinds[li][0], 3 + 7, "from d2");
+    assert_eq!(kinds[li][1], 3 + 4 * 7, "to d5");
+    assert_eq!(kinds[li][3], 3 + 3 * 7, "aux = the captured screen d4");
+    // Grasshopper c1: over the friendly runner at c2, landing exactly
+    // beyond on c3 (a plain landing, kind 0).
+    let gi = strs.iter().position(|s| s == "c1c3").expect("grasshopper hop");
+    assert_eq!(kinds[gi][2], 0);
+    // Short rider f1: two steps up the f-file and no further.
+    assert!(strs.contains(&"f1f3".to_string()), "max_steps 2 reaches step 2");
+    assert!(!strs.contains(&"f1f4".to_string()), "max_steps 2 stops there");
+
+    // Apply the locust capture: the screen dies, the locust lands beyond.
+    assert_eq!(srw_apply(b, c("d2d5xd4").as_ptr()), 0);
+    let mut pi = [0 as c_int; 6];
+    assert_eq!(srw_piece_info(b, 1, pi.as_mut_ptr()), 0);
+    assert_eq!(pi[0], 3 + 4 * 7, "locust stands on d5");
+    assert_eq!(srw_piece_info(b, 8, pi.as_mut_ptr()), 0);
+    assert_eq!(pi[4], 0, "the screened runner is dead");
+    srw_destroy(b);
+
+    // Deterministic full-battle replay with all three batch-3 atoms live.
+    let run = |seed: u64| -> (c_int, Vec<String>) {
+        let s = c(&spec(seed));
+        let b = srw_create(s.as_ptr());
+        assert!(!b.is_null());
+        let mut mv = [0 as c_char; 32];
+        let mut log = Vec::new();
+        for _ in 0..200 {
+            if srw_status(b) != 0 {
+                break;
+            }
+            let r = srw_ai_move(b, mv.as_mut_ptr(), 32);
+            assert!(r >= 0, "ai_move failed: {r}");
+            let m = buf_str(&mv);
+            assert_eq!(srw_apply(b, c(&m).as_ptr()), 0, "arbiter accepts {m}");
+            log.push(m);
+        }
+        let st = srw_status(b);
+        srw_destroy(b);
+        (st, log)
+    };
+    let (st1, log1) = run(29);
+    let (st2, log2) = run(29);
+    assert_ne!(st1, 0, "grasshopper+locust battle reaches a verdict");
+    assert_eq!(st1, st2, "same seed ⇒ same verdict");
+    assert_eq!(log1, log2, "same seed ⇒ identical move log (§10.1)");
+}

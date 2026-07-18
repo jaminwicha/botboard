@@ -214,7 +214,9 @@ impl Searcher {
                 continue;
             }
             any_legal = true;
-            let quiet = pos.piece_at(mv.to).is_none() && mv.kind != MoveKind::Drop;
+            let quiet = pos.piece_at(mv.to).is_none()
+                && mv.kind != MoveKind::Drop
+                && mv.kind != MoveKind::Locust;
             let u = pos.make(g, mv);
             let mut s;
             // Late-move reduction: late quiet moves get a reduced search,
@@ -295,11 +297,14 @@ impl Searcher {
         // Friendly-target abilities (Heal) would undo that progress and make
         // damage/heal cycles explode toward the ply cap — they are position
         // maintenance, not tactics, and stand-pat covers them.
+        // Locust hops land on an empty square but capture the enemy screen
+        // at `aux` — enemy HP strictly drops, so the bound holds for them.
         let mut moves: Vec<Move> = pseudo_moves(g, pos)
             .into_iter()
             .filter(|m| {
-                m.kind != MoveKind::Drop
-                    && pos.piece_at(m.to).is_some_and(|p| p.side != pos.stm)
+                m.kind == MoveKind::Locust
+                    || (m.kind != MoveKind::Drop
+                        && pos.piece_at(m.to).is_some_and(|p| p.side != pos.stm))
             })
             .collect();
         self.order(g, pos, &mut moves, None, ply);
@@ -334,6 +339,12 @@ impl Searcher {
             }
             if let Some(v) = pos.piece_at(mv.to) {
                 return 1_000_000_000 + self.eval.material[v.t as usize] as i64;
+            }
+            // A locust hop is a capture whose victim stands on `aux`.
+            if mv.kind == MoveKind::Locust {
+                if let Some(v) = pos.piece_at(mv.aux) {
+                    return 1_000_000_000 + self.eval.material[v.t as usize] as i64;
+                }
             }
             if Some(*mv) == ks[0] {
                 return 900_000_000;

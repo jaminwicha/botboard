@@ -13,6 +13,7 @@
 //!   train-net srw [--games N --epochs E --budget B --out F]
 //!                             sampled-robot-army training + promotion probe
 //!   netmatch <variant> --a A.bin --b B.bin [--pairs N]   paired-opening gate
+//!   armymatch [--pairs N --depth D --nodes N --seed S]    CwDA fairness bench
 
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
@@ -456,6 +457,44 @@ fn cmd_train_srw(args: &[String]) {
     );
 }
 
+/// The CwDA fairness bench (vocabulary batch 3): price each army with the
+/// engine cost model, then run paired-opening matches FIDE vs each
+/// alternative army — Betza's hand-balanced fairness claim measured with
+/// our numbers; no tuning, the tables speak.
+fn cmd_armymatch(args: &[String]) {
+    use botboard_core::variants::cwda::{self, Army};
+    let pairs: u32 = opt(args, "--pairs", 8);
+    let depth: i32 = opt(args, "--depth", 4);
+    let nodes: u64 = opt(args, "--nodes", 20_000);
+    let seed: u64 = opt(args, "--seed", 17);
+
+    println!("CwDA cost priors (standard weights w_move=w_attack=0.35):\n");
+    for a in cwda::ALL {
+        let sheet = cwda::army_costs(a, &cwda::W);
+        println!("{}:", a.name());
+        for (name, cost, count) in &sheet.pieces {
+            println!("  {:<16} {:>6.2} × {}", name, cost, count);
+        }
+        println!("  {:<16} {:>6.2}\n", "ARMY TOTAL", sheet.total);
+    }
+
+    println!(
+        "paired matches vs FIDE ({pairs} pairs = {} games each, depth {depth}, {nodes} nodes):\n",
+        pairs * 2
+    );
+    for b in [Army::Clobberers, Army::Rookies, Army::Nutters] {
+        let t0 = Instant::now();
+        let (wf, wb, dr) = cwda::paired_match(Army::Fide, b, pairs, depth, nodes, seed, 300);
+        let total = (wf + wb + dr).max(1);
+        println!(
+            "FIDE {wf} — {dr} — {wb} {}  (FIDE score {:.1}%, {:.1}s)",
+            b.name(),
+            100.0 * (wf as f64 + dr as f64 * 0.5) / total as f64,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+}
+
 fn cmd_armies(args: &[String]) {
     let budget: f64 = opt(args, "--budget", 20.0);
     let seed: u64 = opt(args, "--seed", 1);
@@ -506,7 +545,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: botboard <show|perft|divide|play|selfplay|cost|league|armies|bench> [variant] [args]"
+            "usage: botboard <show|perft|divide|play|selfplay|cost|league|armies|armymatch|bench> [variant] [args]"
         );
         std::process::exit(1);
     }
@@ -514,6 +553,9 @@ fn main() {
 
     if cmd == "armies" {
         return cmd_armies(&args[2..]);
+    }
+    if cmd == "armymatch" {
+        return cmd_armymatch(&args[2..]);
     }
     if cmd == "bench" {
         return cmd_bench();

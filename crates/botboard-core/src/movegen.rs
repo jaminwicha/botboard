@@ -6,7 +6,7 @@
 //! legality runs the three tiers of §3.3: empty target, derivable
 //! can-act-from, and the named predicates (*nifu*, *uchifuzume*).
 
-use crate::bits::{AbilityBit, SpecialBit, TargetPred};
+use crate::bits::{AbilityBit, HopMode, SpecialBit, TargetPred};
 use crate::game::{GameDef, PromoTrigger, Side, StalematePolicy, TypeId};
 use crate::moves::{Effect, Move, MoveKind, NO_SQ};
 use crate::position::{Loc, Position};
@@ -189,7 +189,12 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
                 continue;
             }
             let mut cur = from;
+            let mut steps = 0u8;
             while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
+                steps += 1;
+                if k.max_steps != 0 && steps > k.max_steps {
+                    break; // range-limited rider (R4 atom): reach exhausted
+                }
                 if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies, drills) {
                     break;
                 }
@@ -221,28 +226,89 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
             if !zone_ok(k.from_zone, from) {
                 continue;
             }
-            let mut cur = from;
-            let mut screened = false;
-            while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
-                if !pos.terrain_open_for(to, flies, drills) {
-                    break; // blocking terrain is never a screen
+            match k.landing {
+                // Xiangqi cannon: after one screen, capture at any range.
+                HopMode::CannonAtRange => {
+                    if !k.mode.can_capture() {
+                        continue;
+                    }
+                    let mut cur = from;
+                    let mut screened = false;
+                    while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
+                        if !pos.terrain_open_for(to, flies, drills) {
+                            break; // blocking terrain is never a screen
+                        }
+                        match pos.piece_at(to) {
+                            None => cur = to,
+                            Some(v) => {
+                                if !screened {
+                                    screened = true;
+                                    cur = to;
+                                } else {
+                                    if v.side != stm
+                                        && zone_ok(k.to_zone, to)
+                                        && target_ok(k.target, to)
+                                    {
+                                        push_with_promo(
+                                            g, stm, p.t, from, to, MoveKind::Normal, NO_SQ,
+                                            &mut out,
+                                        );
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
-                match pos.piece_at(to) {
-                    None => cur = to,
-                    Some(v) => {
-                        if !screened {
-                            screened = true;
-                            cur = to;
-                        } else {
-                            if v.side != stm && zone_ok(k.to_zone, to) && target_ok(k.target, to)
-                            {
+                // Grasshopper: land IMMEDIATELY beyond the screen — onto
+                // empty (move) or capturing an enemy there (capture).
+                HopMode::BeyondScreen => {
+                    let Some((_screen, to)) = first_screen_and_beyond(g, pos, from, k, flies, drills)
+                    else {
+                        continue;
+                    };
+                    if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies, drills) {
+                        continue;
+                    }
+                    match pos.piece_at(to) {
+                        None => {
+                            if k.mode.can_move() {
                                 push_with_promo(
                                     g, stm, p.t, from, to, MoveKind::Normal, NO_SQ, &mut out,
                                 );
                             }
-                            break;
+                        }
+                        Some(v) => {
+                            if v.side != stm && k.mode.can_capture() && target_ok(k.target, to) {
+                                push_with_promo(
+                                    g, stm, p.t, from, to, MoveKind::Normal, NO_SQ, &mut out,
+                                );
+                            }
                         }
                     }
+                }
+                // Locust: capture the screen itself (must be an enemy),
+                // landing on the empty square just beyond — the aux-victim
+                // machinery en passant already exercises.
+                HopMode::Locust => {
+                    if !k.mode.can_capture() {
+                        continue;
+                    }
+                    let Some((screen, to)) = first_screen_and_beyond(g, pos, from, k, flies, drills)
+                    else {
+                        continue;
+                    };
+                    let victim = pos.piece_at(screen).expect("screen is occupied");
+                    if victim.side == stm || !target_ok(k.target, screen) {
+                        continue;
+                    }
+                    if !zone_ok(k.to_zone, to)
+                        || !pos.terrain_open_for(to, flies, drills)
+                        || pos.piece_at(to).is_some()
+                    {
+                        continue;
+                    }
+                    out.push(Move::special(from, to, MoveKind::Locust, screen));
                 }
             }
         }
@@ -366,6 +432,32 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
     });
 
     out
+}
+
+/// Walk a hop ray from `from`: find the first occupied square (the screen)
+/// and the square immediately beyond it. `None` when the ray hits blocking
+/// terrain or the board edge first, or when the screen is on the edge.
+/// Callers apply their own zone/occupancy/terrain rules to the landing.
+fn first_screen_and_beyond(
+    g: &GameDef,
+    pos: &Position,
+    from: u16,
+    k: &crate::game::HopK,
+    flies: bool,
+    drills: bool,
+) -> Option<(u16, u16)> {
+    let mut cur = from;
+    while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
+        if !pos.terrain_open_for(to, flies, drills) {
+            return None; // blocking terrain is never a screen
+        }
+        if pos.piece_at(to).is_some() {
+            let beyond = g.board.offset(to, k.d.dx, k.d.dy)?;
+            return Some((to, beyond));
+        }
+        cur = to;
+    }
+    None
 }
 
 /// Standard castling: unmoved king + unmoved partner rook on the same rank,
@@ -809,7 +901,12 @@ fn pseudo_kernel_moves_of(g: &GameDef, pos: &Position, from: u16) -> Vec<Move> {
             continue;
         }
         let mut cur = from;
+        let mut steps = 0u8;
         while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
+            steps += 1;
+            if k.max_steps != 0 && steps > k.max_steps {
+                break;
+            }
             if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies, drills) {
                 break;
             }

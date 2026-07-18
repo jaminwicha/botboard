@@ -317,16 +317,18 @@ pub fn random_army(
 /// SRW-content generate step (STATUS scale rung 3; SRW Appendix B): sample
 /// the full robot vocabulary — armor 1–3, overclock, stealth, flight, EMP
 /// auras, hologram decoys (movement-only, 1 HP), and Axis-B ability Bits
-/// (heal / wall / pit / laser ±pierce ±retreat / mine / resurrect / hack) —
-/// at roughly the SRW clan palettes' rates (abilities ~30%, flags 5–20%),
-/// priced by the cost prior and packed symmetric under budget like
-/// `random_army`. Deterministic per rng seed.
+/// (heal / wall / pit / laser ±pierce ±retreat / mine / resurrect / hack /
+/// swap / push) — at roughly the SRW clan palettes' rates (abilities ~30%,
+/// flags 5–20%), priced by the cost prior and packed symmetric under budget
+/// like `random_army`. Batch-3 movement vocabulary at low rates: hopper Bits
+/// with the three landing modes (~8% of movement Bits) and range-limited
+/// riders (max_steps 2–4 on ~10% of riders). Deterministic per rng seed.
 pub fn random_robot_army(
     g_budget: f64,
     rng: &mut Rng,
     weights: &CostWeights,
 ) -> (GameDef, Vec<GeneratedPiece>) {
-    use crate::bits::{AbilityBit, Mode, MoveBit};
+    use crate::bits::{AbilityBit, HopMode, Mode, MoveBit};
     use crate::game::*;
     use crate::geometry::DirFilter;
 
@@ -344,10 +346,24 @@ pub fn random_robot_army(
         for _ in 0..[1usize, 2][rng.below(2)] {
             let (m, n) = [(0i8, 1i8), (1, 1), (1, 2), (0, 2), (2, 2), (1, 3), (2, 3)]
                 [rng.below(7)];
-            let mut b = if rng.unit_f64() < 0.5 {
+            let geom = rng.unit_f64();
+            let mut b = if geom < 0.46 {
                 MoveBit::leaper(m, n)
+            } else if geom < 0.92 {
+                let mut r = MoveBit::rider(m, n);
+                if rng.unit_f64() < 0.10 {
+                    // Range-limited rider (the R4 atom): 2–4 steps.
+                    r = r.max_steps(2 + rng.below(3) as u8);
+                }
+                r
             } else {
-                MoveBit::rider(m, n)
+                // Hopper family, one landing mode each (batch 3).
+                let hop = MoveBit::hopper(m, n);
+                match rng.below(3) {
+                    0 => hop, // cannon-at-range (capture-only default)
+                    1 => hop.landing(HopMode::BeyondScreen), // grasshopper
+                    _ => hop.landing(HopMode::Locust),
+                }
             };
             if rng.unit_f64() < 0.25 {
                 b = b.dirs(DirFilter::Forward);
@@ -390,7 +406,7 @@ pub fn random_robot_army(
         }
         if rng.unit_f64() < 0.30 {
             let range12 = 1 + rng.below(2) as u8;
-            let ability = match rng.below(7) {
+            let ability = match rng.below(9) {
                 0 => AbilityBit::Heal { amount: 1, range: range12 },
                 1 => AbilityBit::CreateWall { range: range12 },
                 2 => AbilityBit::DigPit { range: range12 },
@@ -401,7 +417,10 @@ pub fn random_robot_army(
                 },
                 4 => AbilityBit::MineLayer { range: 1 },
                 5 => AbilityBit::Resurrect { range: 2 },
-                _ => AbilityBit::Hack { range: range12 },
+                6 => AbilityBit::Hack { range: range12 },
+                // Batch-2 abilities join the palette.
+                7 => AbilityBit::Swap { range: range12 },
+                _ => AbilityBit::Push { range: range12 },
             };
             def = def.abilities(vec![ability]);
         }

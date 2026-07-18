@@ -53,6 +53,8 @@ impl PolicyHead {
         use crate::moves::MoveKind;
         match mv.kind {
             MoveKind::Ability | MoveKind::Compound => 2,
+            // A locust hop captures its screen even though `to` is empty.
+            MoveKind::Locust => 1,
             _ if pos.piece_at(mv.to).is_some() => 1,
             _ => 0,
         }
