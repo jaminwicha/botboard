@@ -6,9 +6,10 @@
 //! xor-in — exactly the discipline the old per-kind `make_impl` arms
 //! used), pushes an exact-undo record onto the move's `OpLog`, and is
 //! reverted by replaying the log backwards. Ops never compose ops; the
-//! one hook that runs *after* an op is the landing-hazard check
-//! (mine/acid), which stays a post-op hook until terrain becomes registry
-//! rows in Stage 3 — its mutations flow through the same undo records.
+//! one hook that runs *after* an op is the landing-hazard check — as of
+//! Stage 3 an interpreter over the terrain registry row's `on_land`
+//! script (gate → consumed → ops), its mutations flowing through the
+//! same undo records.
 //!
 //! Op set as built (deviations from the design table are documented in
 //! the design doc's Stage-1 notes):
@@ -41,9 +42,8 @@
 
 use crate::game::{GameDef, Side, TypeId};
 use crate::moves::NO_SQ;
-use crate::position::{
-    is_block, mine_owner, Loc, Piece, Position, T_ACID, T_BLOCK1, T_MINE0, T_NONE, T_PIT, T_WALL,
-};
+use crate::position::{is_block, mine_owner, Loc, Piece, Position, T_MINE0, T_NONE, T_PIT, T_WALL};
+use crate::terrain_defs::{self, LandGate};
 
 /// Square reference, resolved against the applying move's fields.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -519,16 +519,16 @@ impl Position {
         self.xor_terrain(g, sq);
     }
 
-    /// Block erosion: an unoccupied destructible block drops one tier
-    /// (T_BLOCK1 clears to bare floor); anything else is a no-op — a
-    /// piece standing inside the block (a driller) shields it.
+    /// Block erosion: an unoccupied destructible block (registry
+    /// `tiers > 0`) drops one tier (tier 1 clears to bare floor);
+    /// anything else is a no-op — a piece standing inside the block
+    /// (a driller) shields it.
     pub(crate) fn op_terrain_step(&mut self, g: &GameDef, sq: u16, log: &mut OpLog) {
         let t = self.terrain[sq as usize];
         if self.board[sq as usize] >= 0 || !is_block(t) {
             return;
         }
-        let next = if t == T_BLOCK1 { T_NONE } else { t - 1 };
-        self.op_set_terrain(g, sq, next, log);
+        self.op_set_terrain(g, sq, terrain_defs::erode(t), log);
     }
 
     /// Hack: flip the occupant of `sq` to `side`. Masks track side, so
@@ -605,37 +605,65 @@ impl Position {
         self.xor_piece(g, i);
     }
 
-    /// Landing hazards (SRW Appendix B): spring an enemy mine (spent on
-    /// trigger) or wade into acid (persistent, bites every side). Either
-    /// way the lander takes 1 HP — lethal at 1. Stays a post-op hook
-    /// until terrain rows land (Stage 3); undo flows through the op log.
+    /// Landing hazards (SRW Appendix B): the post-op hook, now a
+    /// registry-driven interpreter over the terrain row's `on_land`
+    /// script (Bits 2.0 Stage 3). The call sites — and their quirks:
+    /// castle rooks and resurrected pieces do not trigger — are
+    /// unchanged. The guard inlines to the derived range compares
+    /// (`has_on_land`); the interpreted body stays cold and out of the
+    /// dominant path.
+    #[inline]
     pub(crate) fn hazard_landing(&mut self, g: &GameDef, mi: usize, log: &mut OpLog) {
         let Loc::Board(sq) = self.pieces[mi].loc else { return };
         let t = self.terrain[sq as usize];
-        let bites = match mine_owner(t) {
-            Some(owner) => {
-                if owner == self.pieces[mi].side {
-                    return;
-                }
-                // The mine is spent.
-                self.op_set_terrain(g, sq, T_NONE, log);
-                true
-            }
-            None => t == T_ACID,
-        };
-        if !bites {
+        if !terrain_defs::has_on_land(t) {
             return;
         }
-        if self.hp[mi] > 1 {
-            log.push(OpUndo::Hp { i: mi as u32, prior: self.hp[mi] });
-            self.xor_piece(g, mi);
-            self.hp[mi] -= 1;
-            self.xor_piece(g, mi);
-        } else {
-            self.xor_piece(g, mi);
-            self.lift(mi, sq);
-            self.pieces[mi].loc = Loc::Dead;
-            log.push(OpUndo::HazardDeath { i: mi as u32, sq });
+        self.land_hazard_interpret(g, mi, sq, t, log);
+    }
+
+    /// The on-land interpreter: gate check → consumed handling → the
+    /// row's ops against the lander, all through the shared op log. HP
+    /// damage here carries the hazard floor-death rule (lethal at 0) —
+    /// unlike the ability interpreter's generation-guarded `HpAdd`.
+    #[cold]
+    #[inline(never)]
+    fn land_hazard_interpret(
+        &mut self,
+        g: &GameDef,
+        mi: usize,
+        sq: u16,
+        t: u8,
+        log: &mut OpLog,
+    ) {
+        let Some(land) = &terrain_defs::row(t).on_land else { return };
+        match land.gate {
+            LandGate::EnemyOfOwner => {
+                // The banded owner's own pieces pass over unharmed (and
+                // the hazard is NOT spent).
+                if mine_owner(t) == Some(self.pieces[mi].side) {
+                    return;
+                }
+            }
+            LandGate::Anyone => {}
+        }
+        if land.consumed {
+            self.op_set_terrain(g, sq, T_NONE, log);
+        }
+        for op in land.ops {
+            match *op {
+                MicroOp::HpAdd { n: HpAmt::Lit(v), .. } => {
+                    if self.hp[mi] + v >= 1 {
+                        self.op_hp_add(g, mi, v, false, log);
+                    } else {
+                        self.xor_piece(g, mi);
+                        self.lift(mi, sq);
+                        self.pieces[mi].loc = Loc::Dead;
+                        log.push(OpUndo::HazardDeath { i: mi as u32, sq });
+                    }
+                }
+                _ => unreachable!("on_land op outside the stdlib on_land vocabulary"),
+            }
         }
     }
 }

@@ -358,24 +358,23 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
         }
     }
 
-    // Appendix B ice: a rider landing on an empty sheet keeps sliding
-    // along its ray — destinations are rewritten here so make/unmake and
-    // hashing never know ice existed. Leapers land normally.
-    let any_ice = pos.terrain.iter().any(|&t| t == crate::position::T_ICE);
+    // Appendix B ice (registry carry row `Slide`): a rider landing on an
+    // empty sheet keeps sliding along its ray — destinations are
+    // rewritten here so make/unmake and hashing never know ice existed.
+    // Leapers land normally (the row's `riders_only` parameter).
+    let any_ice = pos.terrain.iter().any(|&t| crate::terrain_defs::slides(t));
     if any_ice {
         for m in out.iter_mut() {
             slide_on_ice(g, pos, m);
         }
     }
-    // Conveyor belts: any quiet landing on a belt is carried along it —
-    // also destination rewriting, applied to ALL landings (leapers too;
-    // belts carry everyone). Documented interleave rule: belts resolve
+    // Conveyor belts (registry carry row `Belt`): any quiet landing on a
+    // belt is carried along it — also destination rewriting, applied to
+    // ALL landings (leapers too; belts carry everyone — no rider
+    // restriction on the row). Documented interleave rule: belts resolve
     // AFTER the ice slide, one pass, no re-entry into ice logic — a belt
     // dumping onto ice does not restart the skid.
-    let any_belt = pos
-        .terrain
-        .iter()
-        .any(|&t| crate::position::conv_dir(t).is_some());
+    let any_belt = pos.terrain.iter().any(|&t| crate::terrain_defs::belts(t));
     if any_belt {
         for m in out.iter_mut() {
             carry_on_belt(g, pos, m);
@@ -592,17 +591,23 @@ fn gen_partner_compound(
     }
 }
 
-/// Ice slide (Appendix B): rewrite a quiet rider move that lands on ice
-/// to its slide-out endpoint — the last ice cell before a blocker/edge,
-/// or the first open non-ice cell past the sheet.
+/// Ice slide (Appendix B; the registry `Carry::Slide` row): rewrite a
+/// quiet rider move that lands on slide terrain to its slide-out
+/// endpoint — the last slide cell before a blocker/edge, or the first
+/// open non-slide cell past the sheet. The rider-only rule is the row's
+/// `riders_only` parameter, not a hard-coded kind check.
 fn slide_on_ice(g: &GameDef, pos: &Position, mv: &mut Move) {
-    use crate::position::T_ICE;
+    use crate::terrain_defs::{self, Carry};
     if mv.kind != MoveKind::Normal || mv.promo.is_some() {
         return;
     }
-    if pos.board[mv.to as usize] >= 0 || pos.terrain[mv.to as usize] != T_ICE {
+    if pos.board[mv.to as usize] >= 0 {
         return;
     }
+    let Carry::Slide { riders_only } = terrain_defs::row(pos.terrain[mv.to as usize]).carry
+    else {
+        return;
+    };
     let mover = pos.piece_at(mv.from).expect("mover exists");
     let (fx, fy) = g.board.xy(mv.from);
     let (tx, ty) = g.board.xy(mv.to);
@@ -612,14 +617,16 @@ fn slide_on_ice(g: &GameDef, pos: &Position, mv: &mut Move) {
         return;
     }
     let (sx, sy) = ((dx / gd) as i8, (dy / gd) as i8);
-    // Only sliders skid: the mover must ride in exactly this direction.
-    let ck = g.compiled(mover.t, mover.side);
-    let is_ride = ck
-        .rides
-        .iter()
-        .any(|r| r.mode.can_move() && r.d.dx == sx && r.d.dy == sy);
-    if !is_ride {
-        return;
+    if riders_only {
+        // Only sliders skid: the mover must ride in exactly this direction.
+        let ck = g.compiled(mover.t, mover.side);
+        let is_ride = ck
+            .rides
+            .iter()
+            .any(|r| r.mode.can_move() && r.d.dx == sx && r.d.dy == sy);
+        if !is_ride {
+            return;
+        }
     }
     let flies = g.types[mover.t as usize].flight;
     let drills = g.types[mover.t as usize].drill;
@@ -629,7 +636,7 @@ fn slide_on_ice(g: &GameDef, pos: &Position, mv: &mut Move) {
         if pos.board[next as usize] >= 0 || !pos.terrain_open_for(next, flies, drills) {
             break; // stop on the last ice cell before the obstruction
         }
-        if pos.terrain[next as usize] == T_ICE {
+        if terrain_defs::slides(pos.terrain[next as usize]) {
             cur = next;
             continue;
         }
@@ -727,10 +734,11 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                     _ => Effect::Mine,
                 };
                 for sq in 0..g.board.ncells() as u16 {
-                    // Bare floor only: no stacking terrain on mines.
+                    // Bare floor only (the registry's absence row): no
+                    // stacking terrain on mines.
                     if sq == from
                         || pos.cell_obstructed(sq)
-                        || pos.terrain[sq as usize] != crate::position::T_NONE
+                        || !crate::terrain_defs::is_bare(pos.terrain[sq as usize])
                     {
                         continue;
                     }
@@ -799,12 +807,12 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                     for _ in 0..range {
                         let Some(nsq) = g.board.offset(cur, dx, dy) else { break };
                         if !pos.terrain_open(nsq) {
-                            // A destructible block is blocking terrain the
-                            // beam may TARGET: each hit drops it one tier
-                            // (make handles the empty-victim square as
-                            // terrain damage). The beam still stops here,
-                            // pierce or not.
-                            if crate::position::is_block(pos.terrain[nsq as usize])
+                            // A destructible block (registry `tiers > 0`)
+                            // is blocking terrain the beam may TARGET:
+                            // each hit drops it one tier (make handles
+                            // the empty-victim square as terrain damage).
+                            // The beam still stops here, pierce or not.
+                            if crate::terrain_defs::is_block(pos.terrain[nsq as usize])
                                 && pos.board[nsq as usize] < 0
                             {
                                 let aux = if retreat {

@@ -19,76 +19,14 @@ use crate::game::{GameDef, Side, TypeId};
 use crate::moves::{Effect, Move, NO_SQ};
 use crate::ops::{OpCtx, OpLog};
 
-pub const T_NONE: u8 = 0;
-pub const T_WALL: u8 = 1;
-pub const T_PIT: u8 = 2;
-/// Owner-tagged mines (SRW Appendix B): T_MINE0 + side. Passable and
-/// non-blocking; an enemy landing takes 1 HP (lethal at 1) and spends it.
-pub const T_MINE0: u8 = 3;
-/// Ice (Appendix B): a rider entering keeps sliding until it hits a
-/// blocker or leaves the sheet — realized as destination rewriting in
-/// movegen, so make/unmake never see it.
-pub const T_ICE: u8 = 7;
-/// Tall grass (Appendix B): positional concealment — masking lives at
-/// the battle layer; the engine only stores the tile.
-pub const T_GRASS: u8 = 8;
-/// Acid (Appendix B): passable; any piece landing here takes 1 HP
-/// (lethal at 1). The pool persists.
-pub const T_ACID: u8 = 9;
-/// Destructible blocks (SRW Appendix B walls a driller chews): blocking
-/// like walls for everyone except drillers, who pass/enter them as if
-/// absent. Three damage tiers; a laser hit lowers the tier by one
-/// (T_BLOCK1 clears to floor).
-pub const T_BLOCK1: u8 = 10;
-pub const T_BLOCK2: u8 = 11;
-pub const T_BLOCK3: u8 = 12;
-/// Conveyor belts: a piece LANDING on one is carried a square per belt in
-/// the belt's direction (chains, bounded) — realized as destination
-/// rewriting in movegen like ice, so make/unmake never see them.
-/// N is +y (side 0's forward), E is +x, S is −y, W is −x.
-pub const T_CONV_N: u8 = 13;
-pub const T_CONV_E: u8 = 14;
-pub const T_CONV_S: u8 = 15;
-pub const T_CONV_W: u8 = 16;
-
-/// Is this a destructible block tier?
-#[inline]
-pub fn is_block(t: u8) -> bool {
-    (T_BLOCK1..=T_BLOCK3).contains(&t)
-}
-
-/// The belt direction, if this terrain is a conveyor.
-#[inline]
-pub fn conv_dir(t: u8) -> Option<(i8, i8)> {
-    match t {
-        T_CONV_N => Some((0, 1)),
-        T_CONV_E => Some((1, 0)),
-        T_CONV_S => Some((0, -1)),
-        T_CONV_W => Some((-1, 0)),
-        _ => None,
-    }
-}
-
-/// Terrain that blocks entry, rays, screens, and legs (mines do not).
-#[inline]
-pub fn terrain_blocks(t: u8) -> bool {
-    t == T_WALL || t == T_PIT || is_block(t)
-}
-
-/// `terrain_blocks` under the terrain permissions (§3.1 path
-/// interaction): flight ignores pits; drill ignores walls and
-/// destructible blocks (the drill chews scrap). Pits still stop a
-/// driller unless it also flies.
-#[inline]
-pub fn terrain_stops(t: u8, flies: bool, drills: bool) -> bool {
-    ((t == T_WALL || is_block(t)) && !drills) || (t == T_PIT && !flies)
-}
-
-/// The mine's owner, if this cell holds one (mines occupy 3..=6).
-#[inline]
-pub fn mine_owner(t: u8) -> Option<Side> {
-    (T_MINE0..T_MINE0 + 4).contains(&t).then(|| (t - T_MINE0) as Side)
-}
+// Terrain is registry rows (Bits 2.0 Stage 3, `terrain_defs`): the
+// internal codes and the registry-backed predicates are re-exported here
+// so consumers (movegen, ops, FFI, tests) keep their import paths.
+pub use crate::terrain_defs::{
+    conv_dir, is_block, mine_owner, terrain_blocks, terrain_stops, T_ACID, T_BLOCK1, T_BLOCK2,
+    T_BLOCK3, T_CONV_E, T_CONV_N, T_CONV_S, T_CONV_W, T_GRASS, T_ICE, T_MINE0, T_NONE, T_PIT,
+    T_WALL,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Loc {
@@ -132,9 +70,12 @@ pub struct Position {
     pub occ_all: u128,
     pub occ_side: Vec<u128>,
     pub terrain_mask: u128,
-    /// Number of pit cells (kept in sync by set_terrain/rehash).
+    /// Number of ground-blocking cells a flyer is exempt from (the
+    /// registry's `FLIGHT_EXEMPT` class — pits in the stdlib); kept in
+    /// sync by set_terrain/rehash.
     pit_count: u16,
-    /// Number of wall + destructible-block cells (same maintenance).
+    /// Number of ground-blocking cells a driller is exempt from
+    /// (`DRILL_EXEMPT` — walls + destructible blocks; same maintenance).
     wall_count: u16,
     wide: bool,
 }
@@ -193,14 +134,12 @@ impl Position {
     /// Re-derive the incremental key and occupancy mirrors after
     /// out-of-band edits (tests, determinization, manual setup).
     pub fn rehash(&mut self, g: &GameDef) {
+        use crate::terrain_defs::{drill_exempt, flight_exempt};
         self.hash = g.zobrist.full_hash(self);
         self.pit_count =
-            self.terrain.iter().filter(|&&t| t == T_PIT).count() as u16;
-        self.wall_count = self
-            .terrain
-            .iter()
-            .filter(|&&t| t == T_WALL || is_block(t))
-            .count() as u16;
+            self.terrain.iter().filter(|&&t| flight_exempt(t)).count() as u16;
+        self.wall_count =
+            self.terrain.iter().filter(|&&t| drill_exempt(t)).count() as u16;
         if self.wide {
             self.occ_all = 0;
             self.occ_side.iter_mut().for_each(|m| *m = 0);
@@ -262,15 +201,17 @@ impl Position {
         !terrain_stops(self.terrain[sq as usize], flies, drills)
     }
 
-    /// Any pits on the board? Gates the wide-bitboard fast path for
-    /// flyers (whose kernels must ignore pit obstruction).
+    /// Any flight-exempt blocking terrain (stdlib: pits)? Gates the
+    /// wide-bitboard fast path for flyers (whose kernels must ignore pit
+    /// obstruction).
     #[inline]
     pub fn has_pit(&self) -> bool {
         self.pit_count > 0
     }
 
-    /// Any walls or destructible blocks? Gates the wide-bitboard fast
-    /// path for drillers (whose kernels must ignore wall obstruction).
+    /// Any drill-exempt blocking terrain (stdlib: walls + destructible
+    /// blocks)? Gates the wide-bitboard fast path for drillers (whose
+    /// kernels must ignore wall obstruction).
     #[inline]
     pub fn has_wall(&self) -> bool {
         self.wall_count > 0
@@ -336,17 +277,18 @@ impl Position {
 
     #[inline]
     pub(crate) fn set_terrain(&mut self, sq: u16, t: u8) {
+        use crate::terrain_defs::{drill_exempt, flight_exempt};
         let old = self.terrain[sq as usize];
-        if old == T_PIT {
+        if flight_exempt(old) {
             self.pit_count -= 1;
         }
-        if t == T_PIT {
+        if flight_exempt(t) {
             self.pit_count += 1;
         }
-        if old == T_WALL || is_block(old) {
+        if drill_exempt(old) {
             self.wall_count -= 1;
         }
-        if t == T_WALL || is_block(t) {
+        if drill_exempt(t) {
             self.wall_count += 1;
         }
         self.terrain[sq as usize] = t;

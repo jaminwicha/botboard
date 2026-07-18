@@ -276,3 +276,85 @@ Deviations and notes:
   +0.11%, cycles +2.7% (the residual is the mandated ephemeral-marker
   op-log records ≈0.6% plus dispatch/layout stalls; xiangqi and shogi
   are at parity or faster).
+
+## Stage 3 as built (July 2026) — deviations and notes
+
+Landed in `terrain_defs.rs` (the terrain registry); `position.rs` keeps
+only re-exports of the codes and predicates, `ops.rs`'s hazard hook is a
+registry interpreter, `movegen.rs`'s carry/targeting checks read rows,
+and `srw.rs`'s parsing/codes/concealment read rows. Strictly
+behavior-preserving: every suite bit-identical (zero expectation
+changes), deep perft trio exact, selfplay traces identical.
+
+**The rows as built.** One row per INTERNAL code (17 rows): the
+`T_*` codes stay frozen as the registry index and the Zobrist terrain
+key space (`zobrist::TERRAINS` = `terrain_defs::NT`). Mines occupy the
+owner band `T_MINE0 + side` (codes 3..=6): four rows sharing id
+`"mine"`, `owner_banded: true`, and wire code 3 — the code-band
+encoding survives as row data. `blocks` uses three named profiles:
+SOLID (ground+flight; drill passes — wall, block1-3), CHASM
+(ground+drill; flight passes — pit), OPEN (everything else). `on_land`
+is `Some` on mines {BITE, gate EnemyOfOwner, consumed} and acid
+{BITE, Anyone, persistent}; `carry` is `Slide{riders_only: true}` on
+ice and `Belt{dx,dy}` on the four conveyors; `conceal` is `Standing`
+on grass and `OwnerSecret` on mines; `tiers` 1/2/3 on the block band.
+The `code` field is the stable FFI wire id (`srw_terrain` codes 0–13).
+
+Deviations and notes:
+
+- **The hot predicates compile to derived RANGE COMPARES, not mask
+  probes.** The planned per-class u32 code-mask probe
+  (`mask & (1 << t)`) measured ~9% slower on chess perft than the
+  pre-registry compare chains — and a 256-byte table ~6% — because the
+  hottest sites (`cell_obstructed_for` inside `is_attacked`, kernel
+  walks) live and die by two fused register compares on an
+  already-loaded byte. As built, the masks ARE still folded from the
+  rows at compile time, then re-expressed as contiguous code ranges
+  (`ranges_of`, up to `NR = 3` per class; unused ranges fold to
+  `false`), so `terrain_stops` compiles to exactly the old comparison
+  chain. `terrain_stops` decomposes over derived exemption classes
+  (STOP_ALWAYS / DRILL_EXEMPT / FLIGHT_EXEMPT / EXEMPT_BOTH) so the
+  open cell short-circuits on `t` alone; the stdlib's empty classes
+  fold away. A compile-time exhaustive proof (all 256 codes × 4
+  permission combos) asserts the range forms equal the rows — a row
+  edit the derivation cannot express fails the build, never drifts.
+- **`pit_count`/`wall_count` generalized to exemption-class counts**:
+  maintained via the derived `flight_exempt`/`drill_exempt` predicates
+  (ground-blocking codes the class ignores). `has_pit`/`has_wall` keep
+  their names and their EXACT bb fast-path gating semantics: flyers
+  yield the wide-bitboard path when any flight-exempt terrain exists,
+  drillers when any drill-exempt terrain exists.
+- **The hazard hook is the on-land interpreter**: same call sites, same
+  quirks (castle rooks and resurrected pieces do not trigger; swap
+  bites caster then partner). The guard (`has_on_land`, derived
+  ranges) is now INLINE at the call sites — cheaper than Stage 2's
+  unconditional call — and the interpreter body (`land_hazard_interpret`,
+  gate → consumed → ops through the op log) is `#[cold]`/out-of-line.
+  On-land `HpAdd` carries the hazard floor-death rule (lethal at 0),
+  unlike the ability interpreter's generation-guarded `HpAdd`; the
+  gate check precedes `consumed`, so an owner crossing its own mine
+  spends nothing.
+- **Carry rules live in the rows**: the ice pass dispatches on
+  `Carry::Slide { riders_only }` (the rider-in-entry-direction rule is
+  row data, not a kind check) and slides across any `slides()` cell;
+  the belt pass on `Carry::Belt { dx, dy }` via `conv_dir`/`belts`.
+  The Stage-2 interleave rule (ice pass, then belt pass, no re-entry)
+  and all guards are unchanged.
+- **Concealment is row data at the SRW layer**: `masked_world` blanks
+  `OwnerSecret` terrain for non-owners, `srw_terrain_for` surfaces its
+  wire code only to the banded owner, and `concealed_by_grass` keys on
+  `Conceal::Standing` — no kind constants left in the FFI's masking.
+  `srw.rs` terrain parsing is `by_id` over the AUTHORABLE rows (the
+  absence row and owner-band rows excluded — mines are laid by the
+  ability), preserving the parser's exact acceptance set (unknown
+  kinds still default to wall).
+- **Ability targeting reads row properties**: bare-floor checks are
+  `is_bare` (the absence row), laser-vs-cover and `TerrainStep`
+  erosion are `is_block` (`tiers > 0`) with `erode` stepping down the
+  code-contiguous block band (debug-asserted contiguous).
+- **Perf**: interleaved A/B perft medians (release, user-CPU time,
+  12–16 pairs, base-vs-base control 0.997): chess d5 1.017×, xiangqi
+  d4 1.019×, shogi d4 1.000× — within the 3% gate. The residual is
+  layout-lottery (LTO + one codegen unit: ±2% swings were observed
+  from semantically identical formulations); the inline hazard guard
+  claws most of it back.

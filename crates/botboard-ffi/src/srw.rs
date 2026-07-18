@@ -74,12 +74,10 @@ use botboard_core::geometry::DirFilter;
 use botboard_core::ladder::{choose_move_traced, LadderConfig, LadderTrace, Rung};
 use botboard_core::movegen::{legal_moves, status, Status};
 use botboard_core::moves::{move_str, Effect, MoveKind, NO_SQ};
-use botboard_core::position::{
-    mine_owner, Loc, Position, T_ACID, T_BLOCK1, T_BLOCK2, T_BLOCK3, T_CONV_E, T_CONV_N,
-    T_CONV_S, T_CONV_W, T_GRASS, T_ICE, T_NONE, T_PIT, T_WALL,
-};
+use botboard_core::position::{mine_owner, Loc, Position, T_NONE, T_WALL};
 use botboard_core::rng::Rng;
 use botboard_core::search::Searcher;
+use botboard_core::terrain_defs::{self, Conceal};
 
 use crate::json::{parse, Json};
 use crate::write_str;
@@ -350,20 +348,11 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
                 return Err("terrain out of range".into());
             }
             let sq = g.board.sq(x, y) as usize;
-            let kind = match cj.str_or("kind", "wall") {
-                "pit" => T_PIT,
-                "ice" => T_ICE,
-                "grass" => T_GRASS,
-                "acid" => T_ACID,
-                "block1" => T_BLOCK1,
-                "block2" => T_BLOCK2,
-                "block3" => T_BLOCK3,
-                "conv_n" => T_CONV_N,
-                "conv_e" => T_CONV_E,
-                "conv_s" => T_CONV_S,
-                "conv_w" => T_CONV_W,
-                _ => T_WALL,
-            };
+            // Registry-id lookup (Bits 2.0 Stage 3): the row ids ARE the
+            // setup-JSON terrain kinds. Owner-band rows (mines) and the
+            // absence row are not authorable; unknown kinds keep the
+            // historical wall default.
+            let kind = terrain_defs::by_id(cj.str_or("kind", "wall")).unwrap_or(T_WALL);
             // Blocking terrain cannot share a cell with a piece; the
             // passable kinds (ice, grass, acid) are stood upon by design.
             if pos.board[sq] >= 0 && botboard_core::position::terrain_blocks(kind) {
@@ -482,10 +471,11 @@ impl SrwBattle {
             }
         }
         for sq in 0..world.terrain.len() {
-            if let Some(owner) = mine_owner(world.terrain[sq]) {
-                if owner != s {
-                    world.terrain[sq] = T_NONE;
-                }
+            // Owner-secret terrain (registry conceal row): invisible to
+            // everyone but its banded owner until it triggers.
+            let t = world.terrain[sq];
+            if terrain_defs::row(t).conceal == Conceal::OwnerSecret && mine_owner(t) != Some(s) {
+                world.terrain[sq] = T_NONE;
             }
         }
         world.rehash(&self.g);
@@ -499,7 +489,9 @@ impl SrwBattle {
     fn concealed_by_grass(&self, observer: Side, i: usize) -> bool {
         let p = self.pos.pieces[i];
         let Loc::Board(sq) = p.loc else { return false };
-        if p.side == observer || self.pos.terrain[sq as usize] != T_GRASS {
+        let standing_conceal =
+            terrain_defs::row(self.pos.terrain[sq as usize]).conceal == Conceal::Standing;
+        if p.side == observer || !standing_conceal {
             return false;
         }
         let (x, y) = self.g.board.xy(sq);
@@ -905,24 +897,11 @@ pub extern "C" fn srw_entropy(b: *mut SrwBattle, observer: c_int) -> f64 {
 
 /// Shared FFI terrain encoding: 0 none, 1 wall, 2 pit, 3 mine, 4 ice,
 /// 5 tall grass, 6 acid, 7/8/9 destructible block tier 1/2/3,
-/// 10/11/12/13 conveyor N/E/S/W (N = +y, side 0's forward).
+/// 10/11/12/13 conveyor N/E/S/W (N = +y, side 0's forward). The code IS
+/// the registry row's stable wire id (all four owner-band mine rows
+/// share code 3).
 fn terrain_code(t: u8) -> c_int {
-    match t {
-        T_WALL => 1,
-        T_PIT => 2,
-        T_ICE => 4,
-        T_GRASS => 5,
-        T_ACID => 6,
-        T_BLOCK1 => 7,
-        T_BLOCK2 => 8,
-        T_BLOCK3 => 9,
-        T_CONV_N => 10,
-        T_CONV_E => 11,
-        T_CONV_S => 12,
-        T_CONV_W => 13,
-        t if mine_owner(t).is_some() => 3,
-        _ => 0,
-    }
+    terrain_defs::row(t).code as c_int
 }
 
 /// Ground-truth terrain: 0 none, 1 wall, 2 pit, 3 mine, 4 ice,
@@ -939,15 +918,19 @@ pub extern "C" fn srw_terrain(b: *mut SrwBattle, sq: c_int) -> c_int {
 #[no_mangle]
 pub extern "C" fn srw_terrain_for(b: *mut SrwBattle, observer: c_int, sq: c_int) -> c_int {
     let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
-    b.pos.terrain.get(sq as usize).map_or(-2, |&t| match mine_owner(t) {
-        Some(owner) => {
-            if owner == observer as Side {
-                3
-            } else {
-                0
+    b.pos.terrain.get(sq as usize).map_or(-2, |&t| {
+        match terrain_defs::row(t).conceal {
+            // Owner-secret rows surface their wire code to the banded
+            // owner and bare floor to everyone else.
+            Conceal::OwnerSecret => {
+                if mine_owner(t) == Some(observer as Side) {
+                    terrain_code(t)
+                } else {
+                    0
+                }
             }
+            _ => terrain_code(t),
         }
-        None => terrain_code(t),
     })
 }
 
