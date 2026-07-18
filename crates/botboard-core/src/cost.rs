@@ -122,6 +122,14 @@ pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
     let mut s_flat = 0.0;
     for a in &ty.abilities {
         match a {
+            // Spec §4.1: a piercing beam prices ×1.3 — occupancy-blind rays
+            // reach targets the mobility integral's screens would hide.
+            crate::bits::AbilityBit::Laser { pierce: true, .. } => {
+                m_utility *= 1.3;
+                if let crate::bits::AbilityBit::Laser { retreat: true, .. } = a {
+                    s_nerfs += 0.5;
+                }
+            }
             crate::bits::AbilityBit::Laser { retreat: true, .. } => s_nerfs += 0.5,
             // Board-state-dependent abilities generate no moves on the
             // mobility-integral board, so they carry Appendix-B-style flat

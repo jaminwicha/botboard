@@ -684,3 +684,18 @@ fn emp_aura_suppresses_enemy_ability_bits() {
     );
 }
 
+
+#[test]
+fn piercing_prices_higher_than_plain_lasers() {
+    use botboard_core::cost::{cost_prior, CostWeights};
+    // Identical bots, one beam pierces: spec §4.1 says ×1.3.
+    let g = robot_game(vec![(KING, 0, 0, 0), (KING, 1, 7, 7)]);
+    let w = CostWeights { w_move: 0.35, w_attack: 0.35 };
+    let plain = cost_prior(&g, LASERBOT, &w);
+    let pierced = cost_prior(&g, PIERCER, &w);
+    // PIERCER also lacks the retreat nerf, so it must clear plain solidly.
+    assert!(
+        pierced > plain * 1.15,
+        "piercing must out-price plain: {pierced} vs {plain}"
+    );
+}
