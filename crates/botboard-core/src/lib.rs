@@ -21,6 +21,7 @@ pub mod game;
 pub mod geometry;
 pub mod ladder;
 pub mod league;
+pub mod move_defs;
 pub mod movegen;
 pub mod moves;
 pub mod nnue;

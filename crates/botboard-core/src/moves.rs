@@ -5,21 +5,32 @@ use crate::game::{GameDef, TypeId};
 
 pub const NO_SQ: u16 = u16::MAX;
 
+/// Display code: which stdlib move script (`move_defs`) generated this
+/// move. Bits 2.0 Stage 2 demoted this enum from a behavioral switch to a
+/// stable wire surface — the FFI kind codes (0–7) and notation are frozen
+/// on it, but make/unmake, legality, and search consult the script ROW
+/// (`move_defs::script(kind)` is the one surviving branch; everything
+/// downstream derives from the row's gates/binding/ops/derived classes).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MoveKind {
+    /// `move_defs::NORMAL` — the dominant kernel-landing script.
     Normal,
+    /// `move_defs::DOUBLE_STEP` — zone-gated two-step, lays the marker.
     DoubleStep,
+    /// `move_defs::EN_PASSANT` — capture onto the ephemeral marker.
     EnPassant,
+    /// `move_defs::CASTLE` — partner-binding two-piece compound.
     Castle,
+    /// `move_defs::DROP` — enter from the hand (source: Hand).
     Drop,
-    /// An Axis-B effect invoked as the turn's single action (§3.4).
+    /// `move_defs::ABILITY` — an Axis-B effect registry row invoked as
+    /// the turn's single action (§3.4); `effect` names the row.
     Ability,
-    /// A multi-step effect script generated as ONE move (§3.4): atomic,
-    /// piece-local. Overclock: from→to then to→aux, self −1 HP.
+    /// `move_defs::OVERCLOCK` — the sequenced multi-step compound
+    /// (§3.4): from→to then to→aux, self −1 HP.
     Compound,
-    /// Locust hop (§3.1 landing mode): capture the screen at `aux`, land
-    /// on the empty square `to` immediately beyond — en-passant-style
-    /// aux-victim machinery, checkers atom.
+    /// `move_defs::LOCUST` — capture the screen at `aux`, land on the
+    /// empty square `to` beyond (§3.1 landing mode, checkers atom).
     Locust,
 }
 

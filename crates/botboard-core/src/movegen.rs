@@ -1,15 +1,19 @@
 //! Move generation (§7.3) and legality.
 //!
-//! Pseudo-legal moves come from the compiled kernels plus the special-move
-//! generators (§3.3) and drops; legality is make → own-royal-safe → unmake,
-//! which also catches en-passant pins and xiangqi's facing generals. Drop
-//! legality runs the three tiers of §3.3: empty target, derivable
-//! can-act-from, and the named predicates (*nifu*, *uchifuzume*).
+//! Pseudo-legal moves come from the compiled kernels plus the compiled
+//! move-script references (Bits 2.0 Stage 2): specials and drops walk
+//! `move_defs` stdlib rows — origin gates interpreted as data, one
+//! hand-optimized walker per DERIVED generation shape, each parameterized
+//! by its row. Legality is make → own-royal-safe → unmake, which also
+//! catches en-passant pins and xiangqi's facing generals; drop legality
+//! runs the three tiers of §3.3 (empty target, derivable can-act-from,
+//! and the drop row's named predicate gates *nifu* / *uchifuzume*).
 
-use crate::bits::{AbilityBit, HopMode, SpecialBit, TargetPred};
-use crate::game::{GameDef, PromoTrigger, Side, StalematePolicy, TypeId};
+use crate::bits::{AbilityBit, HopMode, TargetPred};
+use crate::game::{Compiled, GameDef, PromoTrigger, Side, StalematePolicy, TypeId};
+use crate::move_defs::{Binding, Gate, GenShape, MoveScript, PartnerFlag};
 use crate::moves::{Effect, Move, MoveKind, NO_SQ};
-use crate::position::{Loc, Position};
+use crate::position::{hp_gate_ok, Loc, Piece, Position};
 
 /// Expand a landing into promotion variants per the type's promo rule.
 fn push_with_promo(
@@ -314,61 +318,33 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
         }
 
         gen_abilities(g, pos, p.t, from, &mut out);
-        if g.types[p.t as usize].overclock && pos.hp[pos.board[from as usize] as usize] > 1 {
-            gen_overclock(g, pos, from, &mut out);
-        }
-
-        for s in &g.types[p.t as usize].specials {
-            match s {
-                SpecialBit::DoubleStep { start_zone } => {
-                    if !g.zones[*start_zone].contains(stm, from) {
-                        continue;
-                    }
-                    let f = Position::forward(stm);
-                    let Some(mid) = g.board.offset(from, 0, f) else { continue };
-                    let Some(to) = g.board.offset(from, 0, 2 * f) else { continue };
-                    if !pos.cell_obstructed(mid) && !pos.cell_obstructed(to) {
-                        out.push(Move::special(from, to, MoveKind::DoubleStep, NO_SQ));
-                    }
-                }
-                SpecialBit::EnPassant => {
-                    if pos.ep == NO_SQ {
-                        continue;
-                    }
-                    let f = Position::forward(stm);
-                    for k in &ck.leaps {
-                        if !k.mode.can_capture() {
-                            continue;
-                        }
-                        if g.board.offset(from, k.d.dx, k.d.dy) == Some(pos.ep) {
-                            let victim = g.board.offset(pos.ep, 0, -f).unwrap();
-                            out.push(Move::special(from, pos.ep, MoveKind::EnPassant, victim));
-                        }
-                    }
-                }
-                SpecialBit::Castling => {
-                    if p.moved {
-                        continue;
-                    }
-                    gen_castles(g, pos, from, &mut out);
-                }
+        if let Some(oc) = &ck.overclock {
+            // The overclock row's HpBand gate (min 2: the compound's
+            // self −1 HP must not be lethal).
+            if oc.gates.pass(g, pos, from, p.moved, hp) {
+                gen_overclock(g, pos, from, &mut out);
             }
         }
+
+        gen_specials(g, pos, ck, p, from, hp, &mut out);
     }
 
-    // Drops (§3.3). Tier 1: empty target. Tier 2: the dropped piece must be
-    // able to act from the target. Tier 3 (*nifu*) here; *uchifuzume* needs
-    // make/unmake, so it lives in the legality filter.
+    // Drops — the compiled Drop script row (source: Hand). Tier 1: empty
+    // target. Tier 2: the dropped piece must be able to act from the
+    // target. Tier 3 is the row's NAMED gates: *nifu* (`NoDupFile`) walks
+    // the file here; *uchifuzume* (`NoDropMate`) needs make/unmake, so it
+    // is interpreted in the legality filter.
     for t in 0..g.types.len() as TypeId {
-        if pos.hands[stm as usize][t as usize] == 0 || !g.types[t as usize].droppable {
+        if pos.hands[stm as usize][t as usize] == 0 {
             continue;
         }
         let ck = g.compiled(t, stm);
+        let Some(dr) = &ck.drop else { continue };
         for sq in 0..g.board.ncells() as u16 {
             if pos.cell_obstructed(sq) || !ck.can_act_from[sq as usize] {
                 continue;
             }
-            if g.types[t as usize].drop_no_dup_file {
+            if dr.no_dup_file {
                 let (x, _) = g.board.xy(sq);
                 let dup = (0..g.board.h).any(|y| {
                     pos.piece_at(g.board.sq(x as u8, y))
@@ -460,59 +436,159 @@ fn first_screen_and_beyond(
     None
 }
 
-/// Standard castling: unmoved king + unmoved partner rook on the same rank,
-/// clear between, king's from/mid/dest squares unattacked.
-fn gen_castles(g: &GameDef, pos: &Position, ksq: u16, out: &mut Vec<Move>) {
+/// Special-move generation (§3.3): walk the type's compiled script
+/// references; check each row's compiled origin gates
+/// (`OriginGates::pass`), then run the walker for the row's derived
+/// generation shape — hand-optimized per shape, but parameterized by the
+/// row's data (step counts, gates, binding).
+#[inline]
+fn gen_specials(
+    g: &GameDef,
+    pos: &Position,
+    ck: &Compiled,
+    p: &Piece,
+    from: u16,
+    hp: i16,
+    out: &mut Vec<Move>,
+) {
+    let stm = pos.stm;
+    for sr in &ck.specials {
+        if !sr.gates.pass(g, pos, from, p.moved, hp) {
+            continue;
+        }
+        match sr.shape {
+            // Stepped quiet advance laying the ephemeral marker: walk
+            // `gen_steps` straight ahead (PathClear: every crossed
+            // square, and the quiet landing, unobstructed).
+            GenShape::TwoStepEphemeral => {
+                let f = Position::forward(stm);
+                let mut cur = from;
+                let mut open = true;
+                for _ in 0..sr.gen_steps {
+                    match g.board.offset(cur, 0, f) {
+                        Some(nx) if !pos.cell_obstructed(nx) => cur = nx,
+                        _ => {
+                            open = false;
+                            break;
+                        }
+                    }
+                }
+                if open {
+                    out.push(Move::special(from, cur, sr.kind, NO_SQ));
+                }
+            }
+            // Capture onto the live marker (`EphemeralMatch` held at the
+            // origin gates): any capture-capable leap kernel reaching the
+            // marker fires; the aux victim is the passed-over pawn.
+            GenShape::EphemeralCapture => {
+                let f = Position::forward(stm);
+                for k in &ck.leaps {
+                    if !k.mode.can_capture() {
+                        continue;
+                    }
+                    if g.board.offset(from, k.d.dx, k.d.dy) == Some(pos.ep) {
+                        let victim = g.board.offset(pos.ep, 0, -f).unwrap();
+                        out.push(Move::special(from, pos.ep, sr.kind, victim));
+                    }
+                }
+            }
+            GenShape::PartnerCompound => gen_partner_compound(g, pos, sr.script, from, out),
+        }
+    }
+}
+
+/// Two-piece compound over a partner binding (castle): select the
+/// partner per the binding row (type flag, same rank, unmoved), then
+/// interpret the PathClear gate (squares strictly between actor and
+/// partner), the actor's `gen_steps` travel with its crossing/landing
+/// occupancy rules, and the PathSafe gate (origin, crossings, landing
+/// unattacked).
+fn gen_partner_compound(
+    g: &GameDef,
+    pos: &Position,
+    sc: &'static MoveScript,
+    ksq: u16,
+    out: &mut Vec<Move>,
+) {
+    let Binding::Partner { flag, same_rank, unmoved } = sc.binding else {
+        return;
+    };
+    let path_clear = sc.has_gate(Gate::PathClear);
+    let path_safe = sc.has_gate(Gate::PathSafe);
     let stm = pos.stm;
     let enemy = (stm + 1) % g.sides;
     let ky = g.board.xy(ksq).1;
     for r in &pos.pieces {
         let Loc::Board(rsq) = r.loc else { continue };
-        if r.side != stm || r.moved || !g.types[r.t as usize].castle_partner {
+        if r.side != stm
+            || (unmoved && r.moved)
+            || !match flag {
+                PartnerFlag::CastlePartner => g.types[r.t as usize].castle_partner,
+            }
+        {
             continue;
         }
-        let ry = g.board.xy(rsq).1;
-        if ry != ky {
+        if same_rank && g.board.xy(rsq).1 != ky {
             continue;
         }
         let dir: i8 = if rsq > ksq { 1 } else { -1 };
-        let mut clear = true;
-        let mut cur = ksq;
-        loop {
-            cur = g.board.offset(cur, dir, 0).unwrap();
-            if cur == rsq {
-                break;
+        if path_clear {
+            // Squares strictly between actor and partner unobstructed.
+            let mut clear = true;
+            let mut cur = ksq;
+            loop {
+                cur = g.board.offset(cur, dir, 0).unwrap();
+                if cur == rsq {
+                    break;
+                }
+                if pos.cell_obstructed(cur) {
+                    clear = false;
+                    break;
+                }
             }
-            if pos.cell_obstructed(cur) {
-                clear = false;
-                break;
+            if !clear {
+                continue;
             }
         }
-        if !clear {
-            continue;
-        }
-        let mid = (ksq as i32 + dir as i32) as u16;
-        let dest = (ksq as i32 + 2 * dir as i32) as u16;
-        // The king's crossing and landing squares must be free (the rook's
-        // own square counts as free for `mid` — it vacates). With standard
-        // rook placement the between-check already covers these; arbitrary
-        // Bit-worlds can put an unmoved partner adjacent to the king.
+        // The actor travels `gen_steps` toward the partner; the partner
+        // lands on the midpoint (the row's `Relocate(Aux→Mid)` op). The
+        // crossing and landing squares must be free (the partner's own
+        // square counts as free — it vacates). With standard placement
+        // the between-check already covers these; arbitrary Bit-worlds
+        // can put an unmoved partner adjacent to the actor.
+        let dest = (ksq as i32 + sc.gen_steps as i32 * dir as i32) as u16;
         if dest == rsq {
             continue;
         }
-        if (pos.board[mid as usize] >= 0 && mid != rsq) || !pos.terrain_open(mid) {
+        let mut open = true;
+        for i in 1..sc.gen_steps {
+            let c = (ksq as i32 + i as i32 * dir as i32) as u16;
+            if (pos.board[c as usize] >= 0 && c != rsq) || !pos.terrain_open(c) {
+                open = false;
+                break;
+            }
+        }
+        if !open {
             continue;
         }
         if pos.board[dest as usize] >= 0 || !pos.terrain_open(dest) {
             continue;
         }
-        if pos.is_attacked(g, ksq, enemy)
-            || pos.is_attacked(g, mid, enemy)
-            || pos.is_attacked(g, dest, enemy)
-        {
-            continue;
+        if path_safe {
+            // Origin, crossings, landing: none may be attacked.
+            let mut safe = !pos.is_attacked(g, ksq, enemy);
+            for i in 1..=sc.gen_steps {
+                if !safe {
+                    break;
+                }
+                let c = (ksq as i32 + i as i32 * dir as i32) as u16;
+                safe = !pos.is_attacked(g, c, enemy);
+            }
+            if !safe {
+                continue;
+            }
         }
-        out.push(Move::special(ksq, dest, MoveKind::Castle, rsq));
+        out.push(Move::special(ksq, dest, sc.kind, rsq));
     }
 }
 
@@ -667,13 +743,16 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
             AbilityBit::Hack { range } => {
                 // The target predicate (§7 hack): a non-royal enemy at
                 // exactly 1 HP in range — flip it, deterministically.
+                // The HP check is the row's `HpEq1` pred, evaluated via
+                // the same hp-band predicate the kernel and script
+                // `HpBand` gates use (band [1, 1]).
                 for p in &pos.pieces {
                     let Loc::Board(sq) = p.loc else { continue };
                     if p.side == stm || g.types[p.t as usize].royal {
                         continue;
                     }
                     let idx = pos.board[sq as usize] as usize;
-                    if pos.hp[idx] != 1 {
+                    if !hp_gate_ok(1, 1, pos.hp[idx]) {
                         continue;
                     }
                     let (x, y) = g.board.xy(sq);
@@ -929,12 +1008,16 @@ fn pseudo_kernel_moves_of(g: &GameDef, pos: &Position, from: u16) -> Vec<Move> {
     out
 }
 
-/// Full legality: make, verify own royal safety, apply *uchifuzume*, unmake.
+/// Full legality: make, verify own royal safety, interpret the named
+/// `NoDropMate` gate (*uchifuzume*) from the generating script row, unmake.
 pub fn is_legal(g: &GameDef, pos: &mut Position, mv: &Move) -> bool {
     let mover = pos.stm;
     let u = pos.make(g, mv);
     let mut ok = !pos.royal_attacked(g, mover);
-    if ok && mv.kind == MoveKind::Drop && g.types[mv.drop_type as usize].drop_no_mate {
+    if ok
+        && g.types[mv.drop_type as usize].drop_no_mate
+        && crate::move_defs::script(mv.kind).has_gate(Gate::NoDropMate)
+    {
         let enemy = pos.stm;
         if pos.royal_attacked(g, enemy) && !has_any_legal(g, pos) {
             ok = false;

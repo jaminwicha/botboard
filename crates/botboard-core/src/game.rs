@@ -351,6 +351,15 @@ pub struct Compiled {
     /// Per square: could this type ever act from here on an empty board?
     /// Drives drop legality tier 2 and forced-if-immobile promotion.
     pub can_act_from: Vec<bool>,
+    /// Stage 2: the type's `SpecialBit`s compiled into stdlib move-script
+    /// references (gates/bindings/ops as data) — resolved once, like
+    /// kernels; movegen's special walkers are driven by these rows.
+    pub specials: Vec<crate::move_defs::SpecialRef>,
+    /// Drop script reference (source: Hand) with the type's named-gate
+    /// participation flags, when the type is droppable.
+    pub drop: Option<crate::move_defs::DropRef>,
+    /// Overclock compound script reference (HP-band gate on the row).
+    pub overclock: Option<crate::move_defs::ScriptRef>,
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +555,19 @@ impl GameDef {
             ck.leap_plain = vec![false; ck.leaps.len()];
             ck.ride_plain = vec![false; ck.rides.len()];
         }
+
+        // Stage-2 script references: specials, drops, and the overclock
+        // compound resolve to stdlib move-script rows once (promotion
+        // stays the type's zone-gated `PromoRule`, applied as an appended
+        // `TransformType` op by the generation-side promo expansion).
+        let ty = &self.types[t as usize];
+        ck.specials = ty.specials.iter().map(crate::move_defs::compile_special).collect();
+        ck.drop = ty.droppable.then(|| crate::move_defs::DropRef {
+            script: &crate::move_defs::DROP,
+            no_dup_file: ty.drop_no_dup_file,
+            no_mate: ty.drop_no_mate,
+        });
+        ck.overclock = ty.overclock.then(crate::move_defs::compile_overclock);
 
         // Reachability on an empty board. Hoppers need a screen, so they
         // cannot contribute here.

@@ -50,13 +50,16 @@ impl PolicyHead {
     }
 
     fn feature_class(pos: &Position, mv: &Move) -> usize {
-        use crate::moves::MoveKind;
-        match mv.kind {
-            MoveKind::Ability | MoveKind::Compound => 2,
-            // A locust hop captures its screen even though `to` is empty.
-            MoveKind::Locust => 1,
-            _ if pos.piece_at(mv.to).is_some() => 1,
-            _ => 0,
+        // Derived from the generating script row: effectful rows
+        // (ability/compound), then the capture classes (aux-victim
+        // locusts capture their screen even though `to` is empty).
+        let sc = crate::move_defs::script(mv.kind);
+        if sc.effectful {
+            2
+        } else if sc.capture_class || pos.piece_at(mv.to).is_some() {
+            1
+        } else {
+            0
         }
     }
 

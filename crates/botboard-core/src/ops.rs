@@ -29,11 +29,15 @@
 //!                     `Relocate`s): a sequential decomposition would need
 //!                     a temp square mid-transaction.
 //!
-//! `TransformType` (promotion) exists as an undo record
-//! (`OpUndo::Transformed`) fused into the fast path's relocate bracket;
-//! `SetEphemeral` remains the make-prologue `prior_ep` snapshot. Both
-//! become standalone interpreted ops when move kinds turn into stdlib
-//! scripts (Stage 2).
+//! Stage 2 promoted the last two deviations to first-class ops:
+//! - `SetEphemeral`    lay the one-ply marker (en-passant square) the
+//!                     `EphemeralMatch`-gated scripts consume; the
+//!                     make-prologue clear logs the same `Ephemeral`
+//!                     undo record (no move-level snapshot remains)
+//! - `TransformType`   promotion/demotion as an interpreted op; the
+//!                     dominant-script fast path still fuses it into the
+//!                     mover's relocate bracket (`op_relocate_promo`) —
+//!                     identical final hash, one bracket per plain move
 
 use crate::game::{GameDef, Side, TypeId};
 use crate::moves::NO_SQ;
@@ -47,6 +51,10 @@ pub enum SqRef {
     From,
     To,
     Aux,
+    /// Midpoint of `from` and `to` — exact on a rectangular board whenever
+    /// the two share a rank (castle rook destination) or a file two ranks
+    /// apart (the double-step's passed-over square).
+    Mid,
 }
 
 /// Source pool for `PlaceFrom` (§3.2 capture fate, §7 resurrect).
@@ -91,8 +99,10 @@ pub enum MicroOp {
     /// HP > 1 loses 1 HP and stays; HP 1 falls per the capture fate.
     /// No-op when `at` is empty.
     CaptureAt { at: SqRef },
-    /// Enter the board at the move's `to` from a source pool.
-    PlaceFrom { pool: Pool },
+    /// Enter the board at the move's `to` from a source pool. `hazard`
+    /// runs the landing-hazard hook: drops spring mines, resurrected
+    /// pieces do not (the Stage-1 behavior quirks, preserved as data).
+    PlaceFrom { pool: Pool, hazard: bool },
     /// Add HP to the occupant of the move's `to`; `cap` clamps at the
     /// target type's max (heal never overfills). Stage-1 users never
     /// drive HP to 0 through this op (generation guards it), so
@@ -110,6 +120,16 @@ pub enum MicroOp {
     /// Exchange the caster (at `from`) with the piece at `to`; both
     /// relocations are landings, so hazards bite both (caster first).
     SwapWithCaster,
+    /// Set the ephemeral one-ply marker (the en-passant square) at `at`
+    /// — the state `EphemeralMatch`-gated scripts consume. First-class
+    /// as of Stage 2: the make-prologue clear and this producer both log
+    /// `OpUndo::Ephemeral` records instead of a move-level snapshot.
+    SetEphemeral { at: SqRef },
+    /// Promotion/demotion: re-type the occupant of the move's `to` to the
+    /// move's carried promotion type. First-class as of Stage 2; the
+    /// dominant-script fast path still fuses it into the mover's relocate
+    /// bracket (`op_relocate_promo`) — same final hash, one bracket.
+    TransformType,
 }
 
 /// Move-derived context the interpreter resolves op parameters against.
@@ -123,6 +143,8 @@ pub struct OpCtx {
     pub side: Side,
     /// Named type for `PlaceFrom` (drop or resurrect target type).
     pub drop_type: TypeId,
+    /// Promotion target for `TransformType` (the move's `promo` field).
+    pub promo: Option<TypeId>,
 }
 
 /// Exact-undo record for one applied micro-op. Reverting a move replays
@@ -155,6 +177,11 @@ pub enum OpUndo {
     /// Killed by a landing hazard on `sq`: back from the crater (HP was
     /// already 1 and is unchanged; the spent mine is its own record).
     HazardDeath { i: u32, sq: u16 },
+    /// The ephemeral marker (en-passant square) changed: restore the
+    /// prior value. Logged by the make-prologue clear and by the
+    /// `SetEphemeral` producer (Stage 2 — the move-level `prior_ep`
+    /// snapshot folded into the op log).
+    Ephemeral { prior: u16 },
 }
 
 const FILL: OpUndo = OpUndo::Hp { i: 0, prior: 0 };
@@ -210,12 +237,16 @@ impl Default for OpLog {
 // ---------------------------------------------------------------------------
 
 impl Position {
-    /// Interpret one registry op against the move context.
+    /// Interpret one registry op against the move context. `inline` so
+    /// call sites with a CONSTANT op (the unrolled row-wrapper loops)
+    /// fold the match down to the single live arm.
+    #[inline]
     pub(crate) fn apply_op(&mut self, g: &GameDef, op: &MicroOp, ctx: &OpCtx, log: &mut OpLog) {
         let sq = |r: SqRef| match r {
             SqRef::From => ctx.from,
             SqRef::To => ctx.to,
             SqRef::Aux => ctx.aux,
+            SqRef::Mid => (ctx.from + ctx.to) / 2,
         };
         match *op {
             MicroOp::Relocate { who, dest, hazard } => {
@@ -232,26 +263,33 @@ impl Position {
             MicroOp::CaptureAt { at } => {
                 self.op_capture_at(g, sq(at), log);
             }
-            MicroOp::PlaceFrom { pool } => match pool {
-                Pool::Dead => {
-                    let ri = self
-                        .pieces
-                        .iter()
-                        .position(|p| {
-                            p.side == ctx.side && p.t == ctx.drop_type && p.loc == Loc::Dead
-                        })
-                        .expect("resurrect with no dead piece of that type");
-                    self.op_place_from_dead(g, ri, ctx.to, log);
+            MicroOp::PlaceFrom { pool, hazard } => {
+                let i = match pool {
+                    Pool::Dead => {
+                        let ri = self
+                            .pieces
+                            .iter()
+                            .position(|p| {
+                                p.side == ctx.side && p.t == ctx.drop_type && p.loc == Loc::Dead
+                            })
+                            .expect("resurrect with no dead piece of that type");
+                        self.op_place_from_dead(g, ri, ctx.to, log);
+                        ri
+                    }
+                    Pool::Hand => {
+                        let i = self
+                            .pieces
+                            .iter()
+                            .position(|p| p.loc == Loc::Hand(ctx.side) && p.t == ctx.drop_type)
+                            .expect("drop with empty hand");
+                        self.op_place_from_hand(g, i, ctx.to, log);
+                        i
+                    }
+                };
+                if hazard {
+                    self.hazard_landing(g, i, log);
                 }
-                Pool::Hand => {
-                    let i = self
-                        .pieces
-                        .iter()
-                        .position(|p| p.loc == Loc::Hand(ctx.side) && p.t == ctx.drop_type)
-                        .expect("drop with empty hand");
-                    self.op_place_from_hand(g, i, ctx.to, log);
-                }
-            },
+            }
             MicroOp::HpAdd { n, cap } => {
                 let i = self.board[ctx.to as usize] as usize;
                 let amt = match n {
@@ -278,12 +316,21 @@ impl Position {
                 self.hazard_landing(g, a, log);
                 self.hazard_landing(g, b, log);
             }
+            MicroOp::SetEphemeral { at } => self.op_set_ephemeral(g, sq(at), log),
+            MicroOp::TransformType => {
+                let i = self.board[ctx.to as usize] as usize;
+                let pt = ctx.promo.expect("TransformType with no promotion type on the move");
+                self.op_transform_type(g, i, pt, log);
+            }
         }
     }
 
     /// Exactly invert one op record. Each revert reads the piece's
     /// CURRENT location, so reverse-order replay is robust to later ops
     /// (already reverted) having moved or killed the same piece.
+    /// `inline(always)`: unmake's replay loop must absorb this whole
+    /// match (an out-of-line call per record measurably stalls unmake).
+    #[inline(always)]
     pub(crate) fn revert_op(&mut self, u: &OpUndo) {
         match *u {
             OpUndo::Moved { i, from, prior_moved } => {
@@ -348,6 +395,7 @@ impl Position {
                 self.pieces[b].moved = bm;
             }
             OpUndo::HazardDeath { i, sq } => self.place(i as usize, sq),
+            OpUndo::Ephemeral { prior } => self.ep = prior,
         }
     }
 
@@ -520,6 +568,41 @@ impl Position {
         self.pieces[b].moved = true;
         self.xor_piece(g, a);
         self.xor_piece(g, b);
+    }
+
+    /// Make-prologue half of the ephemeral-marker discipline: an expiring
+    /// marker (set exactly one ply ago) is cleared before the move's
+    /// script runs. No-op when no marker is live — the dominant script's
+    /// op log stays at its Stage-1 length on the hot path.
+    #[inline]
+    pub(crate) fn op_clear_ephemeral(&mut self, g: &GameDef, log: &mut OpLog) {
+        if self.ep == NO_SQ {
+            return;
+        }
+        log.push(OpUndo::Ephemeral { prior: self.ep });
+        self.hash ^= g.zobrist.ep_key(self.ep);
+        self.ep = NO_SQ;
+    }
+
+    /// Producer half (`SetEphemeral`): lay the one-ply marker at `sq`
+    /// inside its own hash bracket. `ep_key(NO_SQ)` is 0, so the bracket
+    /// pairs correctly whatever the prior state.
+    #[inline]
+    pub(crate) fn op_set_ephemeral(&mut self, g: &GameDef, sq: u16, log: &mut OpLog) {
+        log.push(OpUndo::Ephemeral { prior: self.ep });
+        self.hash ^= g.zobrist.ep_key(self.ep);
+        self.ep = sq;
+        self.hash ^= g.zobrist.ep_key(self.ep);
+    }
+
+    /// Standalone `TransformType`: re-type piece `i` inside its own hash
+    /// bracket. The fast path prefers the fused `op_relocate_promo` (one
+    /// bracket for relocate + transform — identical final hash).
+    pub(crate) fn op_transform_type(&mut self, g: &GameDef, i: usize, t: TypeId, log: &mut OpLog) {
+        log.push(OpUndo::Transformed { i: i as u32, prior_t: self.pieces[i].t });
+        self.xor_piece(g, i);
+        self.pieces[i].t = t;
+        self.xor_piece(g, i);
     }
 
     /// Landing hazards (SRW Appendix B): spring an enemy mine (spent on

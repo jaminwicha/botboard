@@ -12,8 +12,10 @@
 //!   it ([`row`] maps it 1:1); per-move parameters ride on the move
 //!   (heal amount in `Effect::Heal(n)`, retreat square in `aux`,
 //!   revived type in `drop_type`).
-//! - `Selector` rows document each ability's target shape; movegen still
-//!   walks its own per-kind arms until generation unifies (Stage 2).
+//! - `Selector` rows document each ability's target shape; movegen's
+//!   per-kind ability arms remain hand-shaped but share the Stage-2 gate
+//!   vocabulary's predicates where they overlap (HP bands via
+//!   `hp_gate_ok`); move SPECIALS generate from `move_defs` script rows.
 //! - `CostHint`/`descriptor_slot` mirror the numbers cost.rs and nnue.rs
 //!   use today; those modules stay authoritative until Stage 2 reads the
 //!   registry instead.
@@ -174,7 +176,7 @@ pub static REZ: AbilityDef = AbilityDef {
         reach: Reach::Point,
         preds: &[Pred::NonRoyal, Pred::OpenLanding],
     },
-    ops: &[MicroOp::PlaceFrom { pool: Pool::Dead }],
+    ops: &[MicroOp::PlaceFrom { pool: Pool::Dead, hazard: false }],
     self_ops: &[],
     cost: CostHint { flat: 4.0, mult: 1.0 },
     descriptor_slot: 14,

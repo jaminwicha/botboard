@@ -192,3 +192,87 @@ Deviations from the design table above:
   scripts), so the dominant script never allocates; measured perft is
   slightly *faster* than pre-refactor (interleaved A/B, chess/xiangqi/
   shogi all within +2–3%).
+
+## Stage 2 as built (July 2026) — deviations and notes
+
+Landed in `move_defs.rs` (the move-script registry) plus restructures of
+`movegen.rs` (generation walks compiled script references), `game.rs`
+(the compile step resolves them), and `position.rs`/`ops.rs` (make is
+one script selection; `SetEphemeral`/`TransformType` are first-class
+ops). Strictly behavior-preserving: every suite bit-identical, deep
+perft trio exact, selfplay traces identical.
+
+**The vocabulary as built.** `Gate` = Zone (id resolved at compile from
+the authoring bit), HpBand{min,max} (shared `hp_gate_ok`, the kernels'
+HP-gate predicate), MovedFlag{must_be_unmoved}, EphemeralMatch,
+PathClear, PathSafe, ScreenRule (realized by the compiled hop kernels;
+listed on the locust row for vocabulary completeness), and the two
+NAMED predicates NoDupFile (*nifu*, generation-time file walk) and
+NoDropMate (*uchifuzume*, interpreted in the legality filter — it needs
+make/unmake). `Binding` = Partner{flag: CastlePartner, same_rank,
+unmoved}; the selected partner's square rides `aux`. `Source` = Board |
+Hand | DeadPool (resurrect's ability row shares the vocabulary).
+
+**Script rows.** NORMAL `[CaptureAt(To), Relocate(From→To)]`;
+DOUBLE_STEP {gates [Zone, PathClear], ops [Relocate, SetEphemeral(Mid)],
+gen_steps 2}; EN_PASSANT {gates [EphemeralMatch], ops [CaptureAt(Aux),
+Relocate]}; CASTLE {binding Partner, gates [MovedFlag, PathClear,
+PathSafe], ops [Relocate(self, 2 toward partner),
+Relocate(partner, Mid)], gen_steps 2}; DROP {source Hand, gates
+[NoDupFile, NoDropMate], ops [PlaceFrom(Hand)]}; LOCUST (the ep op
+script, hop-targeted); ABILITY (delegates to the effect registry row);
+OVERCLOCK {gates [HpBand min 2], sequenced two kernel steps +
+HpAdd(−1) self}. `SqRef::Mid` (midpoint of from/to) covers both the
+castle rook's landing and the double-step's marker square exactly.
+
+Deviations and notes:
+
+- **Promotion is not a row**: it stays the type's zone-gated
+  `PromoRule`, applied as a `TransformType` op APPENDED to the
+  generating mover script (movegen's promo expansion), and fused into
+  the relocate bracket on the fast path — identical final hash, one
+  bracket. `TransformType` and `SetEphemeral` are now first-class
+  interpreted ops (the Stage-1 deviations closed); the make-prologue ep
+  snapshot folded into the op log as `OpUndo::Ephemeral` records
+  (`Undo` is now `{op log, prior_hash}` — no move-level state snapshot
+  remains).
+- **Generation shape is DERIVED, not authored**: `GenShape` (partner
+  compound / ephemeral capture / two-step producer) is computed at
+  compile time from the row's binding/gates/ops. Each shape keeps one
+  hand-optimized walker (the castle between-squares walk, the ep
+  kernel match), parameterized by the row — step counts, gate lists,
+  binding fields — never hard-coded constants.
+- **Compile step**: `Compiled` gains `specials: Vec<SpecialRef>`,
+  `drop: Option<DropRef>`, `overclock: Option<ScriptRef>`. Origin
+  gates fold into `OriginGates` — a compact straight-line-checkable
+  form (like kernels: interpret the gate list once at compile, not per
+  node). No allocation on the generation or apply hot paths.
+- **MoveKind demoted to a display code**: the enum and its wire values
+  (FFI kind codes 0–7, notation) are frozen; its only behavioral role
+  is `move_defs::script(kind)` / `apply_script`, the single kind→row
+  selection. Make/unmake interpret the row (`ApplyShape`); search's
+  quiet/capture classes are row-derived (`is_quiet`,
+  `counts_as_capture`, `capture_class`, `effectful`); is_legal
+  interprets the row's NoDropMate gate; belief's drop check reads the
+  row's `source`.
+- **En passant deliberately keeps `capture_class: false`**: Stage-1
+  search treated ep as quiet (dest-empty) for LMR/qsearch — a
+  preserved, documented quirk, now explicit row data instead of an
+  accident of the kind allowlist. Locust sets it true.
+- **The fast path survives as row data**: `ApplyShape::Mover{victim,
+  strike_stops_mover, trailing}` parameterizes the dominant
+  non-interpreted path (strike-or-kill at the row's victim square,
+  relocate+promo in one bracket, hazards, trailing ops). Each row
+  carries an `apply_fn` whose body destructures its OWN static row, so
+  the compiler constant-folds the parameters into a specialized body —
+  `apply_script` jump-threads the kind branch to those entries and the
+  dominant script keeps Stage-1 codegen (a plain indirect
+  `apply_fn` call measurably stalled the pipeline; so did letting the
+  out-of-line `revert_op` call survive in unmake — both are
+  inline-always now).
+- **Perf**: interleaved balanced A/B perft medians (release, 16 runs
+  each side): chess d5 0.974×, xiangqi d4 1.010×, shogi d4 1.002× —
+  within the 3% gate. Hardware counters on chess d5: instructions
+  +0.11%, cycles +2.7% (the residual is the mandated ephemeral-marker
+  op-log records ≈0.6% plus dispatch/layout stalls; xiangqi and shogi
+  are at parity or faster).

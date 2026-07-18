@@ -16,7 +16,7 @@
 //! with the full recompute after every make.
 
 use crate::game::{GameDef, Side, TypeId};
-use crate::moves::{Effect, Move, MoveKind, NO_SQ};
+use crate::moves::{Effect, Move, NO_SQ};
 use crate::ops::{OpCtx, OpLog};
 
 pub const T_NONE: u8 = 0;
@@ -139,14 +139,14 @@ pub struct Position {
     wide: bool,
 }
 
-/// Per-move undo: the micro-op log (Bits 2.0 Stage 1 — every mutation a
-/// move makes is an op record in application order; unmake replays it
-/// backwards) plus the O(1) move-level snapshots. The old special-purpose
-/// records (captured/partner/revived/hacked/hp_changes/terrain_changes/
-/// mine_deaths) folded 1:1 into `crate::ops::OpUndo` variants.
+/// Per-move undo: the micro-op log (Bits 2.0 — every mutation a move
+/// makes is an op record in application order; unmake replays it
+/// backwards) plus the O(1) hash snapshot. Stage 2 folded the last
+/// move-level state snapshot (`prior_ep`) into the log as
+/// `OpUndo::Ephemeral` records (the prologue clear and the
+/// `SetEphemeral` producer both push one).
 pub struct Undo {
     ops: OpLog,
-    prior_ep: u16,
     prior_hash: u64,
 }
 
@@ -421,120 +421,124 @@ impl Position {
         u
     }
 
-    /// One move = one op script (Bits 2.0 Stage 1). The dominant script
-    /// `[Relocate(+CaptureAt(victim))]` — plain moves, promotions, en
-    /// passant, locust, castle — keeps a specialized non-interpreted
-    /// path; abilities run ONE interpreter loop over their registry row
-    /// (no per-effect match); drops and compounds call the same shared
-    /// ops directly. Every mutation lands in the op log in application
-    /// order, hash-bracketed inside the op.
+    /// One move = one stdlib script (Bits 2.0 Stage 2). The one
+    /// `MoveKind` branch is the script lookup; everything after is
+    /// driven by the row's data. The dominant Mover shape
+    /// `[CaptureAt(victim), Relocate(+TransformType)]` keeps its
+    /// specialized non-interpreted path parameterized by the row
+    /// (victim square, strike rule, trailing ops); abilities interpret
+    /// their effect registry row; drops interpret the drop row's ops;
+    /// the overclock keeps its kill-conditional sequencing. Every
+    /// mutation lands in the op log in application order,
+    /// hash-bracketed inside the op.
     fn make_impl(&mut self, g: &GameDef, mv: &Move) -> Undo {
-        let mut u = Undo { ops: OpLog::new(), prior_ep: self.ep, prior_hash: self.hash };
-        self.hash ^= g.zobrist.ep_key(self.ep);
-        self.ep = NO_SQ;
-
-        match mv.kind {
-            MoveKind::Drop => {
-                // PlaceFrom(hand): the same source-pool op resurrect
-                // flows through with the dead pool.
-                let idx = self
-                    .pieces
-                    .iter()
-                    .position(|p| p.loc == Loc::Hand(self.stm) && p.t == mv.drop_type)
-                    .expect("drop with empty hand");
-                self.op_place_from_hand(g, idx, mv.to, &mut u.ops);
-                self.hazard_landing(g, idx, &mut u.ops);
-            }
-            MoveKind::Ability => {
-                // The interpreter: the effect's registry row, target ops
-                // then self ops, each hash-bracketed with exact undo.
-                let row = crate::effects::row(mv.effect);
-                let ctx = OpCtx {
-                    from: mv.from,
-                    to: mv.to,
-                    aux: mv.aux,
-                    amount: match mv.effect {
-                        Effect::Heal(n) => n,
-                        _ => 0,
-                    },
-                    side: self.stm,
-                    drop_type: mv.drop_type,
-                };
-                for op in row.ops {
-                    self.apply_op(g, op, &ctx, &mut u.ops);
-                }
-                for op in row.self_ops {
-                    self.apply_op(g, op, &ctx, &mut u.ops);
-                }
-            }
-            MoveKind::Compound => {
-                // Overclock ⟨move, move, self −1 HP⟩ (§3.4): step 1 is a
-                // non-capture move from→to; step 2 to→aux may capture or
-                // strike (a strike leaves the mover on `to`).
-                let mi = self.board[mv.from as usize] as usize;
-                self.op_relocate(g, mi, mv.to, &mut u.ops);
-                let killed2 = self.op_capture_at(g, mv.aux, &mut u.ops);
-                if killed2 || self.board[mv.aux as usize] < 0 {
-                    self.op_relocate(g, mi, mv.aux, &mut u.ops);
-                }
-                self.op_hp_add(g, mi, -1, false, &mut u.ops);
-                self.hazard_landing(g, mi, &mut u.ops);
-            }
-            _ => {
-                // Fast path. Aux-victim moves (en passant, locust hop)
-                // hit the screen square, not the landing square — the
-                // same CaptureAt(aux) op either way.
-                let mi = self.board[mv.from as usize] as usize;
-                let victim_sq = if matches!(mv.kind, MoveKind::EnPassant | MoveKind::Locust) {
-                    mv.aux
-                } else {
-                    mv.to
-                };
-                let mut moved_to_dest = true;
-                if mv.kind != MoveKind::Castle && self.board[victim_sq as usize] >= 0 {
-                    let killed = self.op_capture_at(g, victim_sq, &mut u.ops);
-                    if !killed && (victim_sq == mv.to || mv.kind == MoveKind::Locust) {
-                        // Strike on an armored piece: the attacker stays
-                        // put. A locust striking an armored screen chips
-                        // it at range and does not leap.
-                        moved_to_dest = false;
-                    }
-                }
-                if moved_to_dest {
-                    self.op_relocate_promo(g, mi, mv.to, mv.promo, &mut u.ops);
-                }
-                self.hazard_landing(g, mi, &mut u.ops);
-                match mv.kind {
-                    MoveKind::DoubleStep => {
-                        // The SetEphemeral producer; its undo rides the
-                        // move-level prior_ep snapshot.
-                        let (x, y1) = g.board.xy(mv.from);
-                        let (_, y2) = g.board.xy(mv.to);
-                        self.ep = g.board.sq(x as u8, ((y1 + y2) / 2) as u8);
-                        self.hash ^= g.zobrist.ep_key(self.ep);
-                    }
-                    MoveKind::Castle => {
-                        // Partner relocation: the same op the swap and
-                        // push partners flow through.
-                        let ri = self.board[mv.aux as usize] as usize;
-                        let rook_to = (mv.from + mv.to) / 2;
-                        self.op_relocate(g, ri, rook_to, &mut u.ops);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
+        let mut u = Undo { ops: OpLog::new(), prior_hash: self.hash };
+        // Expire the ephemeral marker (logged, not snapshotted).
+        self.op_clear_ephemeral(g, &mut u.ops);
+        // Select the script (the ONE MoveKind branch, jump-threaded to
+        // each row's constant-folded entry point) and apply it — no
+        // further branching on the kind anywhere in make/unmake.
+        crate::move_defs::apply_script(self, g, mv, &mut u.ops);
         self.advance_stm(g);
         u
     }
 
+    /// The dominant Mover shape, parameterized by the row: optional
+    /// `CaptureAt(victim)` (aux for the ep/locust scripts, dest
+    /// otherwise; none for castle) with the row's strike rule — a strike
+    /// on an armored victim leaves the mover in place when the row says
+    /// so — then `Relocate(From→To)` with any promotion (the appended
+    /// `TransformType` op) fused into the same bracket, the
+    /// landing-hazard hook, and the row's trailing ops (the double-step's
+    /// `SetEphemeral(mid)`, the castle's partner relocation).
+    #[inline(always)]
+    pub(crate) fn mover_apply(
+        &mut self,
+        g: &GameDef,
+        mv: &Move,
+        victim: Option<crate::ops::SqRef>,
+        strike_stops_mover: bool,
+        trailing: &[crate::ops::MicroOp],
+        log: &mut OpLog,
+    ) {
+        let mi = self.board[mv.from as usize] as usize;
+        let mut moved_to_dest = true;
+        if let Some(v) = victim {
+            let victim_sq = match v {
+                crate::ops::SqRef::Aux => mv.aux,
+                _ => mv.to,
+            };
+            if self.board[victim_sq as usize] >= 0 {
+                let killed = self.op_capture_at(g, victim_sq, log);
+                if !killed && strike_stops_mover {
+                    moved_to_dest = false;
+                }
+            }
+        }
+        if moved_to_dest {
+            self.op_relocate_promo(g, mi, mv.to, mv.promo, log);
+        }
+        self.hazard_landing(g, mi, log);
+        if !trailing.is_empty() {
+            self.apply_move_ops(g, mv, trailing, log);
+        }
+    }
+
+    /// Interpret an op list against the move. `inline(always)`: the
+    /// per-row wrappers call this with CONSTANT op slices, so the loop
+    /// unrolls and the unused context fields fall away per row.
+    #[inline(always)]
+    pub(crate) fn apply_move_ops(
+        &mut self,
+        g: &GameDef,
+        mv: &Move,
+        ops: &[crate::ops::MicroOp],
+        log: &mut OpLog,
+    ) {
+        let ctx = OpCtx {
+            from: mv.from,
+            to: mv.to,
+            aux: mv.aux,
+            amount: match mv.effect {
+                Effect::Heal(n) => n,
+                _ => 0,
+            },
+            side: self.stm,
+            drop_type: mv.drop_type,
+            promo: mv.promo,
+        };
+        for op in ops {
+            self.apply_op(g, op, &ctx, log);
+        }
+    }
+
+    /// The ability interpreter: the move's effect names its registry
+    /// row; target ops then self ops apply.
+    pub(crate) fn apply_effect_row(&mut self, g: &GameDef, mv: &Move, log: &mut OpLog) {
+        let row = crate::effects::row(mv.effect);
+        self.apply_move_ops(g, mv, row.ops, log);
+        self.apply_move_ops(g, mv, row.self_ops, log);
+    }
+
+    /// Overclock ⟨move, move, self −1 HP⟩ (§3.4): step 1 is a
+    /// non-capture move from→to; step 2 to→aux may capture or strike (a
+    /// strike leaves the mover on `to`).
+    pub(crate) fn apply_sequenced(&mut self, g: &GameDef, mv: &Move, log: &mut OpLog) {
+        let mi = self.board[mv.from as usize] as usize;
+        self.op_relocate(g, mi, mv.to, log);
+        let killed2 = self.op_capture_at(g, mv.aux, log);
+        if killed2 || self.board[mv.aux as usize] < 0 {
+            self.op_relocate(g, mi, mv.aux, log);
+        }
+        self.op_hp_add(g, mi, -1, false, log);
+        self.hazard_landing(g, mi, log);
+    }
+
     /// Replay the move's op log backwards — each record exactly inverts
-    /// its op, so the bespoke per-kind rewind ordering is gone — then
-    /// restore the O(1) move-level snapshots.
+    /// its op (including ephemeral-marker changes) — then restore the
+    /// O(1) hash snapshot.
     pub fn unmake(&mut self, g: &GameDef, u: &Undo) {
         self.stm = (self.stm + g.sides - 1) % g.sides;
-        self.ep = u.prior_ep;
         for op in u.ops.rev_iter() {
             self.revert_op(op);
         }

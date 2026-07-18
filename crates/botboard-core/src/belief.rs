@@ -10,7 +10,7 @@
 //! samples full worlds consistent with belief + army-pool counts.
 
 use crate::game::{GameDef, Side, TypeId};
-use crate::moves::{Move, MoveKind};
+use crate::moves::Move;
 use crate::position::{Loc, Position};
 use crate::rng::Rng;
 
@@ -84,8 +84,13 @@ impl Belief {
     /// the pre-move position. Captures/drops/specials reveal their whole
     /// script as one observation (§3.4).
     pub fn observe(&mut self, g: &GameDef, pre: &Position, mv: &Move) {
-        if mv.kind == MoveKind::Drop {
-            return; // drop reveals the type directly; nothing left to filter
+        // A hand-sourced script (drop) reveals the type directly;
+        // nothing left to filter.
+        if matches!(
+            crate::move_defs::script(mv.kind).source,
+            crate::move_defs::Source::Hand
+        ) {
+            return;
         }
         let Some(idx) = pre.board.get(mv.from as usize).copied() else { return };
         if idx < 0 {

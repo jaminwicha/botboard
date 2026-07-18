@@ -7,8 +7,9 @@
 
 use crate::eval::Eval;
 use crate::game::{GameDef, StalematePolicy};
+use crate::move_defs::script;
 use crate::movegen::{is_legal, pseudo_moves};
-use crate::moves::{Move, MoveKind};
+use crate::moves::Move;
 use crate::position::{Loc, Position};
 
 pub const MATE: i32 = 1_000_000;
@@ -214,9 +215,9 @@ impl Searcher {
                 continue;
             }
             any_legal = true;
-            let quiet = pos.piece_at(mv.to).is_none()
-                && mv.kind != MoveKind::Drop
-                && mv.kind != MoveKind::Locust;
+            // Quietness is a derived property of the generating script
+            // row (empty landing, not from a hand, no aux-victim class).
+            let quiet = script(mv.kind).is_quiet(pos, mv);
             let u = pos.make(g, mv);
             let mut s;
             // Late-move reduction: late quiet moves get a reduced search,
@@ -297,15 +298,12 @@ impl Searcher {
         // Friendly-target abilities (Heal) would undo that progress and make
         // damage/heal cycles explode toward the ply cap — they are position
         // maintenance, not tactics, and stand-pat covers them.
-        // Locust hops land on an empty square but capture the enemy screen
-        // at `aux` — enemy HP strictly drops, so the bound holds for them.
+        // "Counts as a capture" is the generating script row's derived
+        // property: the aux-victim capture class (locust — enemy HP still
+        // strictly drops) or an enemy on the destination.
         let mut moves: Vec<Move> = pseudo_moves(g, pos)
             .into_iter()
-            .filter(|m| {
-                m.kind == MoveKind::Locust
-                    || (m.kind != MoveKind::Drop
-                        && pos.piece_at(m.to).is_some_and(|p| p.side != pos.stm))
-            })
+            .filter(|m| script(m.kind).counts_as_capture(pos, m))
             .collect();
         self.order(g, pos, &mut moves, None, ply);
         for mv in &moves {
@@ -340,8 +338,8 @@ impl Searcher {
             if let Some(v) = pos.piece_at(mv.to) {
                 return 1_000_000_000 + self.eval.material[v.t as usize] as i64;
             }
-            // A locust hop is a capture whose victim stands on `aux`.
-            if mv.kind == MoveKind::Locust {
+            // Aux-victim capture class (locust): MVV credit via `aux`.
+            if script(mv.kind).capture_class {
                 if let Some(v) = pos.piece_at(mv.aux) {
                     return 1_000_000_000 + self.eval.material[v.t as usize] as i64;
                 }
