@@ -163,6 +163,10 @@ pub struct PieceTypeDef {
     /// Terrain permission (SRW Appendix B hover/flight): pits neither
     /// block this piece's paths nor bar its landings; walls still do.
     pub flight: bool,
+    /// Terrain permission (SRW §3.1's second permission, drill): walls and
+    /// destructible blocks neither block this piece's paths nor bar its
+    /// landings; pits still do (unless it also flies).
+    pub drill: bool,
     /// EMP aura radius (Appendix B): enemies within chebyshev range
     /// cannot use their ability Bits; 0 = no aura.
     pub emp_aura: u8,
@@ -187,6 +191,7 @@ impl PieceTypeDef {
             hologram: false,
             stealth: false,
             flight: false,
+            drill: false,
             emp_aura: 0,
         }
     }
@@ -216,6 +221,10 @@ impl PieceTypeDef {
     }
     pub fn flight(mut self) -> Self {
         self.flight = true;
+        self
+    }
+    pub fn drill(mut self) -> Self {
+        self.drill = true;
         self
     }
     pub fn emp(mut self, radius: u8) -> Self {
@@ -262,6 +271,9 @@ pub struct LeapK {
     pub from_zone: Option<usize>,
     pub to_zone: Option<usize>,
     pub target: TargetPred,
+    /// HP gates (§3.1 state condition), 0 = unbounded.
+    pub min_hp: i16,
+    pub max_hp: i16,
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +283,9 @@ pub struct RideK {
     pub from_zone: Option<usize>,
     pub to_zone: Option<usize>,
     pub target: TargetPred,
+    /// HP gates (§3.1 state condition), 0 = unbounded.
+    pub min_hp: i16,
+    pub max_hp: i16,
 }
 
 /// One-screen capture hopper (xiangqi cannon).
@@ -280,6 +295,9 @@ pub struct HopK {
     pub from_zone: Option<usize>,
     pub to_zone: Option<usize>,
     pub target: TargetPred,
+    /// HP gates (§3.1 state condition), 0 = unbounded.
+    pub min_hp: i16,
+    pub max_hp: i16,
 }
 
 /// Wide-bitboard kernels (§7.1's bounded-mid-size class, portable u128
@@ -427,6 +445,8 @@ impl GameDef {
                             from_zone: bit.from_zone,
                             to_zone: bit.to_zone,
                             target: bit.target,
+                            min_hp: bit.min_hp,
+                            max_hp: bit.max_hp,
                         });
                     }
                     Geometry::Rider(..) => ck.rides.push(RideK {
@@ -435,12 +455,16 @@ impl GameDef {
                         from_zone: bit.from_zone,
                         to_zone: bit.to_zone,
                         target: bit.target,
+                        min_hp: bit.min_hp,
+                        max_hp: bit.max_hp,
                     }),
                     Geometry::Hopper(..) => ck.hops.push(HopK {
                         d,
                         from_zone: bit.from_zone,
                         to_zone: bit.to_zone,
                         target: bit.target,
+                        min_hp: bit.min_hp,
+                        max_hp: bit.max_hp,
                     }),
                 }
             }
@@ -449,11 +473,21 @@ impl GameDef {
         // target predicate — everything else stays on the mailbox path.
         let n = self.board.ncells();
         if n <= 128 {
+            // HP-gated kernels need the mover's per-piece state, which the
+            // precomputed tables cannot see: they stay on the mailbox path.
             let plain_leap = |k: &LeapK| {
-                k.from_zone.is_none() && k.to_zone.is_none() && k.target == TargetPred::Any
+                k.from_zone.is_none()
+                    && k.to_zone.is_none()
+                    && k.target == TargetPred::Any
+                    && k.min_hp == 0
+                    && k.max_hp == 0
             };
             let plain_ride = |k: &RideK| {
-                k.from_zone.is_none() && k.to_zone.is_none() && k.target == TargetPred::Any
+                k.from_zone.is_none()
+                    && k.to_zone.is_none()
+                    && k.target == TargetPred::Any
+                    && k.min_hp == 0
+                    && k.max_hp == 0
             };
             ck.leap_plain = ck.leaps.iter().map(plain_leap).collect();
             ck.ride_plain = ck.rides.iter().map(plain_ride).collect();

@@ -231,6 +231,9 @@ fn random_robot_army_samples_the_full_vocabulary() {
                     AbilityBit::Resurrect { .. } | AbilityBit::Hack { .. } => {
                         seen[10] += 1
                     }
+                    // Batch-2 abilities are not yet in the army sampler's
+                    // vocabulary; nothing to count here.
+                    AbilityBit::Swap { .. } | AbilityBit::Push { .. } => {}
                 }
             }
         }

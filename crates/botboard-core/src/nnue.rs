@@ -87,6 +87,10 @@ pub fn descriptor(g: &GameDef, t: TypeId, side: Side) -> [f32; D] {
             AbilityBit::MineLayer { .. } => mine = 1.0,
             AbilityBit::Resurrect { .. } => res = 1.0,
             AbilityBit::Hack { .. } => hack = 1.0,
+            // Batch-2 abilities (swap/push) have no dedicated descriptor
+            // dim: the 21-dim layout is frozen for checkpoint
+            // compatibility; their value flows through the flat priors.
+            AbilityBit::Swap { .. } | AbilityBit::Push { .. } => {}
         }
     }
     [

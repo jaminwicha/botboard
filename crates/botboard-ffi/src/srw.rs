@@ -32,6 +32,16 @@
 //! }
 //! ```
 //!
+//! Additive vocabulary (batch 2): type flag `"drill": true` (walls and
+//! destructible blocks neither block paths nor bar landings; pits still
+//! do unless the type also flies); per-move optional `"min_hp"` /
+//! `"max_hp"` HP gates (0/absent = unbounded — the §3.1 state condition);
+//! ability kinds `"swap"` (exchange with a friendly in range) and
+//! `"push"` (shove an enemy one square away); terrain kinds `"block1"` /
+//! `"block2"` / `"block3"` (destructible block tiers — laser-crackable,
+//! driller-passable) and `"conv_n"` / `"conv_e"` / `"conv_s"` /
+//! `"conv_w"` (conveyor belts; N is +y, side 0's forward).
+//!
 //! `"net"` (optional): path to a BBNET checkpoint (§10.6). The float
 //! weights quantize against THIS battle's GameDef — descriptors are
 //! Bit-derived (§7.4), so one checkpoint serves any composed army — and
@@ -55,7 +65,10 @@ use botboard_core::geometry::DirFilter;
 use botboard_core::ladder::{choose_move_traced, LadderConfig, LadderTrace, Rung};
 use botboard_core::movegen::{legal_moves, status, Status};
 use botboard_core::moves::{move_str, Effect, MoveKind, NO_SQ};
-use botboard_core::position::{mine_owner, Loc, Position, T_ACID, T_GRASS, T_ICE, T_MINE0, T_NONE, T_PIT, T_WALL};
+use botboard_core::position::{
+    mine_owner, Loc, Position, T_ACID, T_BLOCK1, T_BLOCK2, T_BLOCK3, T_CONV_E, T_CONV_N,
+    T_CONV_S, T_CONV_W, T_GRASS, T_ICE, T_NONE, T_PIT, T_WALL,
+};
 use botboard_core::rng::Rng;
 use botboard_core::search::Searcher;
 
@@ -155,6 +168,16 @@ fn parse_move_bit(j: &Json) -> Option<MoveBit> {
         "leg" => PathRule::Leg,
         _ => PathRule::None,
     });
+    // Optional HP gates (§3.1 state condition), additive schema: absent
+    // or 0 = unbounded on that end.
+    let min_hp = j.num("min_hp", 0.0) as i16;
+    if min_hp > 0 {
+        b = b.min_hp(min_hp);
+    }
+    let max_hp = j.num("max_hp", 0.0) as i16;
+    if max_hp > 0 {
+        b = b.max_hp(max_hp);
+    }
     Some(b)
 }
 
@@ -172,6 +195,8 @@ fn parse_ability(j: &Json) -> Option<AbilityBit> {
         "resurrect" => Some(AbilityBit::Resurrect { range }),
         "hack" => Some(AbilityBit::Hack { range }),
         "mine" => Some(AbilityBit::MineLayer { range }),
+        "swap" => Some(AbilityBit::Swap { range }),
+        "push" => Some(AbilityBit::Push { range }),
         _ => None,
     }
 }
@@ -208,6 +233,9 @@ fn parse_types(spec: &Json) -> Result<Vec<PieceTypeDef>, String> {
         }
         if tj.bool_or("flight", false) {
             def = def.flight();
+        }
+        if tj.bool_or("drill", false) {
+            def = def.drill();
         }
         let emp = tj.num("emp", 0.0) as u8;
         if emp > 0 {
@@ -299,6 +327,13 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
                 "ice" => T_ICE,
                 "grass" => T_GRASS,
                 "acid" => T_ACID,
+                "block1" => T_BLOCK1,
+                "block2" => T_BLOCK2,
+                "block3" => T_BLOCK3,
+                "conv_n" => T_CONV_N,
+                "conv_e" => T_CONV_E,
+                "conv_s" => T_CONV_S,
+                "conv_w" => T_CONV_W,
                 _ => T_WALL,
             };
             // Blocking terrain cannot share a cell with a piece; the
@@ -840,35 +875,51 @@ pub extern "C" fn srw_entropy(b: *mut SrwBattle, observer: c_int) -> f64 {
     b.beliefs.get(observer as usize).map_or(-1.0, |bl| bl.entropy())
 }
 
+/// Shared FFI terrain encoding: 0 none, 1 wall, 2 pit, 3 mine, 4 ice,
+/// 5 tall grass, 6 acid, 7/8/9 destructible block tier 1/2/3,
+/// 10/11/12/13 conveyor N/E/S/W (N = +y, side 0's forward).
+fn terrain_code(t: u8) -> c_int {
+    match t {
+        T_WALL => 1,
+        T_PIT => 2,
+        T_ICE => 4,
+        T_GRASS => 5,
+        T_ACID => 6,
+        T_BLOCK1 => 7,
+        T_BLOCK2 => 8,
+        T_BLOCK3 => 9,
+        T_CONV_N => 10,
+        T_CONV_E => 11,
+        T_CONV_S => 12,
+        T_CONV_W => 13,
+        t if mine_owner(t).is_some() => 3,
+        _ => 0,
+    }
+}
+
 /// Ground-truth terrain: 0 none, 1 wall, 2 pit, 3 mine, 4 ice,
-/// 5 tall grass, 6 acid.
+/// 5 tall grass, 6 acid, 7/8/9 block tier 1/2/3, 10..=13 conveyor NESW.
 #[no_mangle]
 pub extern "C" fn srw_terrain(b: *mut SrwBattle, sq: c_int) -> c_int {
     let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
-    b.pos.terrain.get(sq as usize).map_or(-2, |&t| match t {
-        T_WALL => 1,
-        T_PIT => 2,
-        T_ICE => 4,
-        T_GRASS => 5,
-        T_ACID => 6,
-        t if mine_owner(t).is_some() => 3,
-        _ => 0,
-    })
+    b.pos.terrain.get(sq as usize).map_or(-2, |&t| terrain_code(t))
 }
 
 /// Terrain as `observer` sees it: enemy mines are invisible (0) until
-/// they blow. 0 none, 1 wall, 2 pit, 3 own mine, 4 ice, 5 grass, 6 acid.
+/// they blow. 0 none, 1 wall, 2 pit, 3 own mine, 4 ice, 5 grass, 6 acid,
+/// 7/8/9 block tier 1/2/3, 10..=13 conveyor NESW.
 #[no_mangle]
 pub extern "C" fn srw_terrain_for(b: *mut SrwBattle, observer: c_int, sq: c_int) -> c_int {
     let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
-    b.pos.terrain.get(sq as usize).map_or(-2, |&t| match t {
-        T_WALL => 1,
-        T_PIT => 2,
-        T_ICE => 4,
-        T_GRASS => 5,
-        T_ACID => 6,
-        t if mine_owner(t) == Some(observer as Side) => 3,
-        _ => 0,
+    b.pos.terrain.get(sq as usize).map_or(-2, |&t| match mine_owner(t) {
+        Some(owner) => {
+            if owner == observer as Side {
+                3
+            } else {
+                0
+            }
+        }
+        None => terrain_code(t),
     })
 }
 
@@ -906,9 +957,11 @@ pub extern "C" fn srw_legal_move(
 
 /// out[6] = [from(-1 drop), to, kind, aux(-1 none), effect, promo(-1 none)].
 /// kind: 0 normal 1 double-step 2 en-passant 3 castle 4 drop 5 ability
-/// 6 compound; effect: 0 none 1 heal 2 wall 3 pit 4 laser 5 twice
+/// 6 compound; effect: 0 none 1 heal 2 wall 3 pit 4 laser (a laser whose
+/// `to` holds no piece is terrain damage on a destructible block) 5 twice
 /// 6 resurrect (out[5] then carries the revived type id, not a promo)
-/// 7 hack 8 mine-lay.
+/// 7 hack 8 mine-lay 9 swap (exchange caster with the friendly at `to`)
+/// 10 push (shove the enemy at `to` onto `aux`).
 #[no_mangle]
 pub extern "C" fn srw_legal_info(b: *mut SrwBattle, i: c_int, out: *mut c_int) -> c_int {
     let Some(b) = (unsafe { b.as_mut() }) else { return -1 };
@@ -936,6 +989,8 @@ pub extern "C" fn srw_legal_info(b: *mut SrwBattle, i: c_int, out: *mut c_int) -
         Effect::Resurrect => 6,
         Effect::Hack => 7,
         Effect::Mine => 8,
+        Effect::Swap => 9,
+        Effect::Push => 10,
     };
     unsafe {
         *out = if mv.from == NO_SQ { -1 } else { mv.from as c_int };

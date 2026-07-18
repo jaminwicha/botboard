@@ -78,11 +78,17 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
         }
         let ck = g.compiled(p.t, stm);
         let flies = g.types[p.t as usize].flight;
+        let drills = g.types[p.t as usize].drill;
+        let hp = pos.hp[pos.board[from as usize] as usize];
 
-        // Flyers ignore pit obstruction, which the precompiled bitboard
-        // masks cannot express — those pieces walk the mailbox path
-        // whenever pits are on the board.
-        let bb_active = use_bb && ck.bb.is_some() && !(flies && pos.has_pit());
+        // Flyers ignore pit obstruction and drillers ignore wall/block
+        // obstruction, which the precompiled bitboard masks cannot
+        // express — those pieces walk the mailbox path whenever the
+        // relevant terrain is on the board.
+        let bb_active = use_bb
+            && ck.bb.is_some()
+            && !(flies && pos.has_pit())
+            && !(drills && pos.has_wall());
         if bb_active {
             let bb = ck.bb.as_ref().unwrap();
             for e in &bb.leaps[from as usize] {
@@ -140,17 +146,20 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
             if bb_active && ck.leap_plain[ki] {
                 continue;
             }
+            if !crate::position::hp_gate_ok(k.min_hp, k.max_hp, hp) {
+                continue;
+            }
             if !zone_ok(k.from_zone, from) {
                 continue;
             }
             let Some(to) = g.board.offset(from, k.d.dx, k.d.dy) else { continue };
-            if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies) {
+            if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies, drills) {
                 continue;
             }
             let blocked = k.blockers.iter().any(|b| {
                 g.board
                     .offset(from, b.dx, b.dy)
-                    .map_or(true, |bsq| pos.cell_obstructed_for(bsq, flies))
+                    .map_or(true, |bsq| pos.cell_obstructed_for(bsq, flies, drills))
             });
             if blocked {
                 continue;
@@ -173,12 +182,15 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
             if bb_active && ck.ride_plain[ki] {
                 continue;
             }
+            if !crate::position::hp_gate_ok(k.min_hp, k.max_hp, hp) {
+                continue;
+            }
             if !zone_ok(k.from_zone, from) {
                 continue;
             }
             let mut cur = from;
             while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
-                if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies) {
+                if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies, drills) {
                     break;
                 }
                 match pos.piece_at(to) {
@@ -203,13 +215,16 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
         }
 
         for k in &ck.hops {
+            if !crate::position::hp_gate_ok(k.min_hp, k.max_hp, hp) {
+                continue;
+            }
             if !zone_ok(k.from_zone, from) {
                 continue;
             }
             let mut cur = from;
             let mut screened = false;
             while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
-                if !pos.terrain_open_for(to, flies) {
+                if !pos.terrain_open_for(to, flies, drills) {
                     break; // blocking terrain is never a screen
                 }
                 match pos.piece_at(to) {
@@ -304,11 +319,28 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
     // Appendix B ice: a rider landing on an empty sheet keeps sliding
     // along its ray — destinations are rewritten here so make/unmake and
     // hashing never know ice existed. Leapers land normally.
-    if pos.terrain.iter().any(|&t| t == crate::position::T_ICE) {
+    let any_ice = pos.terrain.iter().any(|&t| t == crate::position::T_ICE);
+    if any_ice {
         for m in out.iter_mut() {
             slide_on_ice(g, pos, m);
         }
-        // Two rides can now share a destination: keep the first.
+    }
+    // Conveyor belts: any quiet landing on a belt is carried along it —
+    // also destination rewriting, applied to ALL landings (leapers too;
+    // belts carry everyone). Documented interleave rule: belts resolve
+    // AFTER the ice slide, one pass, no re-entry into ice logic — a belt
+    // dumping onto ice does not restart the skid.
+    let any_belt = pos
+        .terrain
+        .iter()
+        .any(|&t| crate::position::conv_dir(t).is_some());
+    if any_belt {
+        for m in out.iter_mut() {
+            carry_on_belt(g, pos, m);
+        }
+    }
+    if any_ice || any_belt {
+        // Two moves can now share a destination: keep the first.
         let mut seen: Vec<Move> = Vec::with_capacity(out.len());
         out.retain(|m| {
             if seen.contains(m) {
@@ -422,10 +454,11 @@ fn slide_on_ice(g: &GameDef, pos: &Position, mv: &mut Move) {
         return;
     }
     let flies = g.types[mover.t as usize].flight;
+    let drills = g.types[mover.t as usize].drill;
     let mut cur = mv.to;
     loop {
         let Some(next) = g.board.offset(cur, sx, sy) else { break };
-        if pos.board[next as usize] >= 0 || !pos.terrain_open_for(next, flies) {
+        if pos.board[next as usize] >= 0 || !pos.terrain_open_for(next, flies, drills) {
             break; // stop on the last ice cell before the obstruction
         }
         if pos.terrain[next as usize] == T_ICE {
@@ -434,6 +467,42 @@ fn slide_on_ice(g: &GameDef, pos: &Position, mv: &mut Move) {
         }
         cur = next; // first open floor past the sheet: stop there
         break;
+    }
+    mv.to = cur;
+}
+
+/// Conveyor carry (destination rewriting, like the ice pass): a quiet
+/// landing on a belt is carried one square in the belt's direction when
+/// that square is open (terrain-permission-aware for the mover) and
+/// empty, chaining across consecutive belts — bounded at 8 carries, with
+/// revisit detection so belt cycles cannot spin forever. A blocked exit
+/// parks the piece on the belt. Captures and strikes are not rewritten
+/// (the scuffle jams the rollers), nor are drops, specials, abilities,
+/// compounds, or promotion landings — the same guards as the ice pass.
+fn carry_on_belt(g: &GameDef, pos: &Position, mv: &mut Move) {
+    use crate::position::conv_dir;
+    if mv.kind != MoveKind::Normal || mv.promo.is_some() {
+        return;
+    }
+    if pos.board[mv.to as usize] >= 0 {
+        return;
+    }
+    let Some(mover) = pos.piece_at(mv.from) else { return };
+    let flies = g.types[mover.t as usize].flight;
+    let drills = g.types[mover.t as usize].drill;
+    let mut cur = mv.to;
+    let mut visited: Vec<u16> = vec![cur];
+    for _ in 0..8 {
+        let Some((dx, dy)) = conv_dir(pos.terrain[cur as usize]) else { break };
+        let Some(next) = g.board.offset(cur, dx, dy) else { break };
+        if pos.board[next as usize] >= 0 || !pos.terrain_open_for(next, flies, drills) {
+            break; // blocked exit: the piece parks on the belt
+        }
+        if visited.contains(&next) {
+            break; // belt cycle: stop where the loop closes
+        }
+        visited.push(next);
+        cur = next;
     }
     mv.to = cur;
 }
@@ -559,6 +628,29 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                     for _ in 0..range {
                         let Some(nsq) = g.board.offset(cur, dx, dy) else { break };
                         if !pos.terrain_open(nsq) {
+                            // A destructible block is blocking terrain the
+                            // beam may TARGET: each hit drops it one tier
+                            // (make handles the empty-victim square as
+                            // terrain damage). The beam still stops here,
+                            // pierce or not.
+                            if crate::position::is_block(pos.terrain[nsq as usize])
+                                && pos.board[nsq as usize] < 0
+                            {
+                                let aux = if retreat {
+                                    match g.board.offset(from, -dx, -dy) {
+                                        Some(r)
+                                            if pos.board[r as usize] < 0
+                                                && pos.terrain_open(r) =>
+                                        {
+                                            r
+                                        }
+                                        _ => break,
+                                    }
+                                } else {
+                                    NO_SQ
+                                };
+                                out.push(Move::ability(from, nsq, Effect::Laser, aux));
+                            }
                             break;
                         }
                         if let Some(v) = pos.piece_at(nsq) {
@@ -587,6 +679,57 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                         }
                         cur = nsq;
                     }
+                }
+            }
+            AbilityBit::Swap { range } => {
+                // Exchange with a friendly in chebyshev range. Each half
+                // of the exchange is a landing: the swapped-onto squares
+                // must be terrain-open for the piece arriving there.
+                let cflies = g.types[t as usize].flight;
+                let cdrills = g.types[t as usize].drill;
+                for p in &pos.pieces {
+                    let Loc::Board(sq) = p.loc else { continue };
+                    if p.side != stm || sq == from {
+                        continue;
+                    }
+                    let (x, y) = g.board.xy(sq);
+                    if (x - fx).abs().max((y - fy).abs()) as u8 > range {
+                        continue;
+                    }
+                    let pflies = g.types[p.t as usize].flight;
+                    let pdrills = g.types[p.t as usize].drill;
+                    if !pos.terrain_open_for(sq, cflies, cdrills)
+                        || !pos.terrain_open_for(from, pflies, pdrills)
+                    {
+                        continue;
+                    }
+                    out.push(Move::ability(from, sq, Effect::Swap, NO_SQ));
+                }
+            }
+            AbilityBit::Push { range } => {
+                // Shove an in-range enemy one square directly away from
+                // the caster (chebyshev direction sign); generated only
+                // when that square is open for the PUSHED piece and empty.
+                for p in &pos.pieces {
+                    let Loc::Board(sq) = p.loc else { continue };
+                    if p.side == stm {
+                        continue;
+                    }
+                    let (x, y) = g.board.xy(sq);
+                    let (cx, cy) = (x - fx, y - fy);
+                    if cx.abs().max(cy.abs()) as u8 > range {
+                        continue;
+                    }
+                    let (dx, dy) = (cx.signum() as i8, cy.signum() as i8);
+                    let Some(dest) = g.board.offset(sq, dx, dy) else { continue };
+                    let vflies = g.types[p.t as usize].flight;
+                    let vdrills = g.types[p.t as usize].drill;
+                    if pos.board[dest as usize] >= 0
+                        || !pos.terrain_open_for(dest, vflies, vdrills)
+                    {
+                        continue;
+                    }
+                    out.push(Move::ability(from, sq, Effect::Push, dest));
                 }
             }
         }
@@ -621,10 +764,10 @@ fn gen_overclock(g: &GameDef, pos: &Position, from: u16, out: &mut Vec<Move>) {
 /// Kernel-only pseudo moves of the piece standing on `from` (no specials,
 /// abilities, drops, or nested compounds).
 fn pseudo_kernel_moves_of(g: &GameDef, pos: &Position, from: u16) -> Vec<Move> {
-    let flies = pos
-        .piece_at(from)
-        .map_or(false, |p| g.types[p.t as usize].flight);
     let Some(p) = pos.piece_at(from) else { return Vec::new() };
+    let flies = g.types[p.t as usize].flight;
+    let drills = g.types[p.t as usize].drill;
+    let hp = pos.hp[pos.board[from as usize] as usize];
     if p.side != pos.stm {
         return Vec::new();
     }
@@ -633,15 +776,20 @@ fn pseudo_kernel_moves_of(g: &GameDef, pos: &Position, from: u16) -> Vec<Move> {
     let zone_ok = |z: Option<usize>, at: u16| z.map_or(true, |zi| g.zones[zi].contains(stm, at));
     let mut out = Vec::new();
     for k in &ck.leaps {
+        if !crate::position::hp_gate_ok(k.min_hp, k.max_hp, hp) {
+            continue;
+        }
         if !zone_ok(k.from_zone, from) {
             continue;
         }
         let Some(to) = g.board.offset(from, k.d.dx, k.d.dy) else { continue };
-        if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies) {
+        if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies, drills) {
             continue;
         }
         if k.blockers.iter().any(|b| {
-            g.board.offset(from, b.dx, b.dy).map_or(true, |bsq| pos.cell_obstructed_for(bsq, flies))
+            g.board
+                .offset(from, b.dx, b.dy)
+                .map_or(true, |bsq| pos.cell_obstructed_for(bsq, flies, drills))
         }) {
             continue;
         }
@@ -654,12 +802,15 @@ fn pseudo_kernel_moves_of(g: &GameDef, pos: &Position, from: u16) -> Vec<Move> {
         }
     }
     for k in &ck.rides {
+        if !crate::position::hp_gate_ok(k.min_hp, k.max_hp, hp) {
+            continue;
+        }
         if !zone_ok(k.from_zone, from) {
             continue;
         }
         let mut cur = from;
         while let Some(to) = g.board.offset(cur, k.d.dx, k.d.dy) {
-            if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies) {
+            if !zone_ok(k.to_zone, to) || !pos.terrain_open_for(to, flies, drills) {
                 break;
             }
             match pos.piece_at(to) {

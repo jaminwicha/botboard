@@ -17,8 +17,10 @@ use crate::rng::Rng;
 const MAX_HAND: usize = 20;
 /// State buckets: bit 0 = moved flag, bits 1..4 = HP capped at 7.
 const BUCKETS: usize = 16;
-/// Terrain types keyed per cell (T_NONE hashes to nothing).
-const TERRAINS: usize = 10;
+/// Terrain types keyed per cell (T_NONE hashes to nothing): none, wall,
+/// pit, four owner-tagged mines, ice, grass, acid, three destructible
+/// block tiers, four conveyor directions.
+const TERRAINS: usize = 17;
 
 #[derive(Clone, Debug)]
 pub struct Zobrist {

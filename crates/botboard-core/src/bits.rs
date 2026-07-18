@@ -51,6 +51,10 @@ pub enum TargetPred {
 
 /// One Axis-A movement Bit. Zone conditions gate the origin and/or the
 /// destination square (palace confinement is a destination constraint).
+/// The HP gates are the §3.1 state condition: the kernel only activates
+/// while the mover's *current* HP is inside `[min_hp, max_hp]`
+/// (0 = unbounded on that end) — a `max_hp: 1` kernel is a desperation
+/// Bit that wakes when the armor is gone.
 #[derive(Clone, Debug)]
 pub struct MoveBit {
     pub geom: Geometry,
@@ -60,6 +64,10 @@ pub struct MoveBit {
     pub from_zone: Option<usize>,
     pub to_zone: Option<usize>,
     pub target: TargetPred,
+    /// State gate (§3.1): kernel active only when hp ≥ min_hp (0 = no bound).
+    pub min_hp: i16,
+    /// State gate (§3.1): kernel active only when hp ≤ max_hp (0 = no bound).
+    pub max_hp: i16,
 }
 
 impl MoveBit {
@@ -72,6 +80,8 @@ impl MoveBit {
             from_zone: None,
             to_zone: None,
             target: TargetPred::Any,
+            min_hp: 0,
+            max_hp: 0,
         }
     }
     pub fn leaper(m: i8, n: i8) -> Self {
@@ -107,6 +117,14 @@ impl MoveBit {
     }
     pub fn target(mut self, t: TargetPred) -> Self {
         self.target = t;
+        self
+    }
+    pub fn min_hp(mut self, hp: i16) -> Self {
+        self.min_hp = hp;
+        self
+    }
+    pub fn max_hp(mut self, hp: i16) -> Self {
+        self.max_hp = hp;
         self
     }
 }
@@ -145,4 +163,12 @@ pub enum AbilityBit {
     /// B): passable, non-blocking; an enemy landing takes 1 HP (lethal at
     /// 1) and the mine is spent. Concealment lives at the battle layer.
     MineLayer { range: u8 },
+    /// Exchange the caster with a friendly piece within chebyshev range
+    /// (both on board) — an atomic two-piece relocation script (§3.4).
+    Swap { range: u8 },
+    /// Shove an in-range enemy one square directly away from the caster
+    /// (chebyshev direction sign); generated only when that square is
+    /// open (for the pushed piece's terrain permissions) and empty.
+    /// Landing hazards bite the shoved piece.
+    Push { range: u8 },
 }

@@ -27,7 +27,9 @@ pub enum Effect {
     Wall,
     Pit,
     /// Capture at range without vacating the origin; `aux` holds the forced
-    /// retreat square (NO_SQ when the laser has no coupled retreat).
+    /// retreat square (NO_SQ when the laser has no coupled retreat). When
+    /// `to` holds no piece but a destructible block (T_BLOCK*), the shot is
+    /// terrain damage: the block drops one tier (T_BLOCK1 clears).
     Laser,
     /// Act-twice: second-step destination in `aux`, self −1 HP.
     Twice,
@@ -38,6 +40,12 @@ pub enum Effect {
     Hack,
     /// Lay an owner-tagged mine on the empty square at `to`.
     Mine,
+    /// Exchange the caster (`from`) with the friendly piece at `to` —
+    /// an atomic two-piece relocation.
+    Swap,
+    /// Shove the enemy at `to` one square directly away from the caster;
+    /// `aux` holds the shoved piece's destination.
+    Push,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,7 +58,7 @@ pub struct Move {
     /// Only meaningful when `kind == Drop`.
     pub drop_type: TypeId,
     /// Auxiliary square: en-passant victim, castling rook origin, compound
-    /// second step, or laser retreat; `NO_SQ` otherwise.
+    /// second step, laser retreat, or push destination; `NO_SQ` otherwise.
     pub aux: u16,
     pub effect: Effect,
 }
@@ -118,6 +126,8 @@ pub fn move_str(g: &GameDef, mv: &Move) -> String {
                 }
                 Effect::Hack => "hack".to_string(),
                 Effect::Mine => "mine".to_string(),
+                Effect::Swap => "swap".to_string(),
+                Effect::Push => "push".to_string(),
                 _ => "fx".to_string(),
             };
             let mut s = format!("{}!{}:{}", sq_name(g, mv.from), name, sq_name(g, mv.to));

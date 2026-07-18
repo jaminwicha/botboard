@@ -118,6 +118,22 @@ pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
     if ty.flight {
         m_utility *= 1.1; // Appendix B: terrain-permission multiplier
     }
+    if ty.drill {
+        m_utility *= 1.15; // §3.1's second terrain permission: wall-chewing
+    }
+    // HP-gated kernels (§3.1 state condition): the mobility integral
+    // prices at full HP, so a Bit-set with a kernel that only wakes below
+    // max HP (a desperation Bit) carries conditional vocabulary the piece
+    // cannot use at full strength — discounted once, ×0.85, documented
+    // as a simple prior until self-play refits it (§4.3).
+    if ty.max_hp > 1
+        && ty
+            .bits
+            .iter()
+            .any(|b| b.max_hp != 0 && b.max_hp < ty.max_hp)
+    {
+        m_utility *= 0.85;
+    }
     let mut s_nerfs = 0.0;
     let mut s_flat = 0.0;
     for a in &ty.abilities {
@@ -137,6 +153,9 @@ pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
             crate::bits::AbilityBit::Resurrect { .. } => s_flat += 4.0,
             crate::bits::AbilityBit::Hack { .. } => s_flat += 5.0,
             crate::bits::AbilityBit::MineLayer { .. } => s_flat += 2.0,
+            // Batch-2 flat priors: the exchange trick and the shove.
+            crate::bits::AbilityBit::Swap { .. } => s_flat += 1.5,
+            crate::bits::AbilityBit::Push { .. } => s_flat += 2.0,
             _ => {}
         }
     }

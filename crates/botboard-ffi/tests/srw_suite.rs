@@ -517,3 +517,100 @@ fn tall_grass_conceals_and_reconceals() {
     assert_eq!(srw_visible(b, 0, 3), 0, "grass re-conceals — no memory");
     srw_destroy(b);
 }
+
+/// Vocabulary batch 2 over the C ABI: drill types, destructible blocks,
+/// conveyor belts, swap/push abilities, and HP-gated move kernels — all
+/// additive schema, with the extended terrain and effect code tables.
+#[test]
+fn batch2_vocabulary_over_the_abi() {
+    let spec = r#"{
+  "seed": 5, "max_plies": 60,
+  "board": {"w": 6, "h": 6},
+  "sides": 2,
+  "types": [
+    {"name": "ctrl", "glyph": "C", "royal": true,
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}]},
+    {"name": "driller", "glyph": "D", "drill": true,
+     "moves": [{"geom": "rider", "m": 0, "n": 1}]},
+    {"name": "swapper", "glyph": "W",
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}],
+     "abilities": [{"kind": "swap", "range": 2}]},
+    {"name": "pusher", "glyph": "P",
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}],
+     "abilities": [{"kind": "push", "range": 2}]},
+    {"name": "limper", "glyph": "M", "hp": 2,
+     "moves": [{"geom": "leaper", "m": 0, "n": 1},
+                {"geom": "rider", "m": 0, "n": 1, "max_hp": 1}]},
+    {"name": "runner", "glyph": "R",
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}]}
+  ],
+  "placements": [
+    {"t": 0, "side": 0, "x": 0, "y": 0},
+    {"t": 1, "side": 0, "x": 2, "y": 0},
+    {"t": 2, "side": 0, "x": 1, "y": 0},
+    {"t": 3, "side": 0, "x": 4, "y": 0},
+    {"t": 4, "side": 0, "x": 0, "y": 2},
+    {"t": 0, "side": 1, "x": 5, "y": 5},
+    {"t": 5, "side": 1, "x": 4, "y": 2}
+  ],
+  "terrain": [
+    {"x": 2, "y": 2, "kind": "wall"},
+    {"x": 5, "y": 0, "kind": "block1"},
+    {"x": 5, "y": 1, "kind": "block2"},
+    {"x": 5, "y": 2, "kind": "block3"},
+    {"x": 3, "y": 3, "kind": "conv_n"},
+    {"x": 3, "y": 4, "kind": "conv_e"},
+    {"x": 0, "y": 5, "kind": "conv_s"},
+    {"x": 1, "y": 5, "kind": "conv_w"}
+  ],
+  "tiers": [0, 0]
+}"#;
+    let b = srw_create(c(spec).as_ptr());
+    assert!(!b.is_null(), "batch-2 setup must build (additive schema)");
+
+    // Extended terrain code table: 7/8/9 block tiers, 10..=13 conv NESW.
+    assert_eq!(srw_terrain(b, 14), 1, "wall at c3");
+    assert_eq!(srw_terrain(b, 5), 7, "block1 at f1");
+    assert_eq!(srw_terrain(b, 11), 8, "block2 at f2");
+    assert_eq!(srw_terrain(b, 17), 9, "block3 at f3");
+    assert_eq!(srw_terrain(b, 21), 10, "conv_n at d4");
+    assert_eq!(srw_terrain(b, 27), 11, "conv_e at d5");
+    assert_eq!(srw_terrain(b, 30), 12, "conv_s at a6");
+    assert_eq!(srw_terrain(b, 31), 13, "conv_w at b6");
+    assert_eq!(srw_terrain_for(b, 1, 5), 7, "blocks are public terrain");
+
+    // Collect side 0's legal moves (strings + effect codes).
+    let n = srw_legal_count(b);
+    assert!(n > 0);
+    let mut strs = Vec::new();
+    let mut effects = Vec::new();
+    let mut mv = [0 as c_char; 32];
+    let mut info = [0 as c_int; 6];
+    for i in 0..n {
+        assert!(srw_legal_move(b, i, mv.as_mut_ptr(), 32) > 0);
+        strs.push(buf_str(&mv));
+        assert_eq!(srw_legal_info(b, i, info.as_mut_ptr()), 0);
+        effects.push(info[4]);
+    }
+
+    // Drill: the ride passes the wall at c3 and may even land inside it.
+    assert!(strs.contains(&"c1c3".to_string()), "driller lands in the wall");
+    assert!(strs.contains(&"c1c4".to_string()), "driller passes the wall");
+    // Swap and push surface with their new effect codes (9 and 10).
+    let swap_i = strs.iter().position(|s| s == "b1!swap:c1").expect("swap move");
+    assert_eq!(effects[swap_i], 9, "swap effect code");
+    let push_i = strs.iter().position(|s| s == "e1!push:e3>e4").expect("push move");
+    assert_eq!(effects[push_i], 10, "push effect code");
+    // HP gate: the limper's rider only wakes below max HP.
+    assert!(strs.contains(&"a3a4".to_string()), "ungated step generates");
+    assert!(!strs.contains(&"a3a5".to_string()), "max_hp-gated ride dormant at full HP");
+
+    // Apply the swap through the ABI: driller and swapper trade squares.
+    assert_eq!(srw_apply(b, c("b1!swap:c1").as_ptr()), 0);
+    let mut pi = [0 as c_int; 6];
+    assert_eq!(srw_piece_info(b, 1, pi.as_mut_ptr()), 0);
+    assert_eq!(pi[0], 1, "driller now on b1");
+    assert_eq!(srw_piece_info(b, 2, pi.as_mut_ptr()), 0);
+    assert_eq!(pi[0], 2, "swapper now on c1");
+    srw_destroy(b);
+}

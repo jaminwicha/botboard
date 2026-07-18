@@ -34,21 +34,53 @@ pub const T_GRASS: u8 = 8;
 /// Acid (Appendix B): passable; any piece landing here takes 1 HP
 /// (lethal at 1). The pool persists.
 pub const T_ACID: u8 = 9;
+/// Destructible blocks (SRW Appendix B walls a driller chews): blocking
+/// like walls for everyone except drillers, who pass/enter them as if
+/// absent. Three damage tiers; a laser hit lowers the tier by one
+/// (T_BLOCK1 clears to floor).
+pub const T_BLOCK1: u8 = 10;
+pub const T_BLOCK2: u8 = 11;
+pub const T_BLOCK3: u8 = 12;
+/// Conveyor belts: a piece LANDING on one is carried a square per belt in
+/// the belt's direction (chains, bounded) — realized as destination
+/// rewriting in movegen like ice, so make/unmake never see them.
+/// N is +y (side 0's forward), E is +x, S is −y, W is −x.
+pub const T_CONV_N: u8 = 13;
+pub const T_CONV_E: u8 = 14;
+pub const T_CONV_S: u8 = 15;
+pub const T_CONV_W: u8 = 16;
+
+/// Is this a destructible block tier?
+#[inline]
+pub fn is_block(t: u8) -> bool {
+    (T_BLOCK1..=T_BLOCK3).contains(&t)
+}
+
+/// The belt direction, if this terrain is a conveyor.
+#[inline]
+pub fn conv_dir(t: u8) -> Option<(i8, i8)> {
+    match t {
+        T_CONV_N => Some((0, 1)),
+        T_CONV_E => Some((1, 0)),
+        T_CONV_S => Some((0, -1)),
+        T_CONV_W => Some((-1, 0)),
+        _ => None,
+    }
+}
 
 /// Terrain that blocks entry, rays, screens, and legs (mines do not).
 #[inline]
 pub fn terrain_blocks(t: u8) -> bool {
-    t == T_WALL || t == T_PIT
+    t == T_WALL || t == T_PIT || is_block(t)
 }
 
-/// `terrain_blocks` under a terrain permission: flight ignores pits.
+/// `terrain_blocks` under the terrain permissions (§3.1 path
+/// interaction): flight ignores pits; drill ignores walls and
+/// destructible blocks (the drill chews scrap). Pits still stop a
+/// driller unless it also flies.
 #[inline]
-pub fn terrain_stops(t: u8, flies: bool) -> bool {
-    if flies {
-        t == T_WALL
-    } else {
-        terrain_blocks(t)
-    }
+pub fn terrain_stops(t: u8, flies: bool, drills: bool) -> bool {
+    ((t == T_WALL || is_block(t)) && !drills) || (t == T_PIT && !flies)
 }
 
 /// The mine's owner, if this cell holds one (mines occupy 3..=6).
@@ -81,9 +113,10 @@ pub struct Position {
     pub pieces: Vec<Piece>,
     /// SoA per-instance state (§7.3): hit points, parallel to `pieces`.
     pub hp: Vec<i16>,
-    /// Per-cell terrain (T_NONE / T_WALL / T_PIT). Blocks entry, rays,
-    /// screens, and lame-leaper legs; flight/drill permissions are the
-    /// later path-interaction refinement (§3.1).
+    /// Per-cell terrain (the T_* codes above). Blocking kinds (walls,
+    /// pits, destructible blocks) stop entry, rays, screens, and
+    /// lame-leaper legs, moderated by the §3.1 terrain permissions:
+    /// flight ignores pits, drill ignores walls and blocks.
     pub terrain: Vec<u8>,
     pub stm: Side,
     /// En-passant target square, or NO_SQ.
@@ -100,6 +133,8 @@ pub struct Position {
     pub terrain_mask: u128,
     /// Number of pit cells (kept in sync by set_terrain/rehash).
     pit_count: u16,
+    /// Number of wall + destructible-block cells (same maintenance).
+    wall_count: u16,
     wide: bool,
 }
 
@@ -113,17 +148,21 @@ pub struct Undo {
     captured: Option<(usize, Piece)>,
     /// Second-step capture of a compound.
     captured2: Option<(usize, Piece)>,
-    /// Castle partner: (index, prior square, prior moved).
+    /// Second piece of a two-piece script — castle rook, swap partner, or
+    /// push victim: (index, prior square, prior moved).
     partner: Option<(usize, u16, bool)>,
     /// (piece index, prior hp) — strikes, heals, overclock self-damage.
     hp_changes: Vec<(usize, i16)>,
-    terrain_change: Option<(u16, u8)>,
+    /// (square, prior terrain), in application order. Usually 0 or 1
+    /// entries; a laser that cracks a block and then retreats onto an
+    /// enemy mine, or a push that springs a mine, needs the list.
+    terrain_changes: Vec<(u16, u8)>,
     /// Resurrect: (revived piece index, its prior `moved` flag).
     revived: Option<(usize, bool)>,
     /// Hack: (flipped piece index, its prior side).
     hacked: Option<(usize, Side)>,
-    /// Mine kill: (piece index, the square it died on).
-    mine_death: Option<(usize, u16)>,
+    /// Mine/acid kills: (piece index, the square it died on).
+    mine_deaths: Vec<(usize, u16)>,
     prior_ep: u16,
     prior_hash: u64,
 }
@@ -143,6 +182,7 @@ impl Position {
             occ_side: vec![0; g.sides as usize],
             terrain_mask: 0,
             pit_count: 0,
+            wall_count: 0,
             wide: g.use_bitboards && g.board.ncells() <= 128,
         };
         for &(t, side, sq, moved) in list {
@@ -173,6 +213,11 @@ impl Position {
         self.hash = g.zobrist.full_hash(self);
         self.pit_count =
             self.terrain.iter().filter(|&&t| t == T_PIT).count() as u16;
+        self.wall_count = self
+            .terrain
+            .iter()
+            .filter(|&&t| t == T_WALL || is_block(t))
+            .count() as u16;
         if self.wide {
             self.occ_all = 0;
             self.occ_side.iter_mut().for_each(|m| *m = 0);
@@ -211,19 +256,13 @@ impl Position {
         self.board[sq as usize] >= 0 || terrain_blocks(self.terrain[sq as usize])
     }
 
-    /// `cell_obstructed` with a terrain permission: flyers pass over pits
-    /// (Appendix B hover/flight); walls stop everyone.
+    /// `cell_obstructed` with terrain permissions: flyers pass over pits
+    /// (Appendix B hover/flight); drillers pass through walls and
+    /// destructible blocks (§3.1).
     #[inline]
-    pub fn cell_obstructed_for(&self, sq: u16, flies: bool) -> bool {
-        if self.board[sq as usize] >= 0 {
-            return true;
-        }
-        let t = self.terrain[sq as usize];
-        if flies {
-            t == T_WALL
-        } else {
-            terrain_blocks(t)
-        }
+    pub fn cell_obstructed_for(&self, sq: u16, flies: bool, drills: bool) -> bool {
+        self.board[sq as usize] >= 0
+            || terrain_stops(self.terrain[sq as usize], flies, drills)
     }
 
     /// May a piece land here (ignoring occupancy)? Mines are open — that
@@ -233,16 +272,11 @@ impl Position {
         !terrain_blocks(self.terrain[sq as usize])
     }
 
-    /// `terrain_open` with a terrain permission: a flyer may hover on a
-    /// pit square.
+    /// `terrain_open` with terrain permissions: a flyer may hover on a
+    /// pit square; a driller may stand inside a wall or block.
     #[inline]
-    pub fn terrain_open_for(&self, sq: u16, flies: bool) -> bool {
-        let t = self.terrain[sq as usize];
-        if flies {
-            t != T_WALL
-        } else {
-            !terrain_blocks(t)
-        }
+    pub fn terrain_open_for(&self, sq: u16, flies: bool, drills: bool) -> bool {
+        !terrain_stops(self.terrain[sq as usize], flies, drills)
     }
 
     /// Any pits on the board? Gates the wide-bitboard fast path for
@@ -250,6 +284,13 @@ impl Position {
     #[inline]
     pub fn has_pit(&self) -> bool {
         self.pit_count > 0
+    }
+
+    /// Any walls or destructible blocks? Gates the wide-bitboard fast
+    /// path for drillers (whose kernels must ignore wall obstruction).
+    #[inline]
+    pub fn has_wall(&self) -> bool {
+        self.wall_count > 0
     }
 
     fn fwd(side: Side) -> i8 {
@@ -312,11 +353,18 @@ impl Position {
 
     #[inline]
     fn set_terrain(&mut self, sq: u16, t: u8) {
-        if self.terrain[sq as usize] == T_PIT {
+        let old = self.terrain[sq as usize];
+        if old == T_PIT {
             self.pit_count -= 1;
         }
         if t == T_PIT {
             self.pit_count += 1;
+        }
+        if old == T_WALL || is_block(old) {
+            self.wall_count -= 1;
+        }
+        if t == T_WALL || is_block(t) {
+            self.wall_count += 1;
         }
         self.terrain[sq as usize] = t;
         if self.wide {
@@ -340,8 +388,7 @@ impl Position {
                     return;
                 }
                 // The mine is spent.
-                debug_assert!(u.terrain_change.is_none(), "one terrain change per move");
-                u.terrain_change = Some((sq, t));
+                u.terrain_changes.push((sq, t));
                 self.xor_terrain(g, sq);
                 self.set_terrain(sq, T_NONE);
                 self.xor_terrain(g, sq);
@@ -361,7 +408,7 @@ impl Position {
             self.xor_piece(g, mi);
             self.lift(mi, sq);
             self.pieces[mi].loc = Loc::Dead;
-            u.mine_death = Some((mi, sq));
+            u.mine_deaths.push((mi, sq));
         }
     }
 
@@ -494,10 +541,10 @@ impl Position {
                 captured2: None,
                 partner: None,
                 hp_changes: Vec::new(),
-                terrain_change: None,
+                terrain_changes: Vec::new(),
                 revived: None,
                 hacked: None,
-                mine_death: None,
+                mine_deaths: Vec::new(),
                 prior_ep,
                 prior_hash,
             };
@@ -529,10 +576,10 @@ impl Position {
             captured2: None,
             partner: None,
             hp_changes: Vec::new(),
-            terrain_change: None,
+            terrain_changes: Vec::new(),
             revived: None,
             hacked: None,
-            mine_death: None,
+            mine_deaths: Vec::new(),
             prior_ep,
             prior_hash,
         };
@@ -549,7 +596,7 @@ impl Position {
                         self.xor_piece(g, ti);
                     }
                     Effect::Wall | Effect::Pit | Effect::Mine => {
-                        u.terrain_change = Some((mv.to, self.terrain[mv.to as usize]));
+                        u.terrain_changes.push((mv.to, self.terrain[mv.to as usize]));
                         self.xor_terrain(g, mv.to);
                         self.set_terrain(
                             mv.to,
@@ -562,8 +609,19 @@ impl Position {
                         self.xor_terrain(g, mv.to);
                     }
                     Effect::Laser => {
-                        let (cap, _killed) = self.hit(g, mv.to, &mut u.hp_changes);
-                        u.captured = cap;
+                        let t = self.terrain[mv.to as usize];
+                        if self.board[mv.to as usize] < 0 && is_block(t) {
+                            // Terrain damage: the block drops one tier;
+                            // T_BLOCK1 clears to bare floor.
+                            let next = if t == T_BLOCK1 { T_NONE } else { t - 1 };
+                            u.terrain_changes.push((mv.to, t));
+                            self.xor_terrain(g, mv.to);
+                            self.set_terrain(mv.to, next);
+                            self.xor_terrain(g, mv.to);
+                        } else {
+                            let (cap, _killed) = self.hit(g, mv.to, &mut u.hp_changes);
+                            u.captured = cap;
+                        }
                         if mv.aux != NO_SQ {
                             // Coupled retreat (§3.4): part of the atomic script.
                             self.xor_piece(g, mi);
@@ -572,6 +630,36 @@ impl Position {
                             self.xor_piece(g, mi);
                             self.trigger_mine(g, mi, &mut u);
                         }
+                    }
+                    Effect::Swap => {
+                        // Atomic two-piece exchange: caster from↔to.
+                        let pi = self.board[mv.to as usize] as usize;
+                        u.partner = Some((pi, mv.to, self.pieces[pi].moved));
+                        self.xor_piece(g, mi);
+                        self.xor_piece(g, pi);
+                        self.lift(mi, mv.from);
+                        self.lift(pi, mv.to);
+                        self.place(mi, mv.to);
+                        self.place(pi, mv.from);
+                        self.pieces[mi].moved = true;
+                        self.pieces[pi].moved = true;
+                        self.xor_piece(g, mi);
+                        self.xor_piece(g, pi);
+                        // Both relocations are landings: hazards bite.
+                        self.trigger_mine(g, mi, &mut u);
+                        self.trigger_mine(g, pi, &mut u);
+                    }
+                    Effect::Push => {
+                        // Shove the enemy at `to` onto `aux` (movegen only
+                        // generates the move when aux is open and empty).
+                        let pi = self.board[mv.to as usize] as usize;
+                        u.partner = Some((pi, mv.to, self.pieces[pi].moved));
+                        self.xor_piece(g, pi);
+                        self.move_piece(pi, mv.to, mv.aux);
+                        self.pieces[pi].moved = true;
+                        self.xor_piece(g, pi);
+                        // The shoved piece lands: mines/acid bite it.
+                        self.trigger_mine(g, pi, &mut u);
                     }
                     Effect::Hack => {
                         // Flip the target to the caster's side. Masks track
@@ -687,7 +775,7 @@ impl Position {
         let mv = &u.mv;
 
         if mv.kind == MoveKind::Drop {
-            if let Some((sq, prior)) = u.terrain_change {
+            for &(sq, prior) in u.terrain_changes.iter().rev() {
                 self.set_terrain(sq, prior); // the spent mine returns
             }
             self.lift(u.moving, mv.to);
@@ -701,14 +789,41 @@ impl Position {
             return;
         }
 
-        if let Some((sq, prior)) = u.terrain_change {
+        for &(sq, prior) in u.terrain_changes.iter().rev() {
             self.set_terrain(sq, prior);
         }
 
+        for &(mi, dsq) in u.mine_deaths.iter().rev() {
+            // Back from the crater; the mover-back / partner / captured
+            // restores below finish the rewind. Runs before the partner
+            // block so a hazard-killed swap partner or push victim is on
+            // board again when its relocation unwinds.
+            self.place(mi, dsq);
+        }
+
         if let Some((ri, rsq, rmoved)) = u.partner {
-            let rook_to = (mv.from + mv.to) / 2;
-            self.lift(ri, rook_to);
-            self.place(ri, rsq);
+            match mv.effect {
+                Effect::Swap => {
+                    // Both halves of the exchange step back atomically;
+                    // the mover-back block below then finds the mover
+                    // already home.
+                    self.lift(ri, mv.from);
+                    self.lift(u.moving, mv.to);
+                    self.place(ri, rsq);
+                    self.place(u.moving, mv.from);
+                }
+                Effect::Push => {
+                    if let Loc::Board(cur) = self.pieces[ri].loc {
+                        self.lift(ri, cur);
+                    }
+                    self.place(ri, rsq);
+                }
+                _ => {
+                    let rook_to = (mv.from + mv.to) / 2;
+                    self.lift(ri, rook_to);
+                    self.place(ri, rsq);
+                }
+            }
             self.pieces[ri].moved = rmoved;
         }
 
@@ -722,12 +837,6 @@ impl Position {
             self.lift(hi, mv.to);
             self.pieces[hi].side = side;
             self.place(hi, mv.to);
-        }
-
-        if let Some((mi, dsq)) = u.mine_death {
-            // Back from the crater; the mover-back block below (or the
-            // captured-restore for victims) finishes the rewind.
-            self.place(mi, dsq);
         }
 
         // Put the mover back wherever it now stands.
@@ -790,7 +899,7 @@ impl Position {
         let use_bb = self.wide && g.use_bitboards;
         let obstructed = self.occ_all | self.terrain_mask;
         let sq_bit = 1u128 << sq;
-        for p in &self.pieces {
+        for (pi, p) in self.pieces.iter().enumerate() {
             let Loc::Board(psq) = p.loc else { continue };
             if p.side != by || psq == sq {
                 continue;
@@ -800,13 +909,18 @@ impl Position {
                 continue;
             }
             let aflies = g.types[p.t as usize].flight;
+            let adrills = g.types[p.t as usize].drill;
+            let ahp = self.hp[pi];
             let (px, py) = g.board.xy(psq);
             let (dx, dy) = ((tx - px) as i32, (ty - py) as i32);
             let ck = g.compiled(p.t, p.side);
             let zone_ok = |z: Option<usize>, s: Side, at: u16| {
                 z.map_or(true, |zi| g.zones[zi].contains(s, at))
             };
-            let bb_active = use_bb && ck.bb.is_some() && !(aflies && self.has_pit());
+            let bb_active = use_bb
+                && ck.bb.is_some()
+                && !(aflies && self.has_pit())
+                && !(adrills && self.has_wall());
             if bb_active {
                 let bb = ck.bb.as_ref().unwrap();
                 for e in &bb.leaps[psq as usize] {
@@ -833,6 +947,9 @@ impl Position {
                 if bb_active && ck.leap_plain[ki] {
                     continue;
                 }
+                if !hp_gate_ok(k.min_hp, k.max_hp, ahp) {
+                    continue;
+                }
                 if !k.mode.can_capture() || k.d.dx as i32 != dx || k.d.dy as i32 != dy {
                     continue;
                 }
@@ -845,7 +962,7 @@ impl Position {
                 let blocked = k.blockers.iter().any(|b| {
                     g.board
                         .offset(psq, b.dx, b.dy)
-                        .map_or(true, |bsq| self.cell_obstructed_for(bsq, aflies))
+                        .map_or(true, |bsq| self.cell_obstructed_for(bsq, aflies, adrills))
                 });
                 if !blocked {
                     return true;
@@ -853,6 +970,9 @@ impl Position {
             }
             'ride: for (ki, k) in ck.rides.iter().enumerate() {
                 if bb_active && ck.ride_plain[ki] {
+                    continue;
+                }
+                if !hp_gate_ok(k.min_hp, k.max_hp, ahp) {
                     continue;
                 }
                 if !k.mode.can_capture() || !pred_ok(k.target) {
@@ -867,13 +987,16 @@ impl Position {
                 let mut cur = psq;
                 for _ in 1..steps {
                     cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
-                    if self.cell_obstructed_for(cur, aflies) {
+                    if self.cell_obstructed_for(cur, aflies, adrills) {
                         continue 'ride;
                     }
                 }
                 return true;
             }
             'hop: for k in &ck.hops {
+                if !hp_gate_ok(k.min_hp, k.max_hp, ahp) {
+                    continue;
+                }
                 if !pred_ok(k.target) {
                     continue;
                 }
@@ -887,7 +1010,7 @@ impl Position {
                 let mut cur = psq;
                 for _ in 1..steps {
                     cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
-                    if terrain_stops(self.terrain[cur as usize], aflies) {
+                    if terrain_stops(self.terrain[cur as usize], aflies, adrills) {
                         continue 'hop; // blocking terrain is not a screen
                     }
                     if self.board[cur as usize] >= 0 {
@@ -920,6 +1043,13 @@ impl Position {
     pub fn forward(side: Side) -> i8 {
         Self::fwd(side)
     }
+}
+
+/// Is the kernel's HP gate (§3.1 state condition) satisfied at `hp`?
+/// 0 means unbounded on that end.
+#[inline]
+pub fn hp_gate_ok(min_hp: i16, max_hp: i16, hp: i16) -> bool {
+    (min_hp == 0 || hp >= min_hp) && (max_hp == 0 || hp <= max_hp)
 }
 
 /// If (dx,dy) = k·(sx,sy) for integer k ≥ 1, return k.
