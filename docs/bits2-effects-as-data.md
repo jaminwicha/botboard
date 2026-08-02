@@ -358,3 +358,65 @@ Deviations and notes:
   layout-lottery (LTO + one codegen unit: ±2% swings were observed
   from semantically identical formulations); the inline hazard guard
   claws most of it back.
+
+## Stage 4 as built (August 2026) — deviations and notes
+
+Landed as GameDef-owned custom registries (`GameDef::custom_effects` /
+`custom_terrains`, built via `with_customs`), referenced by
+`AbilityBit::Custom(u16)` / `Effect::Custom(u16)` and the `NT+`
+internal terrain band; authored through two optional top-level arrays
+(`"abilities"`, `"terrains"`) in the SRW battle setup JSON, validated
+loudly at the FFI boundary (`parse_custom_abilities` /
+`parse_custom_terrains` in `srw.rs`). New suites: `stage4_suite.rs`
+(core: generate/apply/undo exactness, lethal damage, qsearch class,
+cost/descriptor flow, ray reach, custom terrain bite/blocking,
+deterministic replay) and the srw_suite Stage-4 block (boundary
+validation, wire codes, notation, masking). Stdlib behavior untouched
+(all prior suites bit-identical).
+
+Deviations from the design above:
+
+- **Authoring rides the battle setup JSON, not separate data files**:
+  the planned `abilities.json` / `terrains.json` are the setup's
+  `"abilities"` / `"terrains"` arrays — per-battle scope, so custom
+  ids/codes are stable *within a battle* and never persist engine-side.
+  `moves.json` (custom MOVE scripts — new special-move generators over
+  gates/bindings) was descoped: gates/bindings compose engine-side
+  only. That plus Maker-Mode composition UX (a client-layer concern)
+  are the remaining Stage-4 spec surface.
+- **The row IS the definition**: unlike stdlib bits (parameters ride
+  `AbilityBit`), a custom row carries its own selector, reach
+  (`CustomReach::Point{range}` | `Ray{max, pierce}`), ops, cost hint,
+  and descriptor slot; per-piece parameters on a `{"kind": <custom-id>}`
+  reference are ignored by design.
+- **The op vocabulary is the validated subset**: target ops `hp_add`
+  (LETHAL at 0 — strike-to-kill through the capture fate, unlike the
+  stdlib ability interpreter's generation-guarded `HpAdd`; landed as
+  `op_damage_lethal`), `capture_at`, `flip_side`, `set_terrain`
+  (stdlib authorable kinds, caster-banded `"mine"`, or a custom
+  terrain id), `terrain_step`; self-ops `hp_add` only.
+  Relocation-coupled shapes (swap/push/retreat/resurrect analogues)
+  stay stdlib-only — they need aux-square generation the custom walker
+  (`gen_custom_ability`, `#[cold]` interpreter `apply_custom_effect`)
+  does not do.
+- **Custom terrain keeps the hot path honest**: the g-less hot
+  predicates keep their derived range-compare forms, extended by
+  per-Position custom blocking masks (`cust_stops` etc. — a 16-bit
+  mask per permission class, folded from the rows); cold/g-carrying
+  call sites use the GameDef-aware twins (`terrain_blocks`,
+  `terrain_carry`, `terrain_slides`, `terrain_belts`, ...). Custom
+  rows are capped at `MAX_CUSTOM_TERRAIN = 16` per battle; custom
+  `tiers` is 0/1 (multi-tier erosion bands are stdlib-only); wire
+  codes are `WIRE_CUSTOM_BASE + i`.
+- **Cost and NNUE flow as designed**: the REQUIRED cost hint's flat
+  term joins S_flat, mult joins M_utility (mobility still measured —
+  custom abilities are generated moves); `descriptor_slot` is a stdlib
+  kin NAME mapped by `effects::kin_slot` into the frozen 21-dim v2
+  layout ("swap"/"push"/"none" → NO_SLOT), the documented
+  approximation until a descriptor v3.
+- **Effect codes allocate upward**: `srw_legal_info` surfaces custom
+  effect `i` as code `11 + i`; notation is `"e2!<id>:e3"`. Custom ids
+  are validated non-colliding with `STDLIB_ABILITY_IDS` and each
+  other; `effects::row`/`ability_row` treat a custom variant reaching
+  them as unreachable — every consumer branches to the GameDef
+  registries first.
