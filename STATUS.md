@@ -76,8 +76,12 @@ remain ops work outside the engine's semantics.
    (`artifacts/chess_net_v3.bin`). H stays the compile-time 32; making
    H runtime-sized (Vec-backed nets) is the prerequisite for true
    width scaling and belongs with rung 5's inference work.
-2. **Wider league** (config): grow to 12–16 members with the §5 pool so
-   Nash averaging has spread; feeds better value targets for (1).
+2. **Wider league** — ✅ DONE (Aug 2026): `league --members N` over
+   `population(n)` (the 4 seeds + a deterministic 2-D style lattice).
+   The 14-member chess run (4 games/pair) produced a real Nash spread:
+   support on 5 members (s70m5 0.30, balanced 0.20, berserk 0.20,
+   s105m14 0.20, active 0.10), zero weight on the no-mobility
+   hoarders — `league_profiles.json`.
 3. **SRW-content curriculum** — ✅ pipes DONE / net promotion OPEN
    (July 2026): descriptor v2
    (D 12→21) gives the net per-ability-kind signals (heal/laser+pierce/
@@ -97,6 +101,17 @@ remain ops work outside the engine's semantics.
    plies, or H growth), not more of the same corpus. The pipes are
    what this rung delivers. See `nnue.rs`, `selfplay.rs`,
    `botboard-ffi/src/srw.rs`, `artifacts/srw_net_v1.bin`.
+   **Recipe levers tried (Aug 2026):** `train-net srw` gained
+   `--depth` (teacher depth, was fixed 2) and `--plies` (value-target
+   horizon, was fixed 160). The 800-game / depth-3 / 240-ply / 10-epoch
+   run (15.6k samples, loss 0.692 → 0.689, probed at depth 3) scored
+   **40.6% HOLD** (0–26–6, draw-heavy) — WORSE than the depth-2 50%:
+   a deeper teacher strengthens the baseline as much as the corpus,
+   and the near-flat loss says H=32 is capacity-saturated on the
+   21-dim SRW descriptor space. Conclusion: depth/horizon alone do
+   not promote; the binding constraint is net capacity —
+   runtime-sized H (the rung-5 prerequisite) or a teacher-diverse
+   corpus is the next real lever.
 4. **Process-parallel farm** (ops): N engine processes with disjoint
    seed ranges appending to a shared game store; the deterministic
    per-seed actor pool makes shard merges trivially reproducible.
@@ -184,10 +199,13 @@ each is a deliberate deferral, listed so it can't silently vanish.
 2. **SRW spec v4 catch-up** — ✅ DONE (Aug 2026):
    `Subterranean_Robot_Wars_Spec_v4.md` (Appendix E = the authoring
    surface; §7 rules army transfer campaign-side; spy/codex shipped).
-3. **SRW net promotion recipe** (scale rung 3's open half) — highest
-   leverage for play quality; try deeper teacher games and longer
-   value targets before H growth.
-4. **League widening** (scale rung 2) — pure config, overnight run.
+3. **SRW net promotion recipe** — 🟡 LEVERS DONE, PROMOTION OPEN
+   (Aug 2026): `--depth`/`--plies` implemented and measured; the
+   depth-3/240-ply run probed 40.6% HOLD (see rung 3 above). The
+   empirical answer: capacity (runtime-sized H) is the binding
+   constraint, so promotion moves behind the rung-5 prerequisite.
+4. **League widening** — ✅ DONE (Aug 2026): 14-member run with real
+   Nash spread (see rung 2 above).
 5. **Bits 2.0 tail, on demand** — custom MOVE scripts and descriptor
    v3 only when Maker Mode / custom-content eval actually need them;
    army-transfer primitive when the campaign layer asks.
