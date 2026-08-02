@@ -244,6 +244,9 @@ fn random_robot_army_samples_the_full_vocabulary() {
                     }
                     // Batch-2 abilities joined the palette in batch 3.
                     AbilityBit::Swap { .. } | AbilityBit::Push { .. } => seen[11] += 1,
+                    // Stage-4 custom references never appear in generated
+                    // armies (the generator draws from the stdlib palette).
+                    AbilityBit::Custom(_) => unreachable!("generator emits stdlib bits only"),
                 }
             }
         }

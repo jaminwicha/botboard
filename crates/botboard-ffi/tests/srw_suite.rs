@@ -720,3 +720,323 @@ fn batch3_grasshopper_locust_battle_over_the_abi() {
     assert_eq!(st1, st2, "same seed ⇒ same verdict");
     assert_eq!(log1, log2, "same seed ⇒ identical move log (§10.1)");
 }
+
+// ---------------------------------------------------------------------------
+// Bits 2.0 Stage 4: custom abilities and terrains authored in the setup
+// JSON — schema, validation (loud NULL + srw_last_error), wire-code
+// allocation, and full-battle determinism with customs live.
+// ---------------------------------------------------------------------------
+
+fn last_err() -> String {
+    let mut buf = [0 as c_char; 512];
+    let n = srw_last_error(buf.as_mut_ptr(), 512);
+    assert!(n >= 0, "srw_last_error buffer error: {n}");
+    buf_str(&buf)
+}
+
+/// The vampiric-strike army: a custom enemy-damage + self-heal ability
+/// referenced from a piece's ability list by id.
+fn vamp_setup(seed: u64) -> String {
+    format!(
+        r#"{{
+  "seed": {seed}, "max_plies": 120,
+  "board": {{"w": 6, "h": 6}},
+  "sides": 2,
+  "abilities": [
+    {{"id": "vamp-strike",
+      "target": {{"who": "enemy", "range": 2, "pred": ["nonroyal"]}},
+      "ops": [{{"op": "hp_add", "n": -1}}],
+      "self_ops": [{{"op": "hp_add", "n": 1, "cap": true}}],
+      "cost": {{"flat": 3.0, "mult": 1.0}},
+      "descriptor_slot": "laser"}}
+  ],
+  "types": [
+    {{"name": "ctrl", "glyph": "C", "royal": true,
+      "moves": [{{"geom": "leaper", "m": 0, "n": 1}}, {{"geom": "leaper", "m": 1, "n": 1}}]}},
+    {{"name": "vamp", "glyph": "V", "hp": 3,
+      "moves": [{{"geom": "leaper", "m": 0, "n": 1}}],
+      "abilities": [{{"kind": "vamp-strike"}}]}},
+    {{"name": "grunt", "glyph": "G", "hp": 2,
+      "moves": [{{"geom": "leaper", "m": 0, "n": 1}}]}}
+  ],
+  "placements": [
+    {{"t": 0, "side": 0, "x": 0, "y": 0}},
+    {{"t": 1, "side": 0, "x": 2, "y": 2}},
+    {{"t": 0, "side": 1, "x": 5, "y": 5}},
+    {{"t": 2, "side": 1, "x": 3, "y": 3}}
+  ],
+  "tiers": [0, 0]
+}}"#
+    )
+}
+
+/// A custom vampiric strike over the C ABI: generation surfaces the id
+/// notation and the upward-allocated effect code (11), application
+/// drains the enemy and feeds the caster (capped), lethal damage kills
+/// through the capture fate, and same-seed battles replay identically
+/// (make/unmake hash parity is debug-asserted under every make).
+#[test]
+fn stage4_vamp_strike_over_the_abi() {
+    let b = srw_create(c(&vamp_setup(3)).as_ptr());
+    assert!(!b.is_null(), "vamp setup must build: {}", last_err());
+    assert_eq!(last_err(), "", "successful create clears the error slot");
+
+    // Generation: the strike surfaces with id notation and effect 11.
+    let n = srw_legal_count(b);
+    let mut mv = [0 as c_char; 48];
+    let mut info = [0 as c_int; 6];
+    let mut strike_idx = None;
+    for i in 0..n {
+        assert!(srw_legal_move(b, i, mv.as_mut_ptr(), 48) > 0);
+        if buf_str(&mv) == "c3!vamp-strike:d4" {
+            strike_idx = Some(i);
+        }
+    }
+    let si = strike_idx.expect("vamp strike generates over the ABI");
+    assert_eq!(srw_legal_info(b, si, info.as_mut_ptr()), 0);
+    assert_eq!(info[2], 5, "ability kind code");
+    assert_eq!(info[4], 11, "custom effect codes allocate upward from the stdlib band");
+
+    // Apply: grunt (piece 3) 2 → 1 HP; vamp (piece 1) capped at 3.
+    let mut pi = [0 as c_int; 6];
+    assert_eq!(srw_apply(b, c("c3!vamp-strike:d4").as_ptr()), 0);
+    assert_eq!(srw_piece_info(b, 3, pi.as_mut_ptr()), 0);
+    assert_eq!(pi[3], 1, "grunt takes 1 damage");
+    assert_eq!(srw_piece_info(b, 1, pi.as_mut_ptr()), 0);
+    assert_eq!(pi[3], 3, "full-HP vampire's drink caps at type max");
+
+    // Enemy shuffles; the second strike kills through the capture fate.
+    assert_eq!(srw_apply(b, c("f6f5").as_ptr()), 0);
+    assert_eq!(srw_apply(b, c("c3!vamp-strike:d4").as_ptr()), 0);
+    assert_eq!(srw_piece_info(b, 3, pi.as_mut_ptr()), 0);
+    assert_eq!(pi[4], 0, "1-HP grunt falls to the custom strike");
+    srw_destroy(b);
+
+    // Determinism: same seed, AI-driven, identical logs (§10.1).
+    let run = |seed: u64| -> (c_int, Vec<String>) {
+        let b = srw_create(c(&vamp_setup(seed)).as_ptr());
+        assert!(!b.is_null());
+        let mut mv = [0 as c_char; 48];
+        let mut log = Vec::new();
+        for _ in 0..200 {
+            if srw_status(b) != 0 {
+                break;
+            }
+            let r = srw_ai_move(b, mv.as_mut_ptr(), 48);
+            assert!(r >= 0, "ai_move failed: {r}");
+            let m = buf_str(&mv);
+            assert_eq!(srw_apply(b, c(&m).as_ptr()), 0, "arbiter accepts {m}");
+            log.push(m);
+        }
+        let st = srw_status(b);
+        srw_destroy(b);
+        (st, log)
+    };
+    let (st1, log1) = run(17);
+    let (st2, log2) = run(17);
+    assert_ne!(st1, 0, "vamp battle reaches a verdict");
+    assert_eq!(st1, st2, "same seed ⇒ same verdict");
+    assert_eq!(log1, log2, "same seed ⇒ identical move log with a custom effect live");
+}
+
+/// Custom terrains over the C ABI: a lava row (on-land bite, lethal at
+/// 0) and an owner-secret glow row — wire codes allocate upward (14+),
+/// the concealment masks read the custom rows, and the hazard persists
+/// (consumed: false).
+#[test]
+fn stage4_custom_lava_terrain_over_the_abi() {
+    let spec = r#"{
+  "seed": 7, "max_plies": 80,
+  "board": {"w": 6, "h": 6},
+  "sides": 2,
+  "terrains": [
+    {"id": "lava", "code": "auto",
+     "blocks": {"ground": false, "flight": false, "drill": false},
+     "on_land": {"ops": [{"op": "hp_add", "n": -1}], "gate": "anyone", "consumed": false},
+     "carry": null, "conceal": null, "tiers": 0},
+    {"id": "glow", "conceal": "owner_secret", "owner": 0}
+  ],
+  "types": [
+    {"name": "ctrl", "glyph": "C", "royal": true,
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}]},
+    {"name": "runner", "glyph": "R", "hp": 2,
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}]}
+  ],
+  "placements": [
+    {"t": 0, "side": 0, "x": 0, "y": 0},
+    {"t": 1, "side": 0, "x": 2, "y": 2},
+    {"t": 0, "side": 1, "x": 5, "y": 5}
+  ],
+  "terrain": [{"x": 2, "y": 3, "kind": "lava"}, {"x": 4, "y": 0, "kind": "glow"}],
+  "tiers": [0, 0]
+}"#;
+    let b = srw_create(c(spec).as_ptr());
+    assert!(!b.is_null(), "lava setup must build: {}", last_err());
+
+    // Wire codes: custom rows surface as 14 + index, in setup order.
+    let lava_sq = 2 + 3 * 6;
+    let glow_sq = 4;
+    assert_eq!(srw_terrain(b, lava_sq), 14, "lava wire code");
+    assert_eq!(srw_terrain(b, glow_sq), 15, "glow wire code");
+    // Owner-secret custom conceal: the owner sees it, the enemy floor.
+    assert_eq!(srw_terrain_for(b, 0, glow_sq), 15, "owner sees the glow");
+    assert_eq!(srw_terrain_for(b, 1, glow_sq), 0, "enemy sees bare floor");
+    assert_eq!(srw_terrain_for(b, 1, lava_sq), 14, "unconcealed lava is public");
+
+    // Landing bites: runner (piece 1) 2 → 1 HP; the pool persists.
+    let mut pi = [0 as c_int; 6];
+    assert_eq!(srw_apply(b, c("c3c4").as_ptr()), 0);
+    assert_eq!(srw_piece_info(b, 1, pi.as_mut_ptr()), 0);
+    assert_eq!(pi[3], 1, "lava bites the lander");
+    assert_eq!(srw_terrain(b, lava_sq), 14, "lava persists (consumed: false)");
+
+    // Off and back on at 1 HP: the pool claims the runner.
+    assert_eq!(srw_apply(b, c("f6f5").as_ptr()), 0);
+    assert_eq!(srw_apply(b, c("c4c3").as_ptr()), 0);
+    assert_eq!(srw_apply(b, c("f5f6").as_ptr()), 0);
+    assert_eq!(srw_apply(b, c("c3c4").as_ptr()), 0);
+    assert_eq!(srw_piece_info(b, 1, pi.as_mut_ptr()), 0);
+    assert_eq!(pi[4], 0, "lava is lethal at 0");
+    srw_destroy(b);
+}
+
+/// Every validation failure is loud: srw_create returns NULL and
+/// srw_last_error names the fault precisely.
+#[test]
+fn stage4_validation_failures_name_the_fault() {
+    // A minimal valid skeleton the cases below corrupt.
+    let base = |abilities: &str, terrains: &str| {
+        format!(
+            r#"{{
+  "seed": 1, "board": {{"w": 6, "h": 6}}, "sides": 2,
+  {abilities}{terrains}
+  "types": [
+    {{"name": "ctrl", "glyph": "C", "royal": true,
+      "moves": [{{"geom": "leaper", "m": 0, "n": 1}}]}}
+  ],
+  "placements": [
+    {{"t": 0, "side": 0, "x": 0, "y": 0}},
+    {{"t": 0, "side": 1, "x": 5, "y": 5}}
+  ]
+}}"#
+        )
+    };
+    let ok_ability = |body: &str| {
+        format!(r#""abilities": [{body}],"#)
+    };
+    let good = r#"{"id": "zap", "target": {"who": "enemy", "range": 2},
+        "ops": [{"op": "hp_add", "n": -1}],
+        "cost": {"flat": 1.0, "mult": 1.0}, "descriptor_slot": "laser"}"#;
+
+    // Sanity: the skeleton with a good custom builds.
+    let ok = srw_create(c(&base(&ok_ability(good), "")).as_ptr());
+    assert!(!ok.is_null(), "skeleton must build: {}", last_err());
+    srw_destroy(ok);
+
+    let cases: Vec<(String, &str)> = vec![
+        // -- ability validation ------------------------------------------
+        (ok_ability(&good.replace("hp_add", "teleport")), "unknown op"),
+        (
+            ok_ability(&good.replace(r#""who": "enemy", "range": 2"#,
+                r#""who": "enemy", "range": 2, "pred": ["sleepy"]"#)),
+            "unknown pred",
+        ),
+        (ok_ability(&good.replace(r#""who": "enemy""#, r#""who": "anything""#)), "unknown target.who"),
+        (
+            ok_ability(&good.replace(
+                r#""ops": [{"op": "hp_add", "n": -1}]"#,
+                r#""ops": [{"op": "hp_add", "n": -1},{"op": "hp_add", "n": -1},{"op": "hp_add", "n": -1},{"op": "hp_add", "n": -1},{"op": "hp_add", "n": -1},{"op": "hp_add", "n": -1},{"op": "hp_add", "n": -1},{"op": "hp_add", "n": -1},{"op": "hp_add", "n": -1}]"#,
+            )),
+            "op list length",
+        ),
+        (
+            ok_ability(&good.replace(r#""ops": [{"op": "hp_add", "n": -1}]"#, r#""ops": []"#)),
+            "at least one op",
+        ),
+        (
+            ok_ability(&good.replace(r#""cost": {"flat": 1.0, "mult": 1.0}, "#, "")),
+            "cost hint required",
+        ),
+        (
+            ok_ability(&good.replace(r#", "descriptor_slot": "laser""#, "")),
+            "descriptor_slot required",
+        ),
+        (
+            ok_ability(&good.replace(r#""descriptor_slot": "laser""#, r#""descriptor_slot": "plasma""#)),
+            "not a stdlib kin",
+        ),
+        (ok_ability(&good.replace(r#""id": "zap""#, r#""id": "heal""#)), "collides with a stdlib ability"),
+        (ok_ability(&format!("{good}, {good}")), "duplicate id"),
+        (ok_ability(&good.replace(r#""n": -1"#, r#""n": 0"#)), "hp_add n must be"),
+        (ok_ability(&good.replace(r#""n": -1"#, r#""n": -12"#)), "hp_add n must be"),
+        (ok_ability(&good.replace(r#""range": 2"#, r#""range": 0"#)), "target.range must be"),
+        (
+            ok_ability(&good.replace(r#""who": "enemy", "range": 2"#,
+                r#""who": "friendly", "ray": {"max": 3}"#)),
+            "ray reach requires who",
+        ),
+        (
+            ok_ability(&good.replace(r#"{"op": "hp_add", "n": -1}"#,
+                r#"{"op": "set_terrain", "kind": "wall"}"#)),
+            "set_terrain needs who",
+        ),
+        (ok_ability(&good.replace(r#""id": "zap""#, r#""id": "Bad Id!""#)), "bad id"),
+        (
+            ok_ability(&good.replace(r#""cost": {"flat": 1.0, "mult": 1.0}"#,
+                r#""cost": {"flat": 1.0, "mult": 99.0}"#)),
+            "cost.mult must be",
+        ),
+        // -- terrain validation ------------------------------------------
+        (
+            format!(
+                r#""terrains": [{}],"#,
+                (0..17)
+                    .map(|i| format!(r#"{{"id": "t{i}"}}"#))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "at most 16 custom rows",
+        ),
+        (r#""terrains": [{"id": "wall"}],"#.to_string(), "collides with a stdlib terrain"),
+        (r#""terrains": [{"id": "x"}, {"id": "x"}],"#.to_string(), "duplicate id"),
+        (r#""terrains": [{"id": "x", "tiers": 2}],"#.to_string(), "tiers must be 0 or 1"),
+        (r#""terrains": [{"id": "x", "code": 40}],"#.to_string(), "code must be \"auto\""),
+        (
+            r#""terrains": [{"id": "x", "carry": {"belt": {"dx": 0, "dy": 0}}}],"#.to_string(),
+            "unit step",
+        ),
+        (
+            r#""terrains": [{"id": "x", "conceal": "owner_secret"}],"#.to_string(),
+            "requires \"owner\"",
+        ),
+        (
+            r#""terrains": [{"id": "x", "on_land": {"ops": [{"op": "hp_add", "n": -1}], "gate": "enemy_of_owner"}}],"#
+                .to_string(),
+            "requires \"owner\"",
+        ),
+        (
+            r#""terrains": [{"id": "x", "on_land": {"ops": [{"op": "burninate", "n": -1}]}}],"#
+                .to_string(),
+            "unknown on_land op",
+        ),
+        (
+            r#""terrains": [{"id": "x", "on_land": {"ops": [{"op": "hp_add", "n": 9}]}}],"#
+                .to_string(),
+            "on_land hp_add n must be",
+        ),
+    ];
+    for (frag, want) in cases {
+        let spec = if frag.starts_with(r#""terrains""#) {
+            base("", &frag)
+        } else {
+            base(&frag, "")
+        };
+        let b = srw_create(c(&spec).as_ptr());
+        assert!(b.is_null(), "must reject: {frag}");
+        let err = last_err();
+        assert!(
+            err.contains(want),
+            "error must name the fault: wanted {want:?} in {err:?} for {frag}"
+        );
+    }
+}

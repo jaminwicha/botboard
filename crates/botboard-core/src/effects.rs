@@ -232,9 +232,11 @@ pub static EMPTY: AbilityDef = AbilityDef {
     descriptor_slot: NO_SLOT,
 };
 
-/// Registry lookup for a move's effect id: which stdlib row applies it.
+/// Registry lookup for a move's effect id: which STDLIB row applies it.
 /// (`Effect` keeps its enum shape as the stable wire/notation surface;
-/// its variants ARE the stdlib ids this stage.)
+/// its variants ARE the stdlib ids.) `Effect::Custom` never reaches this
+/// lookup — custom rows are GameDef-owned (`GameDef::custom_effects`)
+/// and every consumer branches to them first.
 #[inline]
 pub fn row(e: Effect) -> &'static AbilityDef {
     match e {
@@ -248,12 +250,14 @@ pub fn row(e: Effect) -> &'static AbilityDef {
         Effect::Swap => &SWAP,
         Effect::Push => &PUSH,
         Effect::None | Effect::Twice => &EMPTY,
+        Effect::Custom(_) => unreachable!("custom effects resolve via GameDef::custom_effects"),
     }
 }
 
 /// Compile step for the authoring surface: which registry row an
 /// `AbilityBit` generates moves for (ranges/amounts/pierce/retreat stay
-/// parameters of the bit; the row is the application script).
+/// parameters of the bit; the row is the application script). Custom
+/// bits have no static row — their GameDef row IS the definition.
 pub fn ability_row(a: &AbilityBit) -> &'static AbilityDef {
     match a {
         AbilityBit::Heal { .. } => &HEAL,
@@ -265,5 +269,74 @@ pub fn ability_row(a: &AbilityBit) -> &'static AbilityDef {
         AbilityBit::MineLayer { .. } => &MINE,
         AbilityBit::Swap { .. } => &SWAP,
         AbilityBit::Push { .. } => &PUSH,
+        AbilityBit::Custom(_) => {
+            unreachable!("custom ability bits resolve via GameDef::custom_effects")
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: custom, GameDef-owned ability rows (setup-JSON authored).
+// ---------------------------------------------------------------------------
+
+/// The stdlib ability ids (registry row ids plus the FFI parser's kind
+/// names) — custom ids must not collide with any of these.
+pub const STDLIB_ABILITY_IDS: &[&str] = &[
+    "heal", "wall", "pit", "laser", "rez", "resurrect", "hack", "mine", "swap", "push", "none",
+];
+
+/// Target reach of a custom ability. Unlike stdlib rows (whose
+/// range/pierce parameters ride the authoring `AbilityBit`), a custom
+/// row carries its own parameters — the row IS the definition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CustomReach {
+    /// Chebyshev ball of `range` around the caster.
+    Point { range: u8 },
+    /// Queen-line beam: first enemy on each of the 8 rays within `max`
+    /// steps (all enemies on the ray when `pierce`); blocking terrain
+    /// stops the beam; a friendly stops a non-piercing beam.
+    Ray { max: u8, pierce: bool },
+}
+
+/// One custom ability as data (Bits 2.0 Stage 4): validated at the FFI
+/// boundary, owned by the `GameDef`, applied by the (cold) custom-effect
+/// interpreter. Ops draw from the same closed micro-op set; the target
+/// vocabulary is the piece/empty subset of the stdlib selector shapes
+/// (`Who::Friendly` / `Who::Enemy` / `Who::EmptyCell`; preds `Damaged` /
+/// `HpEq1` / `NonRoyal`). Relocation-coupled shapes (swap/push/retreat/
+/// resurrect) stay stdlib-only — they need aux-square generation the
+/// custom walker does not do.
+#[derive(Clone, Debug)]
+pub struct CustomAbility {
+    pub id: String,
+    pub who: Who,
+    pub reach: CustomReach,
+    pub preds: Vec<Pred>,
+    /// Applied in order against the target square (`to`). `HpAdd` here
+    /// is lethal at 0 (strike-to-kill through the capture fate), unlike
+    /// the stdlib ability interpreter's generation-guarded `HpAdd`.
+    pub ops: Vec<MicroOp>,
+    /// Applied after `ops`, against the caster (`from`). `HpAdd` only.
+    pub self_ops: Vec<MicroOp>,
+    pub cost: CostHint,
+    /// NNUE descriptor dim (a stdlib kin's slot via [`kin_slot`], or
+    /// [`NO_SLOT`]): the frozen 21-dim layout, documented approximation.
+    pub descriptor_slot: u8,
+}
+
+/// Map a stdlib kin NAME to its v2 descriptor slot (the frozen 21-dim
+/// layout: dims 10–15 are heal/laser/wall+pit/mine/rez/hack). Kins
+/// without a dedicated dim ("swap"/"push"/"none") map to [`NO_SLOT`] —
+/// their value flows through the cost hint's flat prior only.
+pub fn kin_slot(name: &str) -> Option<u8> {
+    Some(match name {
+        "heal" => 10,
+        "laser" => 11,
+        "wall" | "pit" => 12,
+        "mine" => 13,
+        "resurrect" | "rez" => 14,
+        "hack" => 15,
+        "swap" | "push" | "none" => NO_SLOT,
+        _ => return None,
+    })
 }

@@ -209,4 +209,11 @@ pub enum AbilityBit {
     /// open (for the pushed piece's terrain permissions) and empty.
     /// Landing hazards bite the shoved piece.
     Push { range: u8 },
+    /// Bits 2.0 Stage 4: reference to a CUSTOM ability row
+    /// (`GameDef::custom_effects[index]`). The row carries the whole
+    /// definition — selector, range, ops, cost, descriptor slot — so
+    /// this bit has no parameters of its own (per-piece parameters on a
+    /// custom reference are ignored by design: the row IS the
+    /// definition).
+    Custom(u16),
 }

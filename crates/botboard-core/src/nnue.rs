@@ -91,6 +91,21 @@ pub fn descriptor(g: &GameDef, t: TypeId, side: Side) -> [f32; D] {
             // dim: the 21-dim layout is frozen for checkpoint
             // compatibility; their value flows through the flat priors.
             AbilityBit::Swap { .. } | AbilityBit::Push { .. } => {}
+            // Stage-4 custom rows map into the frozen layout via their
+            // validated stdlib-kin slot (documented approximation: a
+            // fixed presence signal of 1.0 on the kin's dim — exactly
+            // representable at ×64 — or the wall/pit +0.5 step; kins
+            // without a dim contribute nothing here and price via the
+            // cost hint's flat prior).
+            AbilityBit::Custom(ci) => match g.custom_effects[ci as usize].descriptor_slot {
+                10 => heal = heal.max(1.0),
+                11 => laser = laser.max(1.0),
+                12 => wallpit = (wallpit + 0.5).min(1.0),
+                13 => mine = 1.0,
+                14 => res = 1.0,
+                15 => hack = 1.0,
+                _ => {}
+            },
         }
     }
     [

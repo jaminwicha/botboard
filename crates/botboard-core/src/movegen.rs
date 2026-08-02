@@ -362,7 +362,7 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
     // empty sheet keeps sliding along its ray — destinations are
     // rewritten here so make/unmake and hashing never know ice existed.
     // Leapers land normally (the row's `riders_only` parameter).
-    let any_ice = pos.terrain.iter().any(|&t| crate::terrain_defs::slides(t));
+    let any_ice = pos.terrain.iter().any(|&t| g.terrain_slides(t));
     if any_ice {
         for m in out.iter_mut() {
             slide_on_ice(g, pos, m);
@@ -374,7 +374,7 @@ pub fn pseudo_moves(g: &GameDef, pos: &Position) -> Vec<Move> {
     // restriction on the row). Documented interleave rule: belts resolve
     // AFTER the ice slide, one pass, no re-entry into ice logic — a belt
     // dumping onto ice does not restart the skid.
-    let any_belt = pos.terrain.iter().any(|&t| crate::terrain_defs::belts(t));
+    let any_belt = pos.terrain.iter().any(|&t| g.terrain_belts(t));
     if any_belt {
         for m in out.iter_mut() {
             carry_on_belt(g, pos, m);
@@ -597,15 +597,14 @@ fn gen_partner_compound(
 /// open non-slide cell past the sheet. The rider-only rule is the row's
 /// `riders_only` parameter, not a hard-coded kind check.
 fn slide_on_ice(g: &GameDef, pos: &Position, mv: &mut Move) {
-    use crate::terrain_defs::{self, Carry};
+    use crate::terrain_defs::Carry;
     if mv.kind != MoveKind::Normal || mv.promo.is_some() {
         return;
     }
     if pos.board[mv.to as usize] >= 0 {
         return;
     }
-    let Carry::Slide { riders_only } = terrain_defs::row(pos.terrain[mv.to as usize]).carry
-    else {
+    let Carry::Slide { riders_only } = g.terrain_carry(pos.terrain[mv.to as usize]) else {
         return;
     };
     let mover = pos.piece_at(mv.from).expect("mover exists");
@@ -636,7 +635,7 @@ fn slide_on_ice(g: &GameDef, pos: &Position, mv: &mut Move) {
         if pos.board[next as usize] >= 0 || !pos.terrain_open_for(next, flies, drills) {
             break; // stop on the last ice cell before the obstruction
         }
-        if terrain_defs::slides(pos.terrain[next as usize]) {
+        if g.terrain_slides(pos.terrain[next as usize]) {
             cur = next;
             continue;
         }
@@ -655,7 +654,6 @@ fn slide_on_ice(g: &GameDef, pos: &Position, mv: &mut Move) {
 /// (the scuffle jams the rollers), nor are drops, specials, abilities,
 /// compounds, or promotion landings — the same guards as the ice pass.
 fn carry_on_belt(g: &GameDef, pos: &Position, mv: &mut Move) {
-    use crate::position::conv_dir;
     if mv.kind != MoveKind::Normal || mv.promo.is_some() {
         return;
     }
@@ -668,7 +666,7 @@ fn carry_on_belt(g: &GameDef, pos: &Position, mv: &mut Move) {
     let mut cur = mv.to;
     let mut visited: Vec<u16> = vec![cur];
     for _ in 0..8 {
-        let Some((dx, dy)) = conv_dir(pos.terrain[cur as usize]) else { break };
+        let Some((dx, dy)) = g.terrain_conv_dir(pos.terrain[cur as usize]) else { break };
         let Some(next) = g.board.offset(cur, dx, dy) else { break };
         if pos.board[next as usize] >= 0 || !pos.terrain_open_for(next, flies, drills) {
             break; // blocked exit: the piece parks on the belt
@@ -812,7 +810,7 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                             // each hit drops it one tier (make handles
                             // the empty-victim square as terrain damage).
                             // The beam still stops here, pierce or not.
-                            if crate::terrain_defs::is_block(pos.terrain[nsq as usize])
+                            if g.terrain_is_block(pos.terrain[nsq as usize])
                                 && pos.board[nsq as usize] < 0
                             {
                                 let aux = if retreat {
@@ -909,6 +907,93 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                         continue;
                     }
                     out.push(Move::ability(from, sq, Effect::Push, dest));
+                }
+            }
+            // Bits 2.0 Stage 4: a custom row — one generic walker over
+            // the row's selector (who × point/ray × preds); the row
+            // carries its own parameters (the bit is a bare reference).
+            AbilityBit::Custom(ci) => gen_custom_ability(g, pos, from, ci, out),
+        }
+    }
+}
+
+/// Custom-ability generation (Bits 2.0 Stage 4): walk the GameDef row's
+/// selector. Point selectors mirror the stdlib chebyshev-ball walkers
+/// (heal/hack for pieces, wall/pit/mine's bare-cell scan for empties);
+/// ray selectors mirror the laser's beam walk (blocking terrain stops
+/// the beam; a friendly stops a non-piercing beam; `pierce` targets
+/// every enemy along the ray). Preds are the piece-target predicates
+/// (`Damaged` / `HpEq1` / `NonRoyal`); empty-cell targeting is always
+/// bare-floor, matching the stdlib terrain-layers.
+fn gen_custom_ability(g: &GameDef, pos: &Position, from: u16, ci: u16, out: &mut Vec<Move>) {
+    use crate::effects::{CustomReach, Pred, Who};
+    let row = &g.custom_effects[ci as usize];
+    let stm = pos.stm;
+    let (fx, fy) = g.board.xy(from);
+    let pred_ok = |sq: u16, p: &Piece| {
+        let idx = pos.board[sq as usize] as usize;
+        row.preds.iter().all(|pr| match pr {
+            Pred::Damaged => pos.hp[idx] < g.types[p.t as usize].max_hp,
+            Pred::HpEq1 => hp_gate_ok(1, 1, pos.hp[idx]),
+            Pred::NonRoyal => !g.types[p.t as usize].royal,
+            // Validation keeps the remaining stdlib preds off custom
+            // rows (they couple to relocation shapes).
+            _ => true,
+        })
+    };
+    match row.reach {
+        CustomReach::Point { range } => match row.who {
+            Who::Friendly | Who::Enemy => {
+                for p in &pos.pieces {
+                    let Loc::Board(sq) = p.loc else { continue };
+                    let want_friendly = row.who == Who::Friendly;
+                    if (p.side == stm) != want_friendly || sq == from {
+                        continue;
+                    }
+                    let (x, y) = g.board.xy(sq);
+                    if (x - fx).abs().max((y - fy).abs()) as u8 <= range && pred_ok(sq, p) {
+                        out.push(Move::ability(from, sq, Effect::Custom(ci), NO_SQ));
+                    }
+                }
+            }
+            _ => {
+                // Empty-cell targeting: bare floor only (the absence
+                // row), never the caster's own square — the stdlib
+                // terrain-layer rule.
+                for sq in 0..g.board.ncells() as u16 {
+                    if sq == from
+                        || pos.cell_obstructed(sq)
+                        || !crate::terrain_defs::is_bare(pos.terrain[sq as usize])
+                    {
+                        continue;
+                    }
+                    let (x, y) = g.board.xy(sq);
+                    if (x - fx).abs().max((y - fy).abs()) as u8 <= range {
+                        out.push(Move::ability(from, sq, Effect::Custom(ci), NO_SQ));
+                    }
+                }
+            }
+        },
+        CustomReach::Ray { max, pierce } => {
+            // Enemy-target beam (validation pins ray rows to who=enemy).
+            for (dx, dy) in
+                [(0i8, 1i8), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+            {
+                let mut cur = from;
+                for _ in 0..max {
+                    let Some(nsq) = g.board.offset(cur, dx, dy) else { break };
+                    if !pos.terrain_open(nsq) {
+                        break; // blocking terrain stops the beam
+                    }
+                    if let Some(v) = pos.piece_at(nsq) {
+                        if v.side != stm && pred_ok(nsq, v) {
+                            out.push(Move::ability(from, nsq, Effect::Custom(ci), NO_SQ));
+                        }
+                        if !pierce {
+                            break;
+                        }
+                    }
+                    cur = nsq;
                 }
             }
         }

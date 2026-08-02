@@ -78,6 +78,15 @@ pub struct Position {
     /// (`DRILL_EXEMPT` — walls + destructible blocks; same maintenance).
     wall_count: u16,
     wide: bool,
+    /// Bits 2.0 Stage 4: per-class blocking masks over the CUSTOM
+    /// terrain band (bit `i` = internal code `NT + i` blocks that
+    /// class), copied from the GameDef at construction so the g-less
+    /// hot predicates stay g-less. All zero when the battle has no
+    /// custom terrain — the custom branch is then a single predictable
+    /// `t >= NT` compare that stdlib codes never take.
+    cust_ground: u16,
+    cust_flight: u16,
+    cust_drill: u16,
 }
 
 /// Per-move undo: the micro-op log (Bits 2.0 — every mutation a move
@@ -93,6 +102,18 @@ pub struct Undo {
 
 impl Position {
     pub fn from_pieces(g: &GameDef, list: &[(TypeId, Side, u16, bool)], stm: Side) -> Self {
+        let (mut cg, mut cf, mut cd) = (0u16, 0u16, 0u16);
+        for (i, ct) in g.custom_terrains.iter().enumerate() {
+            if ct.blocks.ground {
+                cg |= 1 << i;
+            }
+            if ct.blocks.flight {
+                cf |= 1 << i;
+            }
+            if ct.blocks.drill {
+                cd |= 1 << i;
+            }
+        }
         let mut pos = Position {
             board: vec![-1; g.board.ncells()],
             pieces: Vec::with_capacity(list.len()),
@@ -108,6 +129,9 @@ impl Position {
             pit_count: 0,
             wall_count: 0,
             wide: g.use_bitboards && g.board.ncells() <= 128,
+            cust_ground: cg,
+            cust_flight: cf,
+            cust_drill: cd,
         };
         for &(t, side, sq, moved) in list {
             pos.board[sq as usize] = pos.pieces.len() as i32;
@@ -136,10 +160,16 @@ impl Position {
     pub fn rehash(&mut self, g: &GameDef) {
         use crate::terrain_defs::{drill_exempt, flight_exempt};
         self.hash = g.zobrist.full_hash(self);
-        self.pit_count =
-            self.terrain.iter().filter(|&&t| flight_exempt(t)).count() as u16;
-        self.wall_count =
-            self.terrain.iter().filter(|&&t| drill_exempt(t)).count() as u16;
+        self.pit_count = self
+            .terrain
+            .iter()
+            .filter(|&&t| flight_exempt(t) || self.cust_flight_exempt(t))
+            .count() as u16;
+        self.wall_count = self
+            .terrain
+            .iter()
+            .filter(|&&t| drill_exempt(t) || self.cust_drill_exempt(t))
+            .count() as u16;
         if self.wide {
             self.occ_all = 0;
             self.occ_side.iter_mut().for_each(|m| *m = 0);
@@ -156,7 +186,7 @@ impl Position {
                 }
             }
             for sq in 0..self.terrain.len() {
-                if terrain_blocks(self.terrain[sq]) {
+                if terrain_blocks(self.terrain[sq]) || self.cust_blocks(self.terrain[sq]) {
                     self.terrain_mask |= 1u128 << sq;
                 }
             }
@@ -172,10 +202,54 @@ impl Position {
         }
     }
 
+    // -- Stage-4 custom-band blocking (per-Position masks) -------------
+    //
+    // The stdlib predicates keep their exact derived range-compare
+    // forms (and their exhaustive compile-time proof); codes in the
+    // custom band (>= NT) — which the stdlib chains always miss — fall
+    // through to one `t >= NT` compare plus a mask probe. Stdlib-only
+    // battles never take the probe: the added cost is the single
+    // predictable compare on the predicate's false path.
+
+    /// Custom-band bit probe: does code `t` (>= NT) set `mask`?
+    #[inline]
+    fn cust_bit(mask: u16, t: u8) -> bool {
+        t >= crate::terrain_defs::NT as u8
+            && (mask >> (t - crate::terrain_defs::NT as u8)) & 1 == 1
+    }
+
+    /// Custom-band twin of `terrain_blocks`.
+    #[inline]
+    fn cust_blocks(&self, t: u8) -> bool {
+        Self::cust_bit(self.cust_ground, t)
+    }
+
+    /// Custom-band twin of `terrain_stops`: a piece stops iff every
+    /// permission class it holds is blocked by the row.
+    #[inline]
+    fn cust_stops(&self, t: u8, flies: bool, drills: bool) -> bool {
+        Self::cust_bit(self.cust_ground, t)
+            && (!flies || Self::cust_bit(self.cust_flight, t))
+            && (!drills || Self::cust_bit(self.cust_drill, t))
+    }
+
+    /// Custom-band twin of `flight_exempt` (ground-blocking, flyer passes).
+    #[inline]
+    fn cust_flight_exempt(&self, t: u8) -> bool {
+        Self::cust_bit(self.cust_ground, t) && !Self::cust_bit(self.cust_flight, t)
+    }
+
+    /// Custom-band twin of `drill_exempt` (ground-blocking, driller passes).
+    #[inline]
+    fn cust_drill_exempt(&self, t: u8) -> bool {
+        Self::cust_bit(self.cust_ground, t) && !Self::cust_bit(self.cust_drill, t)
+    }
+
     /// A cell a ray/screen/leg cannot pass and a piece cannot enter.
     #[inline]
     pub fn cell_obstructed(&self, sq: u16) -> bool {
-        self.board[sq as usize] >= 0 || terrain_blocks(self.terrain[sq as usize])
+        let t = self.terrain[sq as usize];
+        self.board[sq as usize] >= 0 || terrain_blocks(t) || self.cust_blocks(t)
     }
 
     /// `cell_obstructed` with terrain permissions: flyers pass over pits
@@ -183,22 +257,35 @@ impl Position {
     /// destructible blocks (§3.1).
     #[inline]
     pub fn cell_obstructed_for(&self, sq: u16, flies: bool, drills: bool) -> bool {
+        let t = self.terrain[sq as usize];
         self.board[sq as usize] >= 0
-            || terrain_stops(self.terrain[sq as usize], flies, drills)
+            || terrain_stops(t, flies, drills)
+            || self.cust_stops(t, flies, drills)
     }
 
     /// May a piece land here (ignoring occupancy)? Mines are open — that
     /// is their whole point.
     #[inline]
     pub fn terrain_open(&self, sq: u16) -> bool {
-        !terrain_blocks(self.terrain[sq as usize])
+        let t = self.terrain[sq as usize];
+        !(terrain_blocks(t) || self.cust_blocks(t))
     }
 
     /// `terrain_open` with terrain permissions: a flyer may hover on a
     /// pit square; a driller may stand inside a wall or block.
     #[inline]
     pub fn terrain_open_for(&self, sq: u16, flies: bool, drills: bool) -> bool {
-        !terrain_stops(self.terrain[sq as usize], flies, drills)
+        let t = self.terrain[sq as usize];
+        !(terrain_stops(t, flies, drills) || self.cust_stops(t, flies, drills))
+    }
+
+    /// Does the terrain AT `sq` stop a mover with these permissions?
+    /// (The occupancy-blind half of `cell_obstructed_for` — the hop
+    /// walkers' screen-cell terrain test.)
+    #[inline]
+    pub fn terrain_stops_at(&self, sq: u16, flies: bool, drills: bool) -> bool {
+        let t = self.terrain[sq as usize];
+        terrain_stops(t, flies, drills) || self.cust_stops(t, flies, drills)
     }
 
     /// Any flight-exempt blocking terrain (stdlib: pits)? Gates the
@@ -279,21 +366,21 @@ impl Position {
     pub(crate) fn set_terrain(&mut self, sq: u16, t: u8) {
         use crate::terrain_defs::{drill_exempt, flight_exempt};
         let old = self.terrain[sq as usize];
-        if flight_exempt(old) {
+        if flight_exempt(old) || self.cust_flight_exempt(old) {
             self.pit_count -= 1;
         }
-        if flight_exempt(t) {
+        if flight_exempt(t) || self.cust_flight_exempt(t) {
             self.pit_count += 1;
         }
-        if drill_exempt(old) {
+        if drill_exempt(old) || self.cust_drill_exempt(old) {
             self.wall_count -= 1;
         }
-        if drill_exempt(t) {
+        if drill_exempt(t) || self.cust_drill_exempt(t) {
             self.wall_count += 1;
         }
         self.terrain[sq as usize] = t;
         if self.wide {
-            if terrain_blocks(t) {
+            if terrain_blocks(t) || self.cust_blocks(t) {
                 self.terrain_mask |= 1u128 << sq;
             } else {
                 self.terrain_mask &= !(1u128 << sq);
@@ -455,11 +542,102 @@ impl Position {
     }
 
     /// The ability interpreter: the move's effect names its registry
-    /// row; target ops then self ops apply.
+    /// row; target ops then self ops apply. Custom effects (Bits 2.0
+    /// Stage 4) branch to the GameDef-owned row's (cold) interpreter.
     pub(crate) fn apply_effect_row(&mut self, g: &GameDef, mv: &Move, log: &mut OpLog) {
+        if let Effect::Custom(ci) = mv.effect {
+            return self.apply_custom_effect(g, ci, mv, log);
+        }
         let row = crate::effects::row(mv.effect);
         self.apply_move_ops(g, mv, row.ops, log);
         self.apply_move_ops(g, mv, row.self_ops, log);
+    }
+
+    /// Lethal-capable HP damage for custom effects: `d` (> 0) points of
+    /// damage on piece `i`; the piece falls at 0 through the capture
+    /// fate. Composed entirely from existing ops (an `HpAdd` down to
+    /// 1 HP, then a `CaptureAt` kill), so undo and hashing are the
+    /// standard records — no new op, no new undo variant.
+    fn op_damage_lethal(&mut self, g: &GameDef, i: usize, d: i16, log: &mut OpLog) {
+        debug_assert!(d > 0);
+        if self.hp[i] > d {
+            self.op_hp_add(g, i, -d, false, log);
+            return;
+        }
+        if self.hp[i] > 1 {
+            let drop = 1 - self.hp[i];
+            self.op_hp_add(g, i, drop, false, log);
+        }
+        let Loc::Board(sq) = self.pieces[i].loc else {
+            unreachable!("damaging an off-board piece")
+        };
+        let killed = self.op_capture_at(g, sq, log);
+        debug_assert!(killed);
+    }
+
+    /// The CUSTOM-effect interpreter (Bits 2.0 Stage 4): the move's
+    /// effect indexes `GameDef::custom_effects`; the row's `ops` apply
+    /// against the target square (`to`), then `self_ops` against the
+    /// caster (`from`). Cold and out-of-line: custom effects never sit
+    /// on the dominant-script path.
+    ///
+    /// Semantics per op (the validated custom vocabulary):
+    /// - `HpAdd` in `ops`: negative amounts are LETHAL at 0 (unlike the
+    ///   stdlib ability interpreter's generation-guarded heal/overclock
+    ///   uses); positive amounts respect the row's `cap`.
+    /// - `HpAdd` in `self_ops`: same rules against the caster — a
+    ///   self-damage cost can kill the caster.
+    /// - `CaptureAt`/`SetTerrain`/`TerrainStep`/`FlipSide`: the shared
+    ///   op implementations, unchanged.
+    #[cold]
+    #[inline(never)]
+    fn apply_custom_effect(&mut self, g: &GameDef, ci: u16, mv: &Move, log: &mut OpLog) {
+        use crate::ops::{HpAmt, MicroOp};
+        let row = &g.custom_effects[ci as usize];
+        let ctx = OpCtx {
+            from: mv.from,
+            to: mv.to,
+            aux: mv.aux,
+            amount: 0,
+            side: self.stm,
+            drop_type: mv.drop_type,
+            promo: mv.promo,
+        };
+        for op in &row.ops {
+            match *op {
+                MicroOp::HpAdd { n: HpAmt::Lit(v), cap } if v < 0 => {
+                    let ti = self.board[mv.to as usize];
+                    debug_assert!(ti >= 0, "custom damage op on an empty target");
+                    // The target may already have fallen to an earlier op
+                    // in this script; a dead target is a no-op.
+                    if ti >= 0 {
+                        self.op_damage_lethal(g, ti as usize, -v, log);
+                    }
+                    let _ = cap;
+                }
+                _ => self.apply_op(g, op, &ctx, log),
+            }
+        }
+        for op in &row.self_ops {
+            match *op {
+                MicroOp::HpAdd { n: HpAmt::Lit(v), cap } => {
+                    let si = self.board[mv.from as usize];
+                    // The caster can only be gone if a prior self-op
+                    // killed it (validation caps self_ops at HpAdd, so
+                    // in practice it stands); guard anyway.
+                    if si < 0 {
+                        continue;
+                    }
+                    let si = si as usize;
+                    if v < 0 {
+                        self.op_damage_lethal(g, si, -v, log);
+                    } else {
+                        self.op_hp_add(g, si, v, cap, log);
+                    }
+                }
+                _ => unreachable!("custom self_ops outside the validated vocabulary"),
+            }
+        }
     }
 
     /// Overclock ⟨move, move, self −1 HP⟩ (§3.4): step 1 is a
@@ -641,7 +819,7 @@ impl Position {
                         let mut cur = psq;
                         for _ in 1..steps {
                             cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
-                            if terrain_stops(self.terrain[cur as usize], aflies, adrills) {
+                            if self.terrain_stops_at(cur, aflies, adrills) {
                                 continue 'hop; // blocking terrain is not a screen
                             }
                             if self.board[cur as usize] >= 0 {
@@ -665,7 +843,7 @@ impl Position {
                         let mut cur = psq;
                         for i in 1..steps {
                             cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
-                            if terrain_stops(self.terrain[cur as usize], aflies, adrills) {
+                            if self.terrain_stops_at(cur, aflies, adrills) {
                                 continue 'hop;
                             }
                             let occupied = self.board[cur as usize] >= 0;
@@ -685,14 +863,14 @@ impl Position {
                         // A victim tucked inside terrain the attacker's ray
                         // cannot enter (a driller in a block) is unreachable
                         // — mirror of movegen's screen-cell terrain check.
-                        if terrain_stops(self.terrain[sq as usize], aflies, adrills) {
+                        if self.terrain_stops_at(sq, aflies, adrills) {
                             continue;
                         }
                         let mut cur = psq;
                         let mut clear = true;
                         for _ in 1..steps {
                             cur = g.board.offset(cur, k.d.dx, k.d.dy).unwrap();
-                            if terrain_stops(self.terrain[cur as usize], aflies, adrills)
+                            if self.terrain_stops_at(cur, aflies, adrills)
                                 || self.board[cur as usize] >= 0
                             {
                                 clear = false;
@@ -704,7 +882,7 @@ impl Position {
                         }
                         let Some(land) = g.board.offset(sq, k.d.dx, k.d.dy) else { continue };
                         if self.board[land as usize] >= 0
-                            || terrain_stops(self.terrain[land as usize], aflies, adrills)
+                            || self.terrain_stops_at(land, aflies, adrills)
                             || !zone_ok(k.to_zone, p.side, land)
                         {
                             continue;

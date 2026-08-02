@@ -21,6 +21,10 @@ const BUCKETS: usize = 16;
 /// per terrain registry row (none, wall, pit, four owner-tagged mines,
 /// ice, grass, acid, three destructible block tiers, four conveyors).
 const TERRAINS: usize = crate::terrain_defs::NT;
+/// Custom terrain key rows (Bits 2.0 Stage 4): sized for the bounded
+/// per-battle custom cap. Drawn from the RNG stream AFTER every stdlib
+/// table, so stdlib-only key values are bit-identical to pre-Stage-4.
+const TERRAINS_EXT: usize = crate::terrain_defs::MAX_CUSTOM_TERRAIN;
 
 #[derive(Clone, Debug)]
 pub struct Zobrist {
@@ -33,6 +37,10 @@ pub struct Zobrist {
     stm: Vec<u64>,
     /// [square] en-passant target marker
     ep: Vec<u64>,
+    /// [custom-terrain-code − NT][square] — the Stage-4 custom band
+    /// (internal codes NT..NT+MAX_CUSTOM_TERRAIN). Filled last so the
+    /// stdlib tables above see the exact historical RNG stream.
+    terrain_ext: Vec<u64>,
     ncells: usize,
     ntypes: usize,
     nsides: usize,
@@ -49,6 +57,7 @@ impl Zobrist {
             hand: fill(nsides * ntypes * MAX_HAND),
             stm: fill(nsides),
             ep: fill(ncells),
+            terrain_ext: fill(TERRAINS_EXT * ncells),
             ncells,
             ntypes,
             nsides,
@@ -65,8 +74,11 @@ impl Zobrist {
     pub fn terrain_key(&self, terrain: u8, sq: usize) -> u64 {
         if terrain == T_NONE {
             0
-        } else {
+        } else if (terrain as usize) < TERRAINS {
             self.terrain[terrain as usize * self.ncells + sq]
+        } else {
+            // Stage-4 custom band: codes allocate upward from NT.
+            self.terrain_ext[(terrain as usize - TERRAINS) * self.ncells + sq]
         }
     }
 

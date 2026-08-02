@@ -42,7 +42,7 @@
 
 use crate::game::{GameDef, Side, TypeId};
 use crate::moves::NO_SQ;
-use crate::position::{is_block, mine_owner, Loc, Piece, Position, T_MINE0, T_NONE, T_PIT, T_WALL};
+use crate::position::{mine_owner, Loc, Piece, Position, T_MINE0, T_NONE, T_PIT, T_WALL};
 use crate::terrain_defs::{self, LandGate};
 
 /// Square reference, resolved against the applying move's fields.
@@ -69,12 +69,15 @@ pub enum Pool {
 }
 
 /// Terrain laid by `SetTerrain`. Owner-tagged kinds resolve against the
-/// caster's side at apply time (the T_MINE0 code band).
+/// caster's side at apply time (the T_MINE0 code band). `Code` lays a
+/// fixed internal code — Stage-4 custom ability rows may lay any
+/// authorable stdlib kind or a custom terrain row by its code.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TerrainKind {
     Wall,
     Pit,
     OwnerMine,
+    Code(u8),
 }
 
 /// HP delta source for `HpAdd`: a literal, or the amount carried by the
@@ -303,6 +306,7 @@ impl Position {
                     TerrainKind::Wall => T_WALL,
                     TerrainKind::Pit => T_PIT,
                     TerrainKind::OwnerMine => T_MINE0 + ctx.side,
+                    TerrainKind::Code(c) => c,
                 };
                 self.op_set_terrain(g, ctx.to, t, log);
             }
@@ -520,15 +524,15 @@ impl Position {
     }
 
     /// Block erosion: an unoccupied destructible block (registry
-    /// `tiers > 0`) drops one tier (tier 1 clears to bare floor);
-    /// anything else is a no-op — a piece standing inside the block
-    /// (a driller) shields it.
+    /// `tiers > 0` — stdlib band or a Stage-4 custom row) drops one
+    /// tier (tier 1 clears to bare floor); anything else is a no-op —
+    /// a piece standing inside the block (a driller) shields it.
     pub(crate) fn op_terrain_step(&mut self, g: &GameDef, sq: u16, log: &mut OpLog) {
         let t = self.terrain[sq as usize];
-        if self.board[sq as usize] >= 0 || !is_block(t) {
+        if self.board[sq as usize] >= 0 || !g.terrain_is_block(t) {
             return;
         }
-        self.op_set_terrain(g, sq, terrain_defs::erode(t), log);
+        self.op_set_terrain(g, sq, g.terrain_erode(t), log);
     }
 
     /// Hack: flip the occupant of `sq` to `side`. Masks track side, so
@@ -616,10 +620,13 @@ impl Position {
     pub(crate) fn hazard_landing(&mut self, g: &GameDef, mi: usize, log: &mut OpLog) {
         let Loc::Board(sq) = self.pieces[mi].loc else { return };
         let t = self.terrain[sq as usize];
-        if !terrain_defs::has_on_land(t) {
-            return;
+        if terrain_defs::has_on_land(t) {
+            self.land_hazard_interpret(g, mi, sq, t, log);
+        } else if t >= terrain_defs::NT as u8 {
+            // Stage-4 custom band: stdlib codes never take this branch,
+            // so the added guard cost is one predictable compare.
+            self.land_hazard_custom(g, mi, sq, t, log);
         }
-        self.land_hazard_interpret(g, mi, sq, t, log);
     }
 
     /// The on-land interpreter: gate check → consumed handling → the
@@ -652,17 +659,62 @@ impl Position {
         }
         for op in land.ops {
             match *op {
+                MicroOp::HpAdd { n: HpAmt::Lit(v), .. } => self.on_land_hp(g, mi, sq, v, log),
+                _ => unreachable!("on_land op outside the stdlib on_land vocabulary"),
+            }
+        }
+    }
+
+    /// One on-land HP tick against the lander: negative amounts carry
+    /// the hazard floor-death rule (lethal at 0), positive amounts cap
+    /// at the lander's type max (a custom healing spring cannot
+    /// overfill; stdlib on-land amounts are all negative).
+    fn on_land_hp(&mut self, g: &GameDef, mi: usize, sq: u16, v: i16, log: &mut OpLog) {
+        if v >= 0 {
+            self.op_hp_add(g, mi, v, true, log);
+        } else if self.hp[mi] + v >= 1 {
+            self.op_hp_add(g, mi, v, false, log);
+        } else {
+            self.xor_piece(g, mi);
+            self.lift(mi, sq);
+            self.pieces[mi].loc = Loc::Dead;
+            log.push(OpUndo::HazardDeath { i: mi as u32, sq });
+        }
+    }
+
+    /// The Stage-4 custom on-land interpreter: same shape as the stdlib
+    /// interpreter — gate → consumed → ops through the op log — but the
+    /// row lives on the GameDef and `EnemyOfOwner` resolves against the
+    /// row's fixed authored owner (customs are not code-banded).
+    #[cold]
+    #[inline(never)]
+    fn land_hazard_custom(&mut self, g: &GameDef, mi: usize, sq: u16, t: u8, log: &mut OpLog) {
+        let Some(ct) = g.custom_terrain(t) else { return };
+        let Some(land) = &ct.on_land else { return };
+        match land.gate {
+            LandGate::EnemyOfOwner => {
+                if ct.owner == Some(self.pieces[mi].side) {
+                    return;
+                }
+            }
+            LandGate::Anyone => {}
+        }
+        if land.consumed {
+            self.op_set_terrain(g, sq, T_NONE, log);
+        }
+        // The ops are cloned out of the row before interpreting: the
+        // ops themselves take &mut self, and the validated vocabulary
+        // (≤ 8 HpAdd literals) keeps the copy trivial.
+        for i in 0..land.ops.len() {
+            let op = g.custom_terrain(t).unwrap().on_land.as_ref().unwrap().ops[i];
+            match op {
                 MicroOp::HpAdd { n: HpAmt::Lit(v), .. } => {
-                    if self.hp[mi] + v >= 1 {
-                        self.op_hp_add(g, mi, v, false, log);
-                    } else {
-                        self.xor_piece(g, mi);
-                        self.lift(mi, sq);
-                        self.pieces[mi].loc = Loc::Dead;
-                        log.push(OpUndo::HazardDeath { i: mi as u32, sq });
+                    // The lander may already have fallen to an earlier op.
+                    if matches!(self.pieces[mi].loc, Loc::Board(_)) {
+                        self.on_land_hp(g, mi, sq, v, log);
                     }
                 }
-                _ => unreachable!("on_land op outside the stdlib on_land vocabulary"),
+                _ => unreachable!("custom on_land op outside the validated vocabulary"),
             }
         }
     }

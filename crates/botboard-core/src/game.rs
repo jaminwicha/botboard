@@ -381,6 +381,15 @@ pub struct GameDef {
     /// Dispatch to the wide-bitboard movegen path (auto for ≤128 cells;
     /// switchable for the Prototype-1 crossover measurement, §12).
     pub use_bitboards: bool,
+    /// Bits 2.0 Stage 4: custom ability rows (setup-JSON authored,
+    /// validated at the boundary). `AbilityBit::Custom(i)` /
+    /// `Effect::Custom(i)` index this vec; stdlib rows stay the static
+    /// registry in `effects`.
+    pub custom_effects: Vec<crate::effects::CustomAbility>,
+    /// Bits 2.0 Stage 4: custom terrain rows. Internal code `NT + i`;
+    /// FFI wire code `WIRE_CUSTOM_BASE + i`. Bounded by
+    /// `terrain_defs::MAX_CUSTOM_TERRAIN` (validated at the boundary).
+    pub custom_terrains: Vec<crate::terrain_defs::CustomTerrain>,
 }
 
 impl GameDef {
@@ -392,6 +401,31 @@ impl GameDef {
         policy: Policy,
         start: Vec<(TypeId, Side, u8, u8)>,
     ) -> Self {
+        Self::with_customs(board, sides, types, zones, policy, start, Vec::new(), Vec::new())
+    }
+
+    /// `new` plus the Stage-4 custom registries (validated upstream: ids
+    /// unique and non-stdlib, terrain count ≤ MAX_CUSTOM_TERRAIN, bit
+    /// indices in range — the FFI boundary is the loud gate; the core
+    /// debug-asserts the structural invariants).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_customs(
+        board: BoardDef,
+        sides: u8,
+        types: Vec<PieceTypeDef>,
+        zones: Vec<Zone>,
+        policy: Policy,
+        start: Vec<(TypeId, Side, u8, u8)>,
+        custom_effects: Vec<crate::effects::CustomAbility>,
+        custom_terrains: Vec<crate::terrain_defs::CustomTerrain>,
+    ) -> Self {
+        debug_assert!(custom_terrains.len() <= crate::terrain_defs::MAX_CUSTOM_TERRAIN);
+        debug_assert!(types.iter().all(|ty| {
+            ty.abilities.iter().all(|a| match a {
+                AbilityBit::Custom(i) => (*i as usize) < custom_effects.len(),
+                _ => true,
+            })
+        }));
         let zobrist = crate::zobrist::Zobrist::for_shape(board.ncells(), types.len(), sides);
         // Prototype 1's measured answer (§7.1, §12): the tuned mailbox beats
         // the portable u128 bitboard class at every tested size (0.80–0.93x
@@ -410,6 +444,8 @@ impl GameDef {
             compiled: Vec::new(),
             zobrist,
             use_bitboards,
+            custom_effects,
+            custom_terrains,
         };
         g.compile();
         g
@@ -417,6 +453,126 @@ impl GameDef {
 
     pub fn compiled(&self, t: TypeId, s: Side) -> &Compiled {
         &self.compiled[t as usize * self.sides as usize + s as usize]
+    }
+
+    // -- Stage-4 terrain lookups (stdlib row, else the custom band) --------
+    //
+    // These are the GameDef-aware twins of the `terrain_defs` predicates:
+    // stdlib codes answer from the static rows exactly as before; codes in
+    // the custom band (>= NT) answer from `custom_terrains`. Only cold /
+    // g-carrying call sites use these — the g-less hot predicates keep
+    // their derived range-compare forms, extended by the per-Position
+    // custom blocking masks.
+
+    /// The custom terrain row for an internal code, if the code is in
+    /// the custom band.
+    #[inline]
+    pub fn custom_terrain(&self, t: u8) -> Option<&crate::terrain_defs::CustomTerrain> {
+        let nt = crate::terrain_defs::NT as u8;
+        if t >= nt {
+            self.custom_terrains.get((t - nt) as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Authorable terrain id → internal code: the stdlib acceptance set
+    /// (`terrain_defs::by_id`) first, then the custom band.
+    pub fn terrain_by_id(&self, id: &str) -> Option<u8> {
+        crate::terrain_defs::by_id(id).or_else(|| {
+            self.custom_terrains
+                .iter()
+                .position(|c| c.id == id)
+                .map(|i| (crate::terrain_defs::NT + i) as u8)
+        })
+    }
+
+    /// Stable FFI wire code: the stdlib row's frozen code (0..=13), or
+    /// `WIRE_CUSTOM_BASE + i` for custom row `i` (stable within a battle).
+    #[inline]
+    pub fn terrain_wire_code(&self, t: u8) -> u8 {
+        match self.custom_terrain(t) {
+            Some(_) => crate::terrain_defs::WIRE_CUSTOM_BASE + (t - crate::terrain_defs::NT as u8),
+            None => crate::terrain_defs::row(t).code,
+        }
+    }
+
+    /// Does this code block entry for the bare ground class?
+    #[inline]
+    pub fn terrain_blocks(&self, t: u8) -> bool {
+        crate::terrain_defs::terrain_blocks(t)
+            || self.custom_terrain(t).is_some_and(|c| c.blocks.ground)
+    }
+
+    /// The carry rule (destination rewriting) for a code.
+    #[inline]
+    pub fn terrain_carry(&self, t: u8) -> crate::terrain_defs::Carry {
+        match self.custom_terrain(t) {
+            Some(c) => c.carry,
+            None => crate::terrain_defs::row(t).carry,
+        }
+    }
+
+    /// Does this code carry `Slide` (the ice pass's sheet test)?
+    #[inline]
+    pub fn terrain_slides(&self, t: u8) -> bool {
+        crate::terrain_defs::slides(t)
+            || self
+                .custom_terrain(t)
+                .is_some_and(|c| matches!(c.carry, crate::terrain_defs::Carry::Slide { .. }))
+    }
+
+    /// Does this code carry `Belt` (the belt pass's board scan)?
+    #[inline]
+    pub fn terrain_belts(&self, t: u8) -> bool {
+        crate::terrain_defs::belts(t)
+            || self
+                .custom_terrain(t)
+                .is_some_and(|c| matches!(c.carry, crate::terrain_defs::Carry::Belt { .. }))
+    }
+
+    /// The belt direction, if this code carries `Belt`.
+    #[inline]
+    pub fn terrain_conv_dir(&self, t: u8) -> Option<(i8, i8)> {
+        match self.terrain_carry(t) {
+            crate::terrain_defs::Carry::Belt { dx, dy } => Some((dx, dy)),
+            _ => None,
+        }
+    }
+
+    /// Is this code a destructible block (`tiers > 0`)?
+    #[inline]
+    pub fn terrain_is_block(&self, t: u8) -> bool {
+        crate::terrain_defs::is_block(t) || self.custom_terrain(t).is_some_and(|c| c.tiers > 0)
+    }
+
+    /// One erosion step: stdlib codes walk the block band; a tier-1
+    /// custom block clears to bare floor (custom tiers are 0 or 1).
+    #[inline]
+    pub fn terrain_erode(&self, t: u8) -> u8 {
+        match self.custom_terrain(t) {
+            Some(_) => crate::terrain_defs::T_NONE,
+            None => crate::terrain_defs::erode(t),
+        }
+    }
+
+    /// The concealment class driving the SRW battle-layer masks.
+    #[inline]
+    pub fn terrain_conceal(&self, t: u8) -> crate::terrain_defs::Conceal {
+        match self.custom_terrain(t) {
+            Some(c) => c.conceal,
+            None => crate::terrain_defs::row(t).conceal,
+        }
+    }
+
+    /// The owning side of owner-scoped terrain: the stdlib owner band
+    /// (mines, code-derived) or a custom row's fixed authored owner.
+    #[inline]
+    pub fn terrain_owner(&self, t: u8) -> Option<Side> {
+        match self.custom_terrain(t) {
+            Some(c) => c.owner,
+            None => crate::terrain_defs::mine_owner(t),
+        }
     }
 
     /// The compile step (§7.3): expand each Bit's symmetric deltas, apply the

@@ -57,13 +57,83 @@
 //! every side's searcher evaluates with the deterministic-grade net.
 //! A missing or invalid checkpoint is a build error, never a silent
 //! fallback to the linear eval.
+//!
+//! Custom effects and terrains (Bits 2.0 Stage 4) — two OPTIONAL
+//! top-level arrays make Axis-B content authorable per battle:
+//!
+//! ```json
+//! "abilities": [
+//!   {"id": "vamp-strike",
+//!    "target": {"who": "enemy", "range": 2, "pred": ["nonroyal"]},
+//!    "ops": [{"op": "hp_add", "n": -1}],
+//!    "self_ops": [{"op": "hp_add", "n": 1, "cap": true}],
+//!    "cost": {"flat": 3.0, "mult": 1.0},
+//!    "descriptor_slot": "laser"}
+//! ],
+//! "terrains": [
+//!   {"id": "lava", "code": "auto",
+//!    "blocks": {"ground": false, "flight": false, "drill": false},
+//!    "on_land": {"ops": [{"op": "hp_add", "n": -1}], "gate": "anyone",
+//!                 "consumed": false},
+//!    "carry": null, "conceal": null, "tiers": 0}
+//! ]
+//! ```
+//!
+//! **Custom abilities.** `target.who` is `"enemy" | "friendly" |
+//! "empty"`; reach is either `"range": N` (chebyshev point, 1..=16) or
+//! `"ray": {"max": N, "pierce": bool}` (queen-line beam, enemies only —
+//! blocking terrain stops it, a friendly stops a non-piercing beam).
+//! `pred` (piece targets): `"damaged"`, `"hp_eq1"`, `"nonroyal"`; empty
+//! targets are always bare floor (`"bare"` is accepted, and implied).
+//! `ops` (1..=8, applied to the target square in order): `hp_add`
+//! {n ∈ ±1..=8, optional cap} — damage is LETHAL at 0 (strike-to-kill
+//! through the capture fate), `capture_at` (§3.2 strike-or-kill, enemy
+//! targets), `flip_side` (enemy targets), `set_terrain` {kind: an
+//! authorable stdlib kind, `"mine"` for the caster-banded mine, or a
+//! custom terrain id — empty targets}, `terrain_step` (erode a block).
+//! `self_ops` (0..=8, against the caster): `hp_add` only. `cost`
+//! (REQUIRED): flat 0..=100 joins the flat priors, mult 0.1..=10 joins
+//! M_utility. `descriptor_slot` (REQUIRED): a stdlib kin NAME ("heal",
+//! "laser", "wall", "pit", "mine", "resurrect", "hack" — or "swap" /
+//! "push" / "none" for no dim), mapping the row into the frozen 21-dim
+//! NNUE layout. Piece `"abilities"` entries may then reference the id:
+//! `{"kind": "vamp-strike"}` (other keys ignored — the row IS the
+//! definition). Notation is `"e2!vamp-strike:e3"`; `srw_legal_info`
+//! effect codes allocate upward from the stdlib band: custom row `i`
+//! surfaces as `11 + i`, stable within the battle (order = array order).
+//! Custom MOVE scripts (new special-move generators) are OUT of scope:
+//! gates/bindings compose engine-side only. Relocation-coupled custom
+//! selector shapes (swap/push/retreat/resurrect analogues) are likewise
+//! stdlib-only this stage.
+//!
+//! **Custom terrains.** ≤ 16 rows per battle; internal codes and wire
+//! codes allocate upward from the stdlib bands (`srw_terrain` code =
+//! `14 + i`, stable within the battle). `code` must be `"auto"` (or
+//! absent). `blocks` gives the three permission-class flags; `on_land`
+//! is `hp_add` literals (±1..=8; damage lethal at 0, healing capped at
+//! type max) with `gate` `"anyone" | "enemy_of_owner"` and `consumed`;
+//! `carry` is `null | {"slide": {"riders_only": bool}} | {"belt":
+//! {"dx": d, "dy": d}}`; `conceal` is `null | "standing" |
+//! "owner_secret"`; `tiers` is 0 or 1 (a tier-1 custom block erodes to
+//! floor; multi-tier bands are stdlib-only). Rows with an
+//! `"enemy_of_owner"` gate or `"owner_secret"` conceal REQUIRE
+//! `"owner": side` — customs are owner-fixed, not code-banded. Custom
+//! ids may then appear in `"terrain"` cells.
+//!
+//! **Validation is loud**: any unknown op/pred/selector, out-of-band
+//! amount, id collision (with the stdlib or another custom), missing
+//! cost hint / descriptor slot, over-cap terrain count, or empty op
+//! list makes `srw_create` return NULL; `srw_last_error` then names the
+//! fault precisely.
 
 use std::ffi::{c_char, c_int, CStr};
 use std::ptr;
+use std::sync::Mutex;
 
 use botboard_core::belief::Belief;
 use botboard_core::bits::{AbilityBit, HopMode, Mode, MoveBit, PathRule};
 use botboard_core::cost::{cost_prior, material_table, CostWeights};
+use botboard_core::effects::{kin_slot, CostHint, CustomAbility, CustomReach, Pred, Who};
 use botboard_core::eval::Eval;
 use botboard_core::ffa::choose_ffa_move;
 use botboard_core::game::{
@@ -74,13 +144,20 @@ use botboard_core::geometry::DirFilter;
 use botboard_core::ladder::{choose_move_traced, LadderConfig, LadderTrace, Rung};
 use botboard_core::movegen::{legal_moves, status, Status};
 use botboard_core::moves::{move_str, Effect, MoveKind, NO_SQ};
-use botboard_core::position::{mine_owner, Loc, Position, T_NONE, T_WALL};
+use botboard_core::ops::{HpAmt, MicroOp, SqRef, TerrainKind};
+use botboard_core::position::{Loc, Position, T_NONE, T_WALL};
 use botboard_core::rng::Rng;
 use botboard_core::search::Searcher;
-use botboard_core::terrain_defs::{self, Conceal};
+use botboard_core::terrain_defs::{
+    self, Blocks, Carry, Conceal, CustomOnLand, CustomTerrain, LandGate, MAX_CUSTOM_TERRAIN,
+};
 
 use crate::json::{parse, Json};
 use crate::write_str;
+
+/// The last `srw_create` build failure, readable via [`srw_last_error`]
+/// — validation is loud: NULL plus a precise fault string.
+static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 
 /// The fixed pricing weights shared with the engine CLI's army generator:
 /// cross-battle comparable, deterministic, re-fit is a campaign concern.
@@ -207,7 +284,11 @@ fn parse_move_bit(j: &Json) -> Option<MoveBit> {
     Some(b)
 }
 
-fn parse_ability(j: &Json) -> Option<AbilityBit> {
+/// Kind lookup for a piece "abilities" entry: the stdlib vocabulary, or
+/// a Stage-4 custom row by id (the row IS the definition — per-piece
+/// parameters on a custom reference are ignored). Unknown kinds keep
+/// the historical silent-drop acceptance.
+fn parse_ability(j: &Json, customs: &[CustomAbility]) -> Option<AbilityBit> {
     let range = j.num("range", 1.0) as u8;
     match j.str_or("kind", "") {
         "heal" => Some(AbilityBit::Heal { amount: j.num("amount", 1.0) as i16, range }),
@@ -223,11 +304,406 @@ fn parse_ability(j: &Json) -> Option<AbilityBit> {
         "mine" => Some(AbilityBit::MineLayer { range }),
         "swap" => Some(AbilityBit::Swap { range }),
         "push" => Some(AbilityBit::Push { range }),
-        _ => None,
+        other => customs
+            .iter()
+            .position(|c| c.id == other)
+            .map(|i| AbilityBit::Custom(i as u16)),
     }
 }
 
-fn parse_types(spec: &Json) -> Result<Vec<PieceTypeDef>, String> {
+// ---------------------------------------------------------------------------
+// Stage-4 custom-content parsing + validation (loud: every fault is a
+// precise Err that srw_create surfaces through srw_last_error).
+// ---------------------------------------------------------------------------
+
+/// Custom ids: 1..=32 chars of [a-z0-9_-] — safe in the move notation
+/// ("e2!<id>:e3") and the terrain cell vocabulary.
+fn valid_custom_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+fn parse_custom_terrains(spec: &Json, sides: u8) -> Result<Vec<CustomTerrain>, String> {
+    let Some(arr) = spec.get("terrains").and_then(|a| a.as_arr()) else {
+        return Ok(Vec::new());
+    };
+    if arr.len() > MAX_CUSTOM_TERRAIN {
+        return Err(format!(
+            "terrains: at most {MAX_CUSTOM_TERRAIN} custom rows per battle, got {}",
+            arr.len()
+        ));
+    }
+    let mut out: Vec<CustomTerrain> = Vec::new();
+    for tj in arr {
+        let id = tj.str_or("id", "").to_string();
+        if !valid_custom_id(&id) {
+            return Err(format!("terrains: bad id {id:?} (want 1..=32 chars of [a-z0-9_-])"));
+        }
+        if terrain_defs::ROWS.iter().any(|r| r.id == id) {
+            return Err(format!("terrains: id {id:?} collides with a stdlib terrain"));
+        }
+        if out.iter().any(|c| c.id == id) {
+            return Err(format!("terrains: duplicate id {id:?}"));
+        }
+        match tj.get("code") {
+            None => {}
+            Some(v) if v.as_str() == Some("auto") => {}
+            Some(_) => {
+                return Err(format!(
+                    "terrains[{id}]: code must be \"auto\" — internal and wire codes \
+                     allocate upward from the stdlib bands"
+                ))
+            }
+        }
+        let blocks = match tj.get("blocks") {
+            None => Blocks { ground: false, flight: false, drill: false },
+            Some(b) => Blocks {
+                ground: b.bool_or("ground", false),
+                flight: b.bool_or("flight", false),
+                drill: b.bool_or("drill", false),
+            },
+        };
+        let owner = match tj.get("owner") {
+            None | Some(Json::Null) => None,
+            Some(v) => {
+                let s = v
+                    .as_i64()
+                    .ok_or(format!("terrains[{id}]: owner must be a side number"))?;
+                if s < 0 || s >= sides as i64 {
+                    return Err(format!(
+                        "terrains[{id}]: owner {s} out of range for {sides} sides"
+                    ));
+                }
+                Some(s as Side)
+            }
+        };
+        let on_land = match tj.get("on_land") {
+            None | Some(Json::Null) => None,
+            Some(oj) => {
+                let ops_j = oj
+                    .get("ops")
+                    .and_then(|o| o.as_arr())
+                    .ok_or(format!("terrains[{id}]: on_land needs an ops array"))?;
+                if ops_j.is_empty() || ops_j.len() > 8 {
+                    return Err(format!(
+                        "terrains[{id}]: on_land op list must number 1..=8, got {}",
+                        ops_j.len()
+                    ));
+                }
+                let mut ops = Vec::new();
+                for opj in ops_j {
+                    let name = opj.str_or("op", "");
+                    if name != "hp_add" {
+                        return Err(format!(
+                            "terrains[{id}]: unknown on_land op {name:?} (vocabulary: hp_add)"
+                        ));
+                    }
+                    let n = opj.num("n", 0.0) as i16;
+                    if n == 0 || n.abs() > 8 {
+                        return Err(format!(
+                            "terrains[{id}]: on_land hp_add n must be ±1..=8, got {n}"
+                        ));
+                    }
+                    ops.push(MicroOp::HpAdd { n: HpAmt::Lit(n), cap: n > 0 });
+                }
+                let gate = match oj.str_or("gate", "anyone") {
+                    "anyone" => LandGate::Anyone,
+                    "enemy_of_owner" => {
+                        if owner.is_none() {
+                            return Err(format!(
+                                "terrains[{id}]: gate enemy_of_owner requires \"owner\""
+                            ));
+                        }
+                        LandGate::EnemyOfOwner
+                    }
+                    other => {
+                        return Err(format!(
+                            "terrains[{id}]: unknown gate {other:?} (anyone|enemy_of_owner)"
+                        ))
+                    }
+                };
+                Some(CustomOnLand { ops, gate, consumed: oj.bool_or("consumed", false) })
+            }
+        };
+        let carry = match tj.get("carry") {
+            None | Some(Json::Null) => Carry::None,
+            Some(cj) => {
+                if let Some(sj) = cj.get("slide") {
+                    Carry::Slide { riders_only: sj.bool_or("riders_only", true) }
+                } else if let Some(bj) = cj.get("belt") {
+                    let (dx, dy) = (bj.num("dx", 0.0) as i8, bj.num("dy", 0.0) as i8);
+                    if !(-1..=1).contains(&dx) || !(-1..=1).contains(&dy) || (dx == 0 && dy == 0)
+                    {
+                        return Err(format!(
+                            "terrains[{id}]: belt direction must be a unit step, got ({dx},{dy})"
+                        ));
+                    }
+                    Carry::Belt { dx, dy }
+                } else {
+                    return Err(format!(
+                        "terrains[{id}]: carry must be null, {{\"slide\":..}} or {{\"belt\":..}}"
+                    ));
+                }
+            }
+        };
+        let conceal = match tj.get("conceal") {
+            None | Some(Json::Null) => Conceal::None,
+            Some(v) => match v.as_str() {
+                Some("standing") => Conceal::Standing,
+                Some("owner_secret") => {
+                    if owner.is_none() {
+                        return Err(format!(
+                            "terrains[{id}]: conceal owner_secret requires \"owner\""
+                        ));
+                    }
+                    Conceal::OwnerSecret
+                }
+                _ => {
+                    return Err(format!(
+                        "terrains[{id}]: unknown conceal (null|standing|owner_secret)"
+                    ))
+                }
+            },
+        };
+        let tiers = tj.num("tiers", 0.0) as i64;
+        if !(0..=1).contains(&tiers) {
+            return Err(format!(
+                "terrains[{id}]: custom tiers must be 0 or 1 (multi-tier bands are stdlib-only)"
+            ));
+        }
+        out.push(CustomTerrain { id, blocks, on_land, carry, conceal, owner, tiers: tiers as u8 });
+    }
+    Ok(out)
+}
+
+/// One custom-ability op. `self_op` restricts to the caster vocabulary;
+/// piece-vs-empty targeting compatibility is validated here so the
+/// interpreter never sees an op its target cannot satisfy.
+fn parse_custom_op(
+    id: &str,
+    opj: &Json,
+    who: Who,
+    terrains: &[CustomTerrain],
+    self_op: bool,
+) -> Result<MicroOp, String> {
+    let name = opj.str_or("op", "");
+    if self_op && name != "hp_add" {
+        return Err(format!(
+            "abilities[{id}]: self_ops vocabulary is hp_add only, got {name:?}"
+        ));
+    }
+    let piece_target = matches!(who, Who::Enemy | Who::Friendly);
+    match name {
+        "hp_add" => {
+            if !self_op && !piece_target {
+                return Err(format!(
+                    "abilities[{id}]: hp_add needs a piece target (who enemy|friendly)"
+                ));
+            }
+            let n = opj.num("n", 0.0) as i16;
+            if n == 0 || n.abs() > 8 {
+                return Err(format!("abilities[{id}]: hp_add n must be ±1..=8, got {n}"));
+            }
+            // Heals cap at type max by default; "cap" overrides.
+            Ok(MicroOp::HpAdd { n: HpAmt::Lit(n), cap: opj.bool_or("cap", n > 0) })
+        }
+        "capture_at" => {
+            if who != Who::Enemy {
+                return Err(format!("abilities[{id}]: capture_at needs who \"enemy\""));
+            }
+            Ok(MicroOp::CaptureAt { at: SqRef::To })
+        }
+        "flip_side" => {
+            if who != Who::Enemy {
+                return Err(format!("abilities[{id}]: flip_side needs who \"enemy\""));
+            }
+            Ok(MicroOp::FlipSide)
+        }
+        "terrain_step" => Ok(MicroOp::TerrainStep),
+        "set_terrain" => {
+            if who != Who::EmptyCell {
+                return Err(format!("abilities[{id}]: set_terrain needs who \"empty\""));
+            }
+            let kind = opj.str_or("kind", "");
+            let tk = match kind {
+                "mine" => TerrainKind::OwnerMine,
+                other => match terrain_defs::by_id(other) {
+                    Some(code) => TerrainKind::Code(code),
+                    None => match terrains.iter().position(|c| c.id == other) {
+                        Some(i) => TerrainKind::Code((terrain_defs::NT + i) as u8),
+                        None => {
+                            return Err(format!(
+                                "abilities[{id}]: set_terrain kind {other:?} names no \
+                                 authorable terrain"
+                            ))
+                        }
+                    },
+                },
+            };
+            Ok(MicroOp::SetTerrain { kind: tk })
+        }
+        other => Err(format!(
+            "abilities[{id}]: unknown op {other:?} (vocabulary: hp_add, capture_at, \
+             flip_side, set_terrain, terrain_step)"
+        )),
+    }
+}
+
+fn parse_custom_abilities(
+    spec: &Json,
+    terrains: &[CustomTerrain],
+) -> Result<Vec<CustomAbility>, String> {
+    let Some(arr) = spec.get("abilities").and_then(|a| a.as_arr()) else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<CustomAbility> = Vec::new();
+    for aj in arr {
+        let id = aj.str_or("id", "").to_string();
+        if !valid_custom_id(&id) {
+            return Err(format!("abilities: bad id {id:?} (want 1..=32 chars of [a-z0-9_-])"));
+        }
+        if botboard_core::effects::STDLIB_ABILITY_IDS.contains(&id.as_str()) {
+            return Err(format!("abilities: id {id:?} collides with a stdlib ability"));
+        }
+        if out.iter().any(|c| c.id == id) {
+            return Err(format!("abilities: duplicate id {id:?}"));
+        }
+        let tj = aj
+            .get("target")
+            .ok_or(format!("abilities[{id}]: missing target selector"))?;
+        let who = match tj.str_or("who", "") {
+            "enemy" => Who::Enemy,
+            "friendly" => Who::Friendly,
+            "empty" => Who::EmptyCell,
+            other => {
+                return Err(format!(
+                    "abilities[{id}]: unknown target.who {other:?} (enemy|friendly|empty)"
+                ))
+            }
+        };
+        let reach = if let Some(rj) = tj.get("ray") {
+            if who != Who::Enemy {
+                return Err(format!("abilities[{id}]: ray reach requires who \"enemy\""));
+            }
+            let max = rj.num("max", 0.0) as i64;
+            if !(1..=16).contains(&max) {
+                return Err(format!("abilities[{id}]: ray.max must be 1..=16, got {max}"));
+            }
+            CustomReach::Ray { max: max as u8, pierce: rj.bool_or("pierce", false) }
+        } else {
+            let range = tj.num("range", 0.0) as i64;
+            if !(1..=16).contains(&range) {
+                return Err(format!(
+                    "abilities[{id}]: target.range must be 1..=16 (or give a \"ray\"), got {range}"
+                ));
+            }
+            CustomReach::Point { range: range as u8 }
+        };
+        let mut preds = Vec::new();
+        if let Some(parr) = tj.get("pred").and_then(|p| p.as_arr()) {
+            for pj in parr {
+                let ps = pj.as_str().unwrap_or("");
+                match ps {
+                    "damaged" | "hp_eq1" | "nonroyal" => {
+                        if who == Who::EmptyCell {
+                            return Err(format!(
+                                "abilities[{id}]: pred {ps:?} needs a piece target"
+                            ));
+                        }
+                        preds.push(match ps {
+                            "damaged" => Pred::Damaged,
+                            "hp_eq1" => Pred::HpEq1,
+                            _ => Pred::NonRoyal,
+                        });
+                    }
+                    // Bare floor is the empty-target rule anyway; accept
+                    // the name as documentation.
+                    "bare" => {
+                        if who != Who::EmptyCell {
+                            return Err(format!(
+                                "abilities[{id}]: pred \"bare\" is for empty targets"
+                            ));
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "abilities[{id}]: unknown pred {other:?} \
+                             (damaged|hp_eq1|nonroyal|bare)"
+                        ))
+                    }
+                }
+            }
+        }
+        let ops_j = aj
+            .get("ops")
+            .and_then(|o| o.as_arr())
+            .ok_or(format!("abilities[{id}]: missing ops array"))?;
+        if ops_j.is_empty() {
+            return Err(format!("abilities[{id}]: a custom ability must include at least one op"));
+        }
+        if ops_j.len() > 8 {
+            return Err(format!(
+                "abilities[{id}]: op list length must be ≤ 8, got {}",
+                ops_j.len()
+            ));
+        }
+        let ops = ops_j
+            .iter()
+            .map(|o| parse_custom_op(&id, o, who, terrains, false))
+            .collect::<Result<Vec<_>, _>>()?;
+        let self_j = aj.get("self_ops").and_then(|o| o.as_arr()).unwrap_or(&[]);
+        if self_j.len() > 8 {
+            return Err(format!(
+                "abilities[{id}]: self_ops length must be ≤ 8, got {}",
+                self_j.len()
+            ));
+        }
+        let self_ops = self_j
+            .iter()
+            .map(|o| parse_custom_op(&id, o, who, terrains, true))
+            .collect::<Result<Vec<_>, _>>()?;
+        let cj = aj
+            .get("cost")
+            .ok_or(format!("abilities[{id}]: cost hint required ({{\"flat\", \"mult\"}})"))?;
+        let flat = cj
+            .get("flat")
+            .and_then(|v| v.as_f64())
+            .ok_or(format!("abilities[{id}]: cost.flat required"))?;
+        let mult = cj
+            .get("mult")
+            .and_then(|v| v.as_f64())
+            .ok_or(format!("abilities[{id}]: cost.mult required"))?;
+        if !flat.is_finite() || !(0.0..=100.0).contains(&flat) {
+            return Err(format!("abilities[{id}]: cost.flat must be 0..=100, got {flat}"));
+        }
+        if !mult.is_finite() || !(0.1..=10.0).contains(&mult) {
+            return Err(format!("abilities[{id}]: cost.mult must be 0.1..=10, got {mult}"));
+        }
+        let slot_name = aj
+            .get("descriptor_slot")
+            .and_then(|v| v.as_str())
+            .ok_or(format!("abilities[{id}]: descriptor_slot required (a stdlib kin name)"))?;
+        let slot = kin_slot(slot_name).ok_or(format!(
+            "abilities[{id}]: descriptor_slot {slot_name:?} is not a stdlib kin"
+        ))?;
+        out.push(CustomAbility {
+            id,
+            who,
+            reach,
+            preds,
+            ops,
+            self_ops,
+            cost: CostHint { flat, mult },
+            descriptor_slot: slot,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_types(spec: &Json, customs: &[CustomAbility]) -> Result<Vec<PieceTypeDef>, String> {
     let mut types = Vec::new();
     for tj in spec.get("types").and_then(|t| t.as_arr()).ok_or("missing types")? {
         // GameDef wants 'static names; battle handles are per-encounter,
@@ -270,7 +746,7 @@ fn parse_types(spec: &Json) -> Result<Vec<PieceTypeDef>, String> {
         let abilities: Vec<AbilityBit> = tj
             .get("abilities")
             .and_then(|a| a.as_arr())
-            .map(|a| a.iter().filter_map(parse_ability).collect())
+            .map(|a| a.iter().filter_map(|j| parse_ability(j, customs)).collect())
             .unwrap_or_default();
         if !abilities.is_empty() {
             def = def.abilities(abilities);
@@ -296,7 +772,12 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
     if !(2..=4).contains(&sides) {
         return Err("sides must be 2..=4".into());
     }
-    let types = parse_types(&spec)?;
+    // Stage-4 custom content: terrains first (ability set_terrain ops may
+    // reference custom terrain ids), then abilities, then the types that
+    // reference them.
+    let custom_terrains = parse_custom_terrains(&spec, sides)?;
+    let custom_effects = parse_custom_abilities(&spec, &custom_terrains)?;
+    let types = parse_types(&spec, &custom_effects)?;
 
     let mut start: Vec<(TypeId, Side, u8, u8)> = Vec::new();
     for pj in spec.get("placements").and_then(|p| p.as_arr()).ok_or("missing placements")? {
@@ -314,7 +795,16 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
         turn: TurnPolicy::Alternate,
         pass: PassPolicy::Forbidden,
     };
-    let g = GameDef::new(board, sides, types, Vec::new(), policy, start);
+    let g = GameDef::with_customs(
+        board,
+        sides,
+        types,
+        Vec::new(),
+        policy,
+        start,
+        custom_effects,
+        custom_terrains,
+    );
 
     let material = match spec.get("material").and_then(|m| m.as_arr()) {
         Some(arr) if arr.len() == g.types.len() => {
@@ -348,14 +838,15 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
                 return Err("terrain out of range".into());
             }
             let sq = g.board.sq(x, y) as usize;
-            // Registry-id lookup (Bits 2.0 Stage 3): the row ids ARE the
-            // setup-JSON terrain kinds. Owner-band rows (mines) and the
+            // Registry-id lookup (Bits 2.0 Stage 3/4): the row ids ARE
+            // the setup-JSON terrain kinds — stdlib authorable rows plus
+            // this battle's custom rows. Owner-band rows (mines) and the
             // absence row are not authorable; unknown kinds keep the
             // historical wall default.
-            let kind = terrain_defs::by_id(cj.str_or("kind", "wall")).unwrap_or(T_WALL);
+            let kind = g.terrain_by_id(cj.str_or("kind", "wall")).unwrap_or(T_WALL);
             // Blocking terrain cannot share a cell with a piece; the
             // passable kinds (ice, grass, acid) are stood upon by design.
-            if pos.board[sq] >= 0 && botboard_core::position::terrain_blocks(kind) {
+            if pos.board[sq] >= 0 && g.terrain_blocks(kind) {
                 return Err("blocking terrain on occupied cell".into());
             }
             pos.terrain[sq] = kind;
@@ -471,10 +962,13 @@ impl SrwBattle {
             }
         }
         for sq in 0..world.terrain.len() {
-            // Owner-secret terrain (registry conceal row): invisible to
-            // everyone but its banded owner until it triggers.
+            // Owner-secret terrain (registry conceal row, stdlib band or
+            // a custom row's fixed authored owner): invisible to everyone
+            // but its owner until it triggers.
             let t = world.terrain[sq];
-            if terrain_defs::row(t).conceal == Conceal::OwnerSecret && mine_owner(t) != Some(s) {
+            if self.g.terrain_conceal(t) == Conceal::OwnerSecret
+                && self.g.terrain_owner(t) != Some(s)
+            {
                 world.terrain[sq] = T_NONE;
             }
         }
@@ -490,7 +984,7 @@ impl SrwBattle {
         let p = self.pos.pieces[i];
         let Loc::Board(sq) = p.loc else { return false };
         let standing_conceal =
-            terrain_defs::row(self.pos.terrain[sq as usize]).conceal == Conceal::Standing;
+            self.g.terrain_conceal(self.pos.terrain[sq as usize]) == Conceal::Standing;
         if p.side == observer || !standing_conceal {
             return false;
         }
@@ -774,14 +1268,41 @@ unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
     CStr::from_ptr(p).to_str().ok()
 }
 
-/// Create a battle from setup JSON. NULL on parse/validation failure.
+/// Create a battle from setup JSON. NULL on parse/validation failure —
+/// `srw_last_error` then names the fault precisely.
 #[no_mangle]
 pub extern "C" fn srw_create(setup_json: *const c_char) -> *mut SrwBattle {
-    let Some(s) = (unsafe { cstr(setup_json) }) else { return ptr::null_mut() };
+    let Some(s) = (unsafe { cstr(setup_json) }) else {
+        if let Ok(mut e) = LAST_ERROR.lock() {
+            *e = "setup_json is null or not UTF-8".into();
+        }
+        return ptr::null_mut();
+    };
     match build(s) {
-        Ok(b) => Box::into_raw(Box::new(b)),
-        Err(_) => ptr::null_mut(),
+        Ok(b) => {
+            if let Ok(mut e) = LAST_ERROR.lock() {
+                e.clear();
+            }
+            Box::into_raw(Box::new(b))
+        }
+        Err(msg) => {
+            if let Ok(mut e) = LAST_ERROR.lock() {
+                *e = msg;
+            }
+            ptr::null_mut()
+        }
     }
+}
+
+/// Copy the reason the most recent `srw_create` returned NULL into
+/// `buf` (NUL-terminated UTF-8). Returns the string length (0 when the
+/// last create succeeded / nothing recorded), or negative on a buffer
+/// problem. The buffer is process-wide state: read it on the same
+/// thread flow that observed the NULL.
+#[no_mangle]
+pub extern "C" fn srw_last_error(buf: *mut c_char, cap: c_int) -> c_int {
+    let s = LAST_ERROR.lock().map(|e| e.clone()).unwrap_or_default();
+    write_str(&s, buf, cap)
 }
 
 #[no_mangle]
@@ -899,37 +1420,41 @@ pub extern "C" fn srw_entropy(b: *mut SrwBattle, observer: c_int) -> f64 {
 /// 5 tall grass, 6 acid, 7/8/9 destructible block tier 1/2/3,
 /// 10/11/12/13 conveyor N/E/S/W (N = +y, side 0's forward). The code IS
 /// the registry row's stable wire id (all four owner-band mine rows
-/// share code 3).
-fn terrain_code(t: u8) -> c_int {
-    terrain_defs::row(t).code as c_int
+/// share code 3). Stage-4 custom rows allocate upward from the stdlib
+/// band: custom row `i` surfaces as `14 + i` — stable within a battle
+/// (order = the setup's "terrains" array order).
+fn terrain_code(g: &GameDef, t: u8) -> c_int {
+    g.terrain_wire_code(t) as c_int
 }
 
 /// Ground-truth terrain: 0 none, 1 wall, 2 pit, 3 mine, 4 ice,
-/// 5 tall grass, 6 acid, 7/8/9 block tier 1/2/3, 10..=13 conveyor NESW.
+/// 5 tall grass, 6 acid, 7/8/9 block tier 1/2/3, 10..=13 conveyor NESW,
+/// 14+ this battle's custom rows in setup order.
 #[no_mangle]
 pub extern "C" fn srw_terrain(b: *mut SrwBattle, sq: c_int) -> c_int {
     let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
-    b.pos.terrain.get(sq as usize).map_or(-2, |&t| terrain_code(t))
+    b.pos.terrain.get(sq as usize).map_or(-2, |&t| terrain_code(&b.g, t))
 }
 
-/// Terrain as `observer` sees it: enemy mines are invisible (0) until
-/// they blow. 0 none, 1 wall, 2 pit, 3 own mine, 4 ice, 5 grass, 6 acid,
-/// 7/8/9 block tier 1/2/3, 10..=13 conveyor NESW.
+/// Terrain as `observer` sees it: owner-secret rows (mines, custom
+/// `"owner_secret"` rows) are invisible (0) until they blow. 0 none,
+/// 1 wall, 2 pit, 3 own mine, 4 ice, 5 grass, 6 acid, 7/8/9 block tier
+/// 1/2/3, 10..=13 conveyor NESW, 14+ custom rows.
 #[no_mangle]
 pub extern "C" fn srw_terrain_for(b: *mut SrwBattle, observer: c_int, sq: c_int) -> c_int {
     let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
     b.pos.terrain.get(sq as usize).map_or(-2, |&t| {
-        match terrain_defs::row(t).conceal {
-            // Owner-secret rows surface their wire code to the banded
-            // owner and bare floor to everyone else.
+        match b.g.terrain_conceal(t) {
+            // Owner-secret rows surface their wire code to the owner
+            // and bare floor to everyone else.
             Conceal::OwnerSecret => {
-                if mine_owner(t) == Some(observer as Side) {
-                    terrain_code(t)
+                if b.g.terrain_owner(t) == Some(observer as Side) {
+                    terrain_code(&b.g, t)
                 } else {
                     0
                 }
             }
-            _ => terrain_code(t),
+            _ => terrain_code(&b.g, t),
         }
     })
 }
@@ -973,7 +1498,10 @@ pub extern "C" fn srw_legal_move(
 /// `to` holds no piece is terrain damage on a destructible block) 5 twice
 /// 6 resurrect (out[5] then carries the revived type id, not a promo)
 /// 7 hack 8 mine-lay 9 swap (exchange caster with the friendly at `to`)
-/// 10 push (shove the enemy at `to` onto `aux`).
+/// 10 push (shove the enemy at `to` onto `aux`); 11+ this battle's
+/// CUSTOM abilities, allocated upward from the stdlib band — custom row
+/// `i` (setup "abilities" array order) surfaces as `11 + i`, stable
+/// within the battle.
 #[no_mangle]
 pub extern "C" fn srw_legal_info(b: *mut SrwBattle, i: c_int, out: *mut c_int) -> c_int {
     let Some(b) = (unsafe { b.as_mut() }) else { return -1 };
@@ -1004,6 +1532,8 @@ pub extern "C" fn srw_legal_info(b: *mut SrwBattle, i: c_int, out: *mut c_int) -
         Effect::Mine => 8,
         Effect::Swap => 9,
         Effect::Push => 10,
+        // Stage-4 custom rows: upward from the stdlib band.
+        Effect::Custom(i) => 11 + i as c_int,
     };
     unsafe {
         *out = if mv.from == NO_SQ { -1 } else { mv.from as c_int };
@@ -1088,7 +1618,11 @@ pub extern "C" fn srw_price(setup_json: *const c_char, out: *mut f64, cap: c_int
     if board.ncells() == 0 || board.ncells() > 128 {
         return -3;
     }
-    let Ok(types) = parse_types(&spec) else { return -4 };
+    // Stage-4 customs price through the same registry: parse them so
+    // custom cost hints reach cost_prior.
+    let Ok(custom_terrains) = parse_custom_terrains(&spec, 2) else { return -4 };
+    let Ok(custom_effects) = parse_custom_abilities(&spec, &custom_terrains) else { return -4 };
+    let Ok(types) = parse_types(&spec, &custom_effects) else { return -4 };
     let n = types.len();
     if out.is_null() || (n as c_int) > cap {
         return -5;
@@ -1099,7 +1633,16 @@ pub extern "C" fn srw_price(setup_json: *const c_char, out: *mut f64, cap: c_int
         turn: TurnPolicy::Alternate,
         pass: PassPolicy::Forbidden,
     };
-    let g = GameDef::new(board, 2, types, Vec::new(), policy, Vec::new());
+    let g = GameDef::with_customs(
+        board,
+        2,
+        types,
+        Vec::new(),
+        policy,
+        Vec::new(),
+        custom_effects,
+        custom_terrains,
+    );
     for t in 0..n {
         let c = cost_prior(&g, t as TypeId, &W);
         unsafe { *out.add(t) = c };

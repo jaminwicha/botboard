@@ -156,6 +156,17 @@ pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
             // Batch-2 flat priors: the exchange trick and the shove.
             crate::bits::AbilityBit::Swap { .. } => s_flat += 1.5,
             crate::bits::AbilityBit::Push { .. } => s_flat += 2.0,
+            // Stage-4 custom rows price via their REQUIRED cost hint:
+            // the flat term joins the board-state-dependent abilities'
+            // S_flat; the multiplier joins M_utility (pierce-style
+            // utility scaling). Point/ray target mobility still flows
+            // through the measured integral because custom abilities
+            // are generated moves.
+            crate::bits::AbilityBit::Custom(ci) => {
+                let hint = &g.custom_effects[*ci as usize].cost;
+                m_utility *= hint.mult;
+                s_flat += hint.flat;
+            }
             _ => {}
         }
     }

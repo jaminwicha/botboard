@@ -61,6 +61,12 @@ pub enum Effect {
     /// Shove the enemy at `to` one square directly away from the caster;
     /// `aux` holds the shoved piece's destination.
     Push,
+    /// Bits 2.0 Stage 4: a CUSTOM ability — the index names the
+    /// GameDef-owned row (`GameDef::custom_effects[i]`), which carries
+    /// the whole definition (selector, ops, cost, descriptor slot).
+    /// Notation is `"e2!<id>:e3"`; the FFI effect code is `11 + i`
+    /// (allocated upward from the stdlib band, stable within a battle).
+    Custom(u16),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -143,6 +149,8 @@ pub fn move_str(g: &GameDef, mv: &Move) -> String {
                 Effect::Mine => "mine".to_string(),
                 Effect::Swap => "swap".to_string(),
                 Effect::Push => "push".to_string(),
+                // Custom rows: the registry id IS the notation name.
+                Effect::Custom(i) => g.custom_effects[i as usize].id.clone(),
                 _ => "fx".to_string(),
             };
             let mut s = format!("{}!{}:{}", sq_name(g, mv.from), name, sq_name(g, mv.to));

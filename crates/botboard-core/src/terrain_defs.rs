@@ -53,6 +53,13 @@ pub const T_CONV_W: u8 = 16;
 /// terrain key table.
 pub const NT: usize = 17;
 
+/// Bits 2.0 Stage 4: maximum CUSTOM terrain rows per battle. Custom
+/// internal codes allocate upward from the stdlib band (NT..NT+cap);
+/// the Zobrist terrain key space is sized for the full bound, and the
+/// per-Position custom blocking masks are 16-bit. Validation rejects
+/// setups past the cap.
+pub const MAX_CUSTOM_TERRAIN: usize = 16;
+
 // -- the row vocabulary ----------------------------------------------------
 
 /// Per-permission-class blocking (§3.1 path interaction): does this
@@ -230,6 +237,43 @@ pub fn by_id(id: &str) -> Option<u8> {
         .position(|r| r.code != 0 && !r.owner_banded && r.id == id)
         .map(|i| i as u8)
 }
+
+// -- Stage-4 custom terrain rows (GameDef-owned, owned data) ---------------
+
+/// A custom terrain row's on-land hazard script (owned twin of
+/// [`OnLand`]). Vocabulary this stage: `HpAdd` literals only — negative
+/// amounts carry the hazard floor-death rule, positive amounts cap at
+/// the lander's type max (a healing spring cannot overfill).
+#[derive(Clone, Debug)]
+pub struct CustomOnLand {
+    pub ops: Vec<MicroOp>,
+    pub gate: LandGate,
+    pub consumed: bool,
+}
+
+/// One CUSTOM terrain kind (Bits 2.0 Stage 4): authored in the setup
+/// JSON, validated at the FFI boundary, owned by the `GameDef`. Internal
+/// code = `NT + index`; FFI wire code = stdlib band top (14) + index.
+/// Unlike stdlib owner-band rows, a custom row's owner (for
+/// `LandGate::EnemyOfOwner` and `Conceal::OwnerSecret`) is a fixed side
+/// authored on the row — customs are not code-banded.
+#[derive(Clone, Debug)]
+pub struct CustomTerrain {
+    pub id: String,
+    pub blocks: Blocks,
+    pub on_land: Option<CustomOnLand>,
+    pub carry: Carry,
+    pub conceal: Conceal,
+    /// Fixed owner side for `EnemyOfOwner` / `OwnerSecret` rows.
+    pub owner: Option<Side>,
+    /// Destructible tier: 0 or 1 for customs (a tier-1 custom block
+    /// erodes to bare floor; multi-tier bands stay stdlib-only).
+    pub tiers: u8,
+}
+
+/// First FFI wire code past the stdlib band (stdlib wire codes 0..=13);
+/// custom row `i` surfaces as `WIRE_CUSTOM_BASE + i`.
+pub const WIRE_CUSTOM_BASE: u8 = 14;
 
 // -- compile-time per-class code masks and ranges (the hot-path form) ------
 //
