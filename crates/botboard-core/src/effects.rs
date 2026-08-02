@@ -220,6 +220,20 @@ pub static PUSH: AbilityDef = AbilityDef {
     descriptor_slot: NO_SLOT,
 };
 
+/// Reveal an enemy in range (SRW §7/§10): the ops are EMPTY — the board
+/// effect is nothing, the turn is the price. The information effect
+/// (belief collapse for the caster's side) is applied by the
+/// imperfect-info layer keying on `Effect::Spy` after the move applies;
+/// the core stays belief-free.
+pub static SPY: AbilityDef = AbilityDef {
+    id: "spy",
+    selector: Selector { who: Who::Enemy, reach: Reach::Point, preds: &[] },
+    ops: &[],
+    self_ops: &[],
+    cost: CostHint { flat: 0.5, mult: 1.0 },
+    descriptor_slot: NO_SLOT,
+};
+
 /// The empty row: `Effect::None`/`Effect::Twice` never reach the ability
 /// interpreter (Twice applies as `MoveKind::Compound`), but the mapping
 /// stays total.
@@ -249,6 +263,7 @@ pub fn row(e: Effect) -> &'static AbilityDef {
         Effect::Mine => &MINE,
         Effect::Swap => &SWAP,
         Effect::Push => &PUSH,
+        Effect::Spy => &SPY,
         Effect::None | Effect::Twice => &EMPTY,
         Effect::Custom(_) => unreachable!("custom effects resolve via GameDef::custom_effects"),
     }
@@ -269,6 +284,7 @@ pub fn ability_row(a: &AbilityBit) -> &'static AbilityDef {
         AbilityBit::MineLayer { .. } => &MINE,
         AbilityBit::Swap { .. } => &SWAP,
         AbilityBit::Push { .. } => &PUSH,
+        AbilityBit::Spy { .. } => &SPY,
         AbilityBit::Custom(_) => {
             unreachable!("custom ability bits resolve via GameDef::custom_effects")
         }
@@ -282,7 +298,8 @@ pub fn ability_row(a: &AbilityBit) -> &'static AbilityDef {
 /// The stdlib ability ids (registry row ids plus the FFI parser's kind
 /// names) — custom ids must not collide with any of these.
 pub const STDLIB_ABILITY_IDS: &[&str] = &[
-    "heal", "wall", "pit", "laser", "rez", "resurrect", "hack", "mine", "swap", "push", "none",
+    "heal", "wall", "pit", "laser", "rez", "resurrect", "hack", "mine", "swap", "push", "spy",
+    "none",
 ];
 
 /// Target reach of a custom ability. Unlike stdlib rows (whose

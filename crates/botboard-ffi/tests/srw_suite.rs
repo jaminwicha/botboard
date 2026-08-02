@@ -795,7 +795,7 @@ fn stage4_vamp_strike_over_the_abi() {
     let si = strike_idx.expect("vamp strike generates over the ABI");
     assert_eq!(srw_legal_info(b, si, info.as_mut_ptr()), 0);
     assert_eq!(info[2], 5, "ability kind code");
-    assert_eq!(info[4], 11, "custom effect codes allocate upward from the stdlib band");
+    assert_eq!(info[4], 32, "custom effect codes live in the band above the stdlib codes");
 
     // Apply: grunt (piece 3) 2 → 1 HP; vamp (piece 1) capped at 3.
     let mut pi = [0 as c_int; 6];
@@ -1039,4 +1039,118 @@ fn stage4_validation_failures_name_the_fault() {
             "error must name the fault: wanted {want:?} in {err:?} for {frag}"
         );
     }
+}
+
+#[test]
+fn spy_collapses_belief_and_pierces_stealth_over_the_abi() {
+    // SRW §7/§10: the active recon verb. A spy-capable controller reveals
+    // an ambiguous, stealthed enemy: identity collapses for the caster's
+    // side only, stealth pierces permanently, the board doesn't move.
+    let spec = r#"{
+  "seed": 21, "max_plies": 60,
+  "board": {"w": 7, "h": 7},
+  "sides": 2,
+  "types": [
+    {"name": "ctrl", "glyph": "C", "royal": true,
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}],
+     "abilities": [{"kind": "spy", "range": 4}]},
+    {"name": "scuttler", "glyph": "S",
+     "moves": [{"geom": "leaper", "m": 1, "n": 2}]},
+    {"name": "shade", "glyph": "H", "stealth": true,
+     "moves": [{"geom": "leaper", "m": 0, "n": 1}]}
+  ],
+  "placements": [
+    {"t": 0, "side": 0, "x": 3, "y": 0},
+    {"t": 0, "side": 1, "x": 3, "y": 6},
+    {"t": 1, "side": 1, "x": 0, "y": 6},
+    {"t": 2, "side": 1, "x": 3, "y": 3}
+  ],
+  "tiers": [0, 0]
+}"#;
+    let b = srw_create(c(spec).as_ptr());
+    assert!(!b.is_null(), "spy setup must build: {}", last_err());
+
+    // Piece 3 = the shade at d4: ambiguous and invisible to side 0.
+    assert_eq!(srw_revealed(b, 0, 3), 0, "shade identity starts ambiguous");
+    assert_eq!(srw_visible(b, 0, 3), 0, "shade starts concealed");
+    let h0 = srw_entropy(b, 0);
+    assert!(h0 > 0.0);
+
+    // The spy move generates (ground truth — the arbiter sees the cloak)
+    // and surfaces effect code 11 in srw_legal_info.
+    let mut mv = [0 as c_char; 32];
+    let mut info = [0 as c_int; 6];
+    let n = srw_legal_count(b);
+    let mut spy_at = -1;
+    for i in 0..n {
+        assert!(srw_legal_move(b, i, mv.as_mut_ptr(), 32) > 0);
+        if buf_str(&mv) == "d1!spy:d4" {
+            spy_at = i;
+        }
+    }
+    assert!(spy_at >= 0, "d1!spy:d4 must be legal");
+    assert_eq!(srw_legal_info(b, spy_at, info.as_mut_ptr()), 0);
+    assert_eq!(info[2], 5, "spy is an ability-kind move");
+    assert_eq!(info[4], 11, "spy's stable effect code");
+
+    // Apply: board-null, but side 0 now knows and sees the shade.
+    let mut pi_before = [0 as c_int; 6];
+    assert_eq!(srw_piece_info(b, 3, pi_before.as_mut_ptr()), 0);
+    assert_eq!(srw_apply(b, c("d1!spy:d4").as_ptr()), 0);
+    let mut pi_after = [0 as c_int; 6];
+    assert_eq!(srw_piece_info(b, 3, pi_after.as_mut_ptr()), 0);
+    assert_eq!(pi_before, pi_after, "spy mutates nothing on the board");
+    assert_eq!(srw_revealed(b, 0, 3), 1, "identity collapses for the caster's side");
+    assert_eq!(srw_visible(b, 0, 3), 1, "stealth is pierced for the caster's side");
+    assert!(srw_entropy(b, 0) < h0, "the caster's belief sharpens");
+    assert_eq!(srw_stm(b), 1, "the turn was the price");
+    srw_destroy(b);
+}
+
+#[test]
+fn codex_export_warm_starts_rematch_over_the_abi() {
+    // §8.8/§10–§11 end to end: export a battle's accumulated belief,
+    // feed it back verbatim in a rematch setup, start strictly sharper.
+    let s_cold = c(&setup(3, "", "[1, 1]"));
+    let b_cold = srw_create(s_cold.as_ptr());
+    let h_cold = srw_entropy(b_cold, 1);
+
+    // Battle A: side 1 learned the lancers (partial intel stands in for
+    // a played battle's observations).
+    let s_a = c(&setup(3, r#"{"observer": 1, "known_types": [2]}"#, "[1, 1]"));
+    let b_a = srw_create(s_a.as_ptr());
+    let h_a = srw_entropy(b_a, 1);
+    assert!(h_a > 0.0 && h_a < h_cold);
+    let mut cbuf = [0 as c_char; 4096];
+    let n = srw_codex(b_a, 1, cbuf.as_mut_ptr(), 4096);
+    assert!(n > 0, "codex export must write, got {n}");
+    let codex_json = buf_str(&cbuf);
+    assert!(codex_json.contains("\"candidates\""));
+
+    // Battle B: a cold rematch, codex fed back verbatim.
+    let s_b = setup(3, "", "[1, 1]")
+        .replace("\"tiers\"", &format!("\"codex\": [{codex_json}],\n  \"tiers\""));
+    let b_b = srw_create(c(&s_b).as_ptr());
+    assert!(!b_b.is_null(), "codex rematch must build: {}", last_err());
+    let h_b = srw_entropy(b_b, 1);
+    assert!(
+        (h_b - h_a).abs() < 1e-12,
+        "warm start restores the learned sharpness: {h_b} vs {h_a}"
+    );
+    assert!(h_b < h_cold, "the rematch starts strictly sharper than cold");
+    assert_eq!(srw_revealed(b_b, 1, 2), 1, "the scouted lancer stays known");
+    // The other side's belief is untouched by side 1's codex.
+    assert_eq!(srw_entropy(b_b, 0), srw_entropy(b_cold, 0));
+
+    // Validation is loud: an out-of-range observer names the fault.
+    let bad = setup(3, "", "[1, 1]").replace(
+        "\"tiers\"",
+        "\"codex\": [{\"observer\": 5, \"candidates\": [[0]]}],\n  \"tiers\"",
+    );
+    assert!(srw_create(c(&bad).as_ptr()).is_null());
+    assert!(last_err().contains("codex"), "fault names codex: {}", last_err());
+
+    srw_destroy(b_cold);
+    srw_destroy(b_a);
+    srw_destroy(b_b);
 }

@@ -209,6 +209,12 @@ pub enum AbilityBit {
     /// open (for the pushed piece's terrain permissions) and empty.
     /// Landing hazards bite the shoved piece.
     Push { range: u8 },
+    /// SRW §7/§10: reveal an enemy piece in Chebyshev range — the active
+    /// belief-collapse verb (identity + stealth pierce for the caster's
+    /// side, applied at the imperfect-info layer). Board-null: the move
+    /// spends the turn and mutates nothing, so under perfect information
+    /// it is a legal but pointless tempo loss.
+    Spy { range: u8 },
     /// Bits 2.0 Stage 4: reference to a CUSTOM ability row
     /// (`GameDef::custom_effects[index]`). The row carries the whole
     /// definition — selector, range, ops, cost, descriptor slot — so

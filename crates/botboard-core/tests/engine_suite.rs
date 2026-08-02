@@ -244,8 +244,13 @@ fn random_robot_army_samples_the_full_vocabulary() {
                     }
                     // Batch-2 abilities joined the palette in batch 3.
                     AbilityBit::Swap { .. } | AbilityBit::Push { .. } => seen[11] += 1,
-                    // Stage-4 custom references never appear in generated
-                    // armies (the generator draws from the stdlib palette).
+                    // Spy is board-null (its value is informational, SRW-
+                    // layer only), so the perfect-info training generator
+                    // deliberately skips it; Stage-4 custom references
+                    // never appear either (stdlib palette only).
+                    AbilityBit::Spy { .. } => {
+                        unreachable!("generator skips the board-null spy")
+                    }
                     AbilityBit::Custom(_) => unreachable!("generator emits stdlib bits only"),
                 }
             }

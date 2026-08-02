@@ -140,13 +140,17 @@ each is a deliberate deferral, listed so it can't silently vanish.
 
 **SRW surface (Subterranean_Robot_Wars_Spec_v3.md):**
 
-- **Spy ability (§7, §10)** — no active "spend an action to reveal"
-  exists; belief collapse is setup-time `intel` or passive observation.
-  (`bits.rs` reserves the hook: "hack/laser/spy reuse it later".)
-- **Codex unwired (§10, §11)** — `codex.rs` (belief JSON roundtrip,
-  rematch warm-start) is core-only; the SRW FFI has no belief
-  export-after / import-before-battle calls, so cross-battle recon
-  persistence can't reach the campaign layer yet.
+- ~~Spy ability (§7, §10)~~ — ✅ CLOSED (Aug 2026): stdlib ability
+  `"spy"` {range}, the active belief-collapse verb. Board-null in the
+  core (empty op row, excluded from the mobility integral, small flat
+  prior); the SRW layer collapses the caster side's belief and pierces
+  the target's stealth on apply. Effect code 11; custom rows moved to
+  the `EFFECT_CUSTOM_BASE` (32+) band. Tested core + ABI.
+- ~~Codex unwired (§10, §11)~~ — ✅ CLOSED (Aug 2026): `srw_codex`
+  exports an observer's belief as codex JSON; the setup's `"codex"`
+  array takes exports back verbatim and warm-starts the rematch
+  (intersection, applied before `intel`). Tested over the ABI:
+  exported sharpness restores exactly, validation is loud.
 - **Controller capture → army transfer (§7)** — elimination only today;
   no primitive supports reassigning a captured side's pieces.
 - **N-player battles run the FFA baseline, not the belief ladder** —
@@ -173,10 +177,9 @@ each is a deliberate deferral, listed so it can't silently vanish.
 
 ## Next phases (proposed order, August 2026)
 
-1. **Wire the codex + add spy** — small, high-leverage for SRW: FFI
-   belief export/import (the core already does the work) plus a spy
-   ability row (active belief collapse). Together they unlock the
-   campaign recon arc (§10–§11) end to end.
+1. **Wire the codex + add spy** — ✅ DONE (Aug 2026): `srw_codex`
+   export + `"codex"` setup warm-start, and the `"spy"` ability row.
+   The campaign recon arc (§10–§11) is open end to end.
 2. **SRW spec v4 catch-up** — document the authoring surface (Stage 4
    customs, batches 2–3, `"net"`), and rule on spy/army-transfer scope
    while in there.

@@ -767,6 +767,21 @@ fn gen_abilities(g: &GameDef, pos: &Position, t: TypeId, from: u16, out: &mut Ve
                     }
                 }
             }
+            AbilityBit::Spy { range } => {
+                // Any enemy in range (royals included — identity is the
+                // payload, and the core does not know which identities
+                // the caster's side still lacks). Board-null on apply.
+                for p in &pos.pieces {
+                    let Loc::Board(sq) = p.loc else { continue };
+                    if p.side == stm {
+                        continue;
+                    }
+                    let (x, y) = g.board.xy(sq);
+                    if (x - fx).abs().max((y - fy).abs()) as u8 <= range {
+                        out.push(Move::ability(from, sq, Effect::Spy, NO_SQ));
+                    }
+                }
+            }
             AbilityBit::Resurrect { range } => {
                 // One candidate per dead friendly type (piece identity
                 // within a type is interchangeable): revive onto any empty

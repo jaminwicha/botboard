@@ -699,3 +699,64 @@ fn piercing_prices_higher_than_plain_lasers() {
         "piercing must out-price plain: {pierced} vs {plain}"
     );
 }
+
+#[test]
+fn spy_is_board_null_and_undoes_exactly() {
+    // SRW §7/§10's active recon verb: generates against any in-range
+    // enemy, applies as a pure tempo loss (zero board mutation — the
+    // information effect lives at the imperfect-info layer), undoes
+    // exactly. Priced as a small flat term.
+    let mut types = robot_types();
+    types.push(
+        PieceTypeDef::new("probe", 'Y', vec![MoveBit::leaper(0, 1)])
+            .abilities(vec![AbilityBit::Spy { range: 3 }]),
+    );
+    types.push(PieceTypeDef::new("bare", 'B', vec![MoveBit::leaper(0, 1)]));
+    const PROBE: TypeId = 13;
+    const BARE: TypeId = 14;
+    let g = GameDef::new(
+        BoardDef { w: 8, h: 8 },
+        2,
+        types,
+        vec![],
+        Policy {
+            stalemate: StalematePolicy::Draw,
+            capture_fate: CaptureFate::Destroy,
+            turn: TurnPolicy::Alternate,
+            pass: PassPolicy::Forbidden,
+        },
+        vec![(KING, 0, 0, 0), (KING, 1, 7, 7), (PROBE, 0, 3, 3), (TANK, 1, 5, 5)],
+    );
+    let mut pos = Position::startpos(&g);
+
+    let moves = legal_moves(&g, &mut pos);
+    let spy = moves
+        .iter()
+        .find(|m| move_str(&g, m) == "d4!spy:f6")
+        .copied()
+        .expect("spy generates against the in-range enemy tank");
+    assert_eq!(spy.kind, MoveKind::Ability);
+    assert_eq!(spy.effect, Effect::Spy);
+    // The far royal is out of range; no spy targets it (royals in range
+    // WOULD be legal targets — identity is the payload).
+    assert!(!moves.iter().any(|m| m.effect == Effect::Spy && m.to == g.board.sq(7, 7)));
+
+    let before = pos.clone();
+    let u = pos.make(&g, &spy); // debug builds assert incremental-hash parity
+    assert_eq!(pos.board, before.board, "spy moves nothing");
+    assert_eq!(pos.hp, before.hp, "spy damages nothing");
+    assert_eq!(pos.terrain, before.terrain, "spy lays nothing");
+    assert_ne!(pos.stm, before.stm, "the turn is the price");
+    pos.unmake(&g, &u);
+    assert_eq!(pos.hash, before.hash, "undo restores the exact key");
+    assert_eq!(pos.hash, g.zobrist.full_hash(&pos), "restored key matches recompute");
+
+    // Pricing: the probe must cost more than its ability-free twin (the
+    // flat information term), but only slightly (< half a pawn extra).
+    use botboard_core::cost::{cost_prior, CostWeights};
+    let w = CostWeights { w_move: 0.35, w_attack: 0.35 };
+    let bare = cost_prior(&g, BARE, &w);
+    let probe = cost_prior(&g, PROBE, &w);
+    assert!(probe > bare, "spy must carry a positive flat term: {probe} vs {bare}");
+    assert!(probe < bare + 0.75, "spy is information, not firepower: {probe} vs {bare}");
+}

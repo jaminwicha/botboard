@@ -56,6 +56,12 @@ pub fn mobility_integral(g: &GameDef, t: TypeId, side: Side) -> Mobility {
                 if mv.from != probe_from || dests.contains(&mv.to) {
                     continue;
                 }
+                // Spy is board-null: its reveal ball is information, not
+                // board power — the flat prior term prices it, so it
+                // must not masquerade as attack coverage here.
+                if mv.effect == crate::moves::Effect::Spy {
+                    continue;
+                }
                 dests.push(mv.to);
                 if pos.piece_at(mv.to).is_some() {
                     a += 1.0;
@@ -156,6 +162,9 @@ pub fn cost_prior(g: &GameDef, t: TypeId, w: &CostWeights) -> f64 {
             // Batch-2 flat priors: the exchange trick and the shove.
             crate::bits::AbilityBit::Swap { .. } => s_flat += 1.5,
             crate::bits::AbilityBit::Push { .. } => s_flat += 2.0,
+            // Spy is board-null; its value is informational (belief
+            // collapse at the SRW layer), priced as a small flat term.
+            crate::bits::AbilityBit::Spy { .. } => s_flat += 0.5,
             // Stage-4 custom rows price via their REQUIRED cost hint:
             // the flat term joins the board-state-dependent abilities'
             // S_flat; the multiplier joins M_utility (pierce-style

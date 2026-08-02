@@ -90,7 +90,9 @@ pub fn descriptor(g: &GameDef, t: TypeId, side: Side) -> [f32; D] {
             // Batch-2 abilities (swap/push) have no dedicated descriptor
             // dim: the 21-dim layout is frozen for checkpoint
             // compatibility; their value flows through the flat priors.
-            AbilityBit::Swap { .. } | AbilityBit::Push { .. } => {}
+            // Swap/push/spy carry no descriptor dim: swap and push flow
+            // through the cost prior only; spy is board-null entirely.
+            AbilityBit::Swap { .. } | AbilityBit::Push { .. } | AbilityBit::Spy { .. } => {}
             // Stage-4 custom rows map into the frozen layout via their
             // validated stdlib-kin slot (documented approximation: a
             // fixed presence signal of 1.0 on the kin's dim — exactly

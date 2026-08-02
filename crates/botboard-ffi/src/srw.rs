@@ -58,6 +58,19 @@
 //! A missing or invalid checkpoint is a build error, never a silent
 //! fallback to the linear eval.
 //!
+//! Spy + codex (SRW §7, §8.8, §10–§11) — the recon arc end to end:
+//! ability kind `"spy"` {range} is the active belief-collapse verb — a
+//! board-null action (notation `"e2!spy:e3"`, effect code 11) that, on
+//! apply, collapses the caster side's belief about the target to its
+//! true identity and pierces its stealth for that side permanently.
+//! `srw_codex(battle, observer, buf, cap)` exports that observer's
+//! current belief as codex JSON; the optional top-level `"codex"` setup
+//! array takes those exports back verbatim
+//! (`"codex": [{"observer": 1, "candidates": [[0,2],[1],...]}]`) and
+//! warm-starts the rematch: intersection with the cold-open belief,
+//! per-piece fallback when the enemy changed a slot, applied before
+//! `intel` so fresh certain intel wins over stale recon.
+//!
 //! Custom effects and terrains (Bits 2.0 Stage 4) — two OPTIONAL
 //! top-level arrays make Axis-B content authorable per battle:
 //!
@@ -99,8 +112,9 @@
 //! NNUE layout. Piece `"abilities"` entries may then reference the id:
 //! `{"kind": "vamp-strike"}` (other keys ignored — the row IS the
 //! definition). Notation is `"e2!vamp-strike:e3"`; `srw_legal_info`
-//! effect codes allocate upward from the stdlib band: custom row `i`
-//! surfaces as `11 + i`, stable within the battle (order = array order).
+//! effect codes for custom rows live in a fixed band above the stdlib
+//! codes: custom row `i` surfaces as `EFFECT_CUSTOM_BASE (32) + i`,
+//! stable within the battle (order = array order).
 //! Custom MOVE scripts (new special-move generators) are OUT of scope:
 //! gates/bindings compose engine-side only. Relocation-coupled custom
 //! selector shapes (swap/push/retreat/resurrect analogues) are likewise
@@ -162,6 +176,11 @@ static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 /// The fixed pricing weights shared with the engine CLI's army generator:
 /// cross-battle comparable, deterministic, re-fit is a campaign concern.
 const W: CostWeights = CostWeights { w_move: 0.35, w_attack: 0.35 };
+
+/// `srw_legal_info` effect-code band for Stage-4 custom rows: custom row
+/// `i` surfaces as `EFFECT_CUSTOM_BASE + i` (stable within a battle;
+/// the gap above the stdlib codes is headroom for stdlib growth).
+pub const EFFECT_CUSTOM_BASE: c_int = 32;
 
 pub struct SrwBattle {
     g: GameDef,
@@ -304,6 +323,7 @@ fn parse_ability(j: &Json, customs: &[CustomAbility]) -> Option<AbilityBit> {
         "mine" => Some(AbilityBit::MineLayer { range }),
         "swap" => Some(AbilityBit::Swap { range }),
         "push" => Some(AbilityBit::Push { range }),
+        "spy" => Some(AbilityBit::Spy { range }),
         other => customs
             .iter()
             .position(|c| c.id == other)
@@ -858,6 +878,42 @@ fn build(spec_str: &str) -> Result<SrwBattle, String> {
     // (SRW §10: codex/recon = belief collapse; the engine gear follows).
     let mut beliefs: Vec<Belief> =
         (0..sides).map(|s| Belief::cold_open(&g, &pos, s)).collect();
+    // Persistent codex (§8.8, §10–§11): each entry warm-starts an
+    // observer's belief from an earlier battle's `srw_codex` export —
+    // intersected with the fresh cold-open set; empty intersections fall
+    // back per piece (the enemy may have changed that slot). Applied
+    // BEFORE intel, so certain fresh intel wins over stale recon.
+    if let Some(codex) = spec.get("codex").and_then(|c| c.as_arr()) {
+        for cj in codex {
+            let Some(o) = cj.get("observer").and_then(|v| v.as_i64()) else {
+                return Err("codex: each entry needs an \"observer\" side number".into());
+            };
+            if o < 0 || o >= sides as i64 {
+                return Err(format!("codex: observer {o} out of range for {sides} sides"));
+            }
+            let Some(cands) = cj.get("candidates").and_then(|c| c.as_arr()) else {
+                return Err(format!(
+                    "codex[observer {o}]: needs a \"candidates\" array of type-id arrays \
+                     (the srw_codex export shape)"
+                ));
+            };
+            let candidates: Vec<Vec<TypeId>> = cands
+                .iter()
+                .map(|row| {
+                    row.as_arr()
+                        .map(|r| {
+                            r.iter().filter_map(|v| v.as_i64().map(|t| t as TypeId)).collect()
+                        })
+                        .ok_or(format!(
+                            "codex[observer {o}]: candidates rows must be arrays of type ids"
+                        ))
+                })
+                .collect::<Result<_, _>>()?;
+            let prior = Belief { observer: o as Side, candidates };
+            beliefs[o as usize] =
+                botboard_core::codex::warm_start(&g, &pos, o as Side, &prior);
+        }
+    }
     if let Some(intel) = spec.get("intel").and_then(|i| i.as_arr()) {
         for ij in intel {
             let o = ij.num("observer", 0.0) as usize;
@@ -1159,6 +1215,19 @@ impl SrwBattle {
             b.observe(&self.g, &pre, &mv);
         }
         self.reveal_pass(&pre);
+        // Spy (§7, §10): the active belief-collapse verb. The move is
+        // board-null by construction; the information effect lands here —
+        // the caster's side learns the target's identity and pierces its
+        // stealth permanently (identity IS the cover blown).
+        if mv.effect == Effect::Spy {
+            let actor = pre.stm as usize;
+            let ti = pre.board[mv.to as usize];
+            if ti >= 0 {
+                let ti = ti as usize;
+                self.beliefs[actor].candidates[ti] = vec![self.pos.pieces[ti].t];
+                self.revealed[actor][ti] = true;
+            }
+        }
         self.history.push(self.pos.hash);
         if self.history.iter().filter(|&&h| h == self.pos.hash).count() >= 3 {
             self.over = Some(9);
@@ -1416,6 +1485,27 @@ pub extern "C" fn srw_entropy(b: *mut SrwBattle, observer: c_int) -> f64 {
     b.beliefs.get(observer as usize).map_or(-1.0, |bl| bl.entropy())
 }
 
+/// Export `observer`'s CURRENT belief as codex JSON (§8.8, §10–§11):
+/// accumulated reconnaissance made durable. The campaign layer stores it
+/// and feeds it back verbatim as an entry in a later battle's `"codex"`
+/// setup array to warm-start the rematch (intersection with cold-open —
+/// strictly sharper, never wrong). Returns bytes written (excl. NUL),
+/// -1 bad handle, -2 bad observer, or the buffer-overflow negative.
+#[no_mangle]
+pub extern "C" fn srw_codex(
+    b: *mut SrwBattle,
+    observer: c_int,
+    buf: *mut c_char,
+    cap: c_int,
+) -> c_int {
+    let Some(b) = (unsafe { b.as_ref() }) else { return -1 };
+    if observer < 0 {
+        return -2;
+    }
+    let Some(bl) = b.beliefs.get(observer as usize) else { return -2 };
+    write_str(&botboard_core::codex::belief_to_json(bl), buf, cap)
+}
+
 /// Shared FFI terrain encoding: 0 none, 1 wall, 2 pit, 3 mine, 4 ice,
 /// 5 tall grass, 6 acid, 7/8/9 destructible block tier 1/2/3,
 /// 10/11/12/13 conveyor N/E/S/W (N = +y, side 0's forward). The code IS
@@ -1532,8 +1622,11 @@ pub extern "C" fn srw_legal_info(b: *mut SrwBattle, i: c_int, out: *mut c_int) -
         Effect::Mine => 8,
         Effect::Swap => 9,
         Effect::Push => 10,
-        // Stage-4 custom rows: upward from the stdlib band.
-        Effect::Custom(i) => 11 + i as c_int,
+        Effect::Spy => 11,
+        // Stage-4 custom rows: a fixed band above the stdlib codes
+        // (moved from 11+i when spy claimed 11 — the band base leaves
+        // headroom for stdlib growth; codes stay stable within a battle).
+        Effect::Custom(i) => EFFECT_CUSTOM_BASE + i as c_int,
     };
     unsafe {
         *out = if mv.from == NO_SQ { -1 } else { mv.from as c_int };

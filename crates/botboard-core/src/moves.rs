@@ -61,11 +61,18 @@ pub enum Effect {
     /// Shove the enemy at `to` one square directly away from the caster;
     /// `aux` holds the shoved piece's destination.
     Push,
+    /// Reveal the enemy piece at `to` (SRW §7/§10): board-null — no ops,
+    /// no board mutation, the turn is the price. The information effect
+    /// (belief collapse + stealth pierce for the caster's side) lives at
+    /// the imperfect-info layer, which keys on this effect after apply;
+    /// under perfect information the move is a legal tempo loss.
+    Spy,
     /// Bits 2.0 Stage 4: a CUSTOM ability — the index names the
     /// GameDef-owned row (`GameDef::custom_effects[i]`), which carries
     /// the whole definition (selector, ops, cost, descriptor slot).
-    /// Notation is `"e2!<id>:e3"`; the FFI effect code is `11 + i`
-    /// (allocated upward from the stdlib band, stable within a battle).
+    /// Notation is `"e2!<id>:e3"`; the FFI effect code is
+    /// `EFFECT_CUSTOM_BASE + i` (a fixed band above the stdlib codes,
+    /// stable within a battle).
     Custom(u16),
 }
 
@@ -149,6 +156,7 @@ pub fn move_str(g: &GameDef, mv: &Move) -> String {
                 Effect::Mine => "mine".to_string(),
                 Effect::Swap => "swap".to_string(),
                 Effect::Push => "push".to_string(),
+                Effect::Spy => "spy".to_string(),
                 // Custom rows: the registry id IS the notation name.
                 Effect::Custom(i) => g.custom_effects[i as usize].id.clone(),
                 _ => "fx".to_string(),
