@@ -155,11 +155,12 @@ each is a deliberate deferral, listed so it can't silently vanish.
   no primitive supports reassigning a captured side's pieces.
 - **N-player battles run the FFA baseline, not the belief ladder** —
   §10's information mechanics fully apply to 2-side battles only.
-- **The spec doc trails the implementation** — custom
-  abilities/terrains (Stage 4), vocab batches 2–3 (drill, blocks,
-  conveyors, swap/push, HP gates, grasshopper/locust, short riders),
-  and per-battle `"net"` checkpoints are all beyond-spec and
-  undocumented there; needs a spec v4 catch-up pass.
+- ~~The spec doc trails the implementation~~ — ✅ CLOSED (Aug 2026):
+  **Subterranean_Robot_Wars_Spec_v4.md** documents the shipped
+  authoring surface (Appendix E: setup keys, vocab batches 2–3,
+  Stage-4 custom rows, `"net"`, telemetry), promotes spy + codex to
+  shipped, rules army transfer as campaign-layer roster bookkeeping,
+  and retires the engine-dependency risk.
 - Campaign/run/meta loops (§4, §5, §11), room archetypes (§6), clans
   and alignment (§9) live in the C#/Godot layer
   (`~/Workspace/Projects/SubterraneanRobotWars`), not this repo; the
@@ -180,9 +181,9 @@ each is a deliberate deferral, listed so it can't silently vanish.
 1. **Wire the codex + add spy** — ✅ DONE (Aug 2026): `srw_codex`
    export + `"codex"` setup warm-start, and the `"spy"` ability row.
    The campaign recon arc (§10–§11) is open end to end.
-2. **SRW spec v4 catch-up** — document the authoring surface (Stage 4
-   customs, batches 2–3, `"net"`), and rule on spy/army-transfer scope
-   while in there.
+2. **SRW spec v4 catch-up** — ✅ DONE (Aug 2026):
+   `Subterranean_Robot_Wars_Spec_v4.md` (Appendix E = the authoring
+   surface; §7 rules army transfer campaign-side; spy/codex shipped).
 3. **SRW net promotion recipe** (scale rung 3's open half) — highest
    leverage for play quality; try deeper teacher games and longer
    value targets before H growth.
