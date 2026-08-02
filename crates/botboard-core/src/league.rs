@@ -41,6 +41,40 @@ pub fn default_population() -> Vec<Member> {
     ]
 }
 
+/// A widened pool (scale-ladder rung 2): the four seed personalities
+/// plus deterministic members walking a 2-D lattice over the same style
+/// space — material scale 1.2 → 0.7 crossed with mobility 0 → 14 cp —
+/// so Nash averaging has spread beyond the seeds' single diagonal.
+/// `population(4)` is exactly the seed pool.
+pub fn population(n: usize) -> Vec<Member> {
+    let mut pop = default_population();
+    pop.truncate(n);
+    // The off-diagonal lattice, most-distinct-first: (scale row, mobility
+    // col) pairs the seeds do not cover.
+    const SCALES: [f64; 4] = [1.2, 1.05, 0.9, 0.7];
+    const MOBILITY: [i32; 4] = [0, 5, 9, 14];
+    let mut lattice: Vec<(usize, usize)> = Vec::new();
+    for d in 1..4usize {
+        // Walk anti-diagonals so contrasting styles (hoarder-static,
+        // gambler-restless) enter before near-duplicates of the seeds.
+        for r in 0..4usize {
+            let c = (r + d) % 4;
+            lattice.push((r, c));
+        }
+    }
+    for &(r, c) in &lattice {
+        if pop.len() >= n {
+            break;
+        }
+        pop.push(Member {
+            name: format!("s{}m{}", (SCALES[r] * 100.0) as i32, MOBILITY[c]),
+            material_scale: SCALES[r],
+            mobility_cp: MOBILITY[c],
+        });
+    }
+    pop
+}
+
 /// Empirical meta-payoff: payoff[i][j] = score of i vs j in [0,1].
 pub fn round_robin(
     g: &GameDef,

@@ -10,7 +10,7 @@
 //!   league <variant> [--games N]                        population + Nash
 //!   armies [--budget B] [--seed S]                      generate + price
 //!   train-net <variant> [--games N --epochs E --out F]  net training
-//!   train-net srw [--games N --epochs E --budget B --out F]
+//!   train-net srw [--games N --epochs E --budget B --depth D --plies P --out F]
 //!                             sampled-robot-army training + promotion probe
 //!   netmatch <variant> --a A.bin --b B.bin [--pairs N]   paired-opening gate
 //!   armymatch [--pairs N --depth D --nodes N --seed S]    CwDA fairness bench
@@ -23,7 +23,7 @@ use botboard_core::cost::{cost_prior, fit_weights, material_table, mobility_inte
 use botboard_core::eval::Eval;
 use botboard_core::game::GameDef;
 use botboard_core::ladder::{choose_move, LadderConfig};
-use botboard_core::league::{default_population, nash_averaging, profiles_json, round_robin};
+use botboard_core::league::{nash_averaging, population, profiles_json, round_robin};
 use botboard_core::movegen::{legal_moves, status, Status};
 use botboard_core::moves::move_str;
 use botboard_core::perft::{divide, perft};
@@ -261,8 +261,11 @@ fn cmd_cost(g: &GameDef, name: &str) {
 
 fn cmd_league(g: &GameDef, name: &str, args: &[String]) {
     let games: u32 = opt(args, "--games", 2);
+    // Scale-ladder rung 2: `--members N` widens the pool past the four
+    // seed personalities so Nash averaging has spread (12–16 intended).
+    let members: usize = opt(args, "--members", 4);
     let material = material_for(g, name);
-    let pop = default_population();
+    let pop = population(members);
     println!("round-robin: {} members × {games} games/pair…", pop.len());
     let payoff = round_robin(g, &pop, &material, games, 2, 20_000, 7);
     let (mix, rating) = nash_averaging(&payoff, 5000);
@@ -360,14 +363,22 @@ fn cmd_train_srw(args: &[String]) {
     let epochs: u32 = opt(args, "--epochs", 8);
     let budget: f64 = opt(args, "--budget", 14.0);
     let seed: u64 = opt(args, "--seed", 11);
+    // The promotion recipe's named levers (STATUS rung 3): deeper
+    // teacher games and a longer value-target horizon. Old behavior was
+    // depth 2 / 160 plies.
+    let depth: i32 = opt(args, "--depth", 3);
+    let plies: u32 = opt(args, "--plies", 240);
     let out: String = opt(args, "--out", "srw_net_v1.bin".into());
     let w = botboard_core::cost::CostWeights { w_move: 0.35, w_attack: 0.35 };
 
     let mut net = botboard_core::nnue::FloatNet::new(7);
-    println!("training on {games} sampled robot armies (budget {budget}, {epochs} epochs)…");
+    println!(
+        "training on {games} sampled robot armies (budget {budget}, teacher depth {depth}, \
+         horizon {plies} plies, {epochs} epochs)…"
+    );
     let t0 = Instant::now();
     let rep = botboard_core::nnue::train_srw_from_selfplay(
-        &mut net, &w, budget, games, 2, epochs, 0.01, seed,
+        &mut net, &w, budget, games, depth, plies, epochs, 0.01, seed,
     );
     println!(
         "samples: {}  loss: {:.4} → {:.4}  ({:.1}s)",

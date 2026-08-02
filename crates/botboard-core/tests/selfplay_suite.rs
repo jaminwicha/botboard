@@ -110,6 +110,34 @@ fn league_round_robin_and_profiles() {
     assert!(json.contains("berserk"));
 }
 
+#[test]
+fn widened_population_spans_the_style_lattice() {
+    // Scale-ladder rung 2: population(n) keeps the four seeds as a
+    // prefix, generates distinct deterministic members up the lattice,
+    // and stays within the seeds' style-space bounds.
+    use botboard_core::league::population;
+    let seeds = default_population();
+    for n in [4usize, 12, 16] {
+        let pop = population(n);
+        assert_eq!(pop.len(), n);
+        for (a, b) in pop.iter().zip(seeds.iter()) {
+            assert_eq!(a.name, b.name, "seeds stay the prefix");
+        }
+        let mut names: Vec<&str> = pop.iter().map(|m| m.name.as_str()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), n, "members must be distinct");
+        for m in &pop {
+            assert!((0.7..=1.2).contains(&m.material_scale));
+            assert!((0..=14).contains(&m.mobility_cp));
+        }
+    }
+    for (a, b) in population(4).iter().zip(seeds.iter()) {
+        assert_eq!(a.material_scale, b.material_scale);
+        assert_eq!(a.mobility_cp, b.mobility_cp);
+    }
+}
+
 /// Heavier statistical check: a deeper searcher must beat a shallower one.
 #[test]
 #[ignore]

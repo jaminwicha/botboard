@@ -540,6 +540,7 @@ pub fn train_srw_from_selfplay(
     budget: f64,
     games: u32,
     depth: i32,
+    max_plies: u32,
     epochs: u32,
     lr: f32,
     seed: u64,
@@ -567,7 +568,10 @@ pub fn train_srw_from_selfplay(
         let mut snaps: Vec<Position> = Vec::new();
         let mut outcome = 0.5f32;
         let mut history: Vec<u64> = Vec::new();
-        for ply in 0..160 {
+        // The value-target horizon: games still undecided at the cap
+        // label 0.5, so a horizon past the old 160 (one of the promotion
+        // recipe's named levers) turns slow grinds into real outcomes.
+        for ply in 0..max_plies {
             let moves = legal_moves(&g, &mut pos);
             if moves.is_empty() {
                 let stm = pos.stm;
