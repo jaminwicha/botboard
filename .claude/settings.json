@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(CARGO_TARGET_DIR=/private/tmp/claude-501/-Users-alucinor-Workspace-Projects-botboard/b4306d92-d3db-4871-9617-904889a77dad/scratchpad/target cargo build --workspace)",
+      "Bash(./target/release/botboard probe-srw *)"
     ]
   }
 }

@@ -24,6 +24,38 @@ floor breaks.
 
 ---
 
+## Phase M0 — Tooling prerequisites (low-hanging; do before everything)
+
+Small tools that make every later phase cheaper to run and cleaner to
+interpret. Each is hours of work, not days.
+
+1. **Standalone probe command** (`botboard probe-srw --net A [--vs B]
+   --pairs K --seed S`). Today the probe is welded into `train-net
+   srw`, so re-probing an existing checkpoint forces a full retrain,
+   and A/B-ing two checkpoints on SRW armies is impossible. Extracting
+   it gives: M2 gate-stability tests on a FIXED net (the clean test —
+   vary only probe armies), M4 sweeps probed after the fact at any
+   power, and checkpoint-vs-checkpoint promotion gates (net-vs-net,
+   not just net-vs-linear) for M3's retrain cadence.
+2. **Corpus label-distribution stat.** `train-net srw` reports the
+   win/draw/loss fraction of its own labels. M1's exit criterion
+   (decisive fraction ≥ 40%) needs this number; today it is invisible.
+   One print line plus a `TrainReport` field.
+3. **Replay-based corpus storage principle (M3 design note, no code
+   yet).** Do NOT serialize positions/GameDefs for the farm store —
+   everything is deterministic per seed, so a stored game is just
+   `(seed, params, move-log)` and a shard is a list of those; replay
+   regenerates positions exactly. This keeps the store tiny, diffable,
+   and version-proof (a replay on new engine code either matches
+   hashes or loudly flags a behavior change — which doubles as a
+   regression canary). At today's scale (65 s/corpus), "the corpus" is
+   simply the `(seed, flags)` tuple in the log — regeneration IS
+   persistence until M3.
+
+**Status: ✅ SHIPPED (Aug 2026).** `probe-srw` (net-vs-linear and
+net-vs-net), the decisive-label stat, and adjudicated probe scoring
+all landed together; every later phase's runs use them.
+
 ## Phase M1 — Corpus signal (code + short runs; days)
 
 **Goal:** training labels that carry information; loss curves that
@@ -62,8 +94,14 @@ Actionable steps:
    mass stops hiding differences.
 3. Keep the ≥55% PROMOTE bar; require it at ≥32 pairs.
 
-**Exit criteria:** re-running the same config twice yields probe scores
-within 6 points. Until then, single-digit deltas are not conclusions.
+**Exit criteria:** probing a FIXED checkpoint (M0.1) under two disjoint
+probe seeds yields scores within 6 points. **Status: ✅ MET (Aug
+2026)** — raw Δ1.6, adjudicated Δ5.5 on srw_net_m2_s23 (log lesson 7).
+Two rules follow, binding on all later phases: (a) recipe comparisons
+run at a FIXED training seed (or averaged over 2–3 seeds — same-config
+retrains spread ~8 points); (b) the ADJUDICATED score is the score —
+adjudication revealed the current nets sit at 12–18% vs the teacher,
+not the draw-flattered 40–45%.
 
 ## Phase M3 — The corpus farm (ops; runs for days/weeks unattended)
 

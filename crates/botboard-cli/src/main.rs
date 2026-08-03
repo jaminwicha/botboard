@@ -10,7 +10,8 @@
 //!   league <variant> [--games N]                        population + Nash
 //!   armies [--budget B] [--seed S]                      generate + price
 //!   train-net <variant> [--games N --epochs E --out F]  net training
-//!   train-net srw [--games N --epochs E --budget B --depth D --plies P --out F]
+//!   train-net srw [--games N --epochs E --budget B --depth D --plies P --hidden H --out F]
+//!   probe-srw --net F [--vs F2 --pairs K --budget B --seed S]   probe checkpoints, no retrain
 //!                             sampled-robot-army training + promotion probe
 //!   netmatch <variant> --a A.bin --b B.bin [--pairs N]   paired-opening gate
 //!   armymatch [--pairs N --depth D --nodes N --seed S]    CwDA fairness bench
@@ -383,8 +384,9 @@ fn cmd_train_srw(args: &[String]) {
         &mut net, &w, budget, games, depth, plies, epochs, 0.01, seed,
     );
     println!(
-        "samples: {}  loss: {:.4} → {:.4}  ({:.1}s)",
+        "samples: {}  decisive: {:.1}%  loss: {:.4} → {:.4}  ({:.1}s)",
         rep.samples,
+        100.0 * rep.decisive as f64 / rep.samples.max(1) as f64,
         rep.first_loss,
         rep.last_loss,
         t0.elapsed().as_secs_f64()
@@ -392,23 +394,49 @@ fn cmd_train_srw(args: &[String]) {
     std::fs::write(&out, net.to_bytes()).expect("write checkpoint");
     println!("checkpoint written to {out} (deterministic grade derives at load)");
 
-    // Promotion probe: quantized net vs the linear teacher, 12 paired
-    // sampled armies, depth 3 / 20k nodes. Fresh seed range so the probe
-    // armies are disjoint from the training draws.
+    // Promotion probe: quantized net vs the linear teacher over paired
+    // sampled armies. Fresh seed range so the probe armies are disjoint
+    // from the training draws.
     let pairs: u32 = opt(args, "--probe-pairs", 12);
     println!("\npromotion probe: net vs linear over {pairs} paired armies…");
+    srw_probe(&net, None, pairs, budget, seed, &w);
+}
+
+/// The SRW paired-army probe (training-plan M0.1), shared by `train-net
+/// srw` and the standalone `probe-srw`: candidate A (a net) vs baseline
+/// B (another net, or the linear teacher when `None`) over freshly
+/// sampled armies — same armies + same opening, colors swapped, depth
+/// 3 / 20k nodes, 200-ply cap. Seed derivation is frozen so historical
+/// probe numbers stay comparable. Prints the running tally and the
+/// PROMOTE/HOLD verdict line (≥55%); returns (a_wins, b_wins, draws).
+fn srw_probe(
+    net: &botboard_core::nnue::FloatNet,
+    vs: Option<&botboard_core::nnue::FloatNet>,
+    pairs: u32,
+    budget: f64,
+    seed: u64,
+    w: &botboard_core::cost::CostWeights,
+) -> (u32, u32, u32) {
+    let b_name = if vs.is_some() { "vs-net" } else { "linear" };
     let (mut wn, mut wl, mut dr) = (0u32, 0u32, 0u32);
+    let (mut awn, mut awl, mut adr) = (0u32, 0u32, 0u32);
     for p in 0..pairs {
         let probe_seed = seed ^ 0x5157_0000 ^ (p as u64 * 7919);
         let mut rng = Rng::new(probe_seed);
-        let (g, gen) = botboard_core::selfplay::random_robot_army(budget, &mut rng, &w);
+        let (g, gen) = botboard_core::selfplay::random_robot_army(budget, &mut rng, w);
         let mut material = vec![0i32; g.types.len()];
         for gp in &gen {
             material[gp.type_id as usize] = (gp.cost * 100.0).round() as i32;
         }
-        let qnet = botboard_core::nnue::QuantNet::from_float(&g, &net);
-        let eval_net = Eval::with_net(material.clone(), qnet);
-        let eval_lin = Eval::new(material);
+        let qnet = botboard_core::nnue::QuantNet::from_float(&g, net);
+        let eval_a = Eval::with_net(material.clone(), qnet);
+        let eval_b = match vs {
+            Some(b) => Eval::with_net(
+                material.clone(),
+                botboard_core::nnue::QuantNet::from_float(&g, b),
+            ),
+            None => Eval::new(material.clone()),
+        };
         // A short shared opening, replayed for both color assignments.
         let mut opening: Vec<botboard_core::moves::Move> = Vec::new();
         {
@@ -423,9 +451,9 @@ fn cmd_train_srw(args: &[String]) {
                 opening.push(mv);
             }
         }
-        for net_first in [true, false] {
-            let mut sn = Searcher::new(&g, eval_net.clone());
-            let mut sl = Searcher::new(&g, eval_lin.clone());
+        for a_first in [true, false] {
+            let mut sa = Searcher::new(&g, eval_a.clone());
+            let mut sb = Searcher::new(&g, eval_b.clone());
             let mut pos = Position::startpos(&g);
             for mv in &opening {
                 pos.make(&g, mv);
@@ -441,8 +469,8 @@ fn cmd_train_srw(args: &[String]) {
                 if plies >= 200 {
                     break None;
                 }
-                let net_to_move = (pos.stm == 0) == net_first;
-                let s = if net_to_move { &mut sn } else { &mut sl };
+                let a_to_move = (pos.stm == 0) == a_first;
+                let s = if a_to_move { &mut sa } else { &mut sb };
                 s.history = history.clone();
                 let Some(mv) = s.search(&g, &mut pos, 3, 20_000).best else {
                     break None;
@@ -454,20 +482,82 @@ fn cmd_train_srw(args: &[String]) {
                 }
                 plies += 1;
             };
+            // M2.2 gate hardening: adjudicate undecided games by the
+            // material verdict at the final position (≥ one pawn-unit
+            // edge in the sampled costs = a win), so the draw mass
+            // stops hiding differences. Raw and adjudicated tallies
+            // both report; the verdict line reads the adjudicated one.
+            let adjudicated = verdict.or_else(|| {
+                let mut diff = 0i64;
+                for (i, pc) in pos.pieces.iter().enumerate() {
+                    if !matches!(pc.loc, botboard_core::position::Loc::Board(_)) {
+                        continue;
+                    }
+                    let v = material[pc.t as usize] as i64
+                        * (pos.hp[i].max(1) as i64);
+                    if pc.side == 0 {
+                        diff += v;
+                    } else {
+                        diff -= v;
+                    }
+                }
+                match diff {
+                    d if d >= 100 => Some(0),
+                    d if d <= -100 => Some(1),
+                    _ => None,
+                }
+            });
             match verdict {
-                Some(side) if (side == 0) == net_first => wn += 1,
+                Some(side) if (side == 0) == a_first => wn += 1,
                 Some(_) => wl += 1,
                 None => dr += 1,
             }
+            match adjudicated {
+                Some(side) if (side == 0) == a_first => awn += 1,
+                Some(_) => awl += 1,
+                None => adr += 1,
+            }
         }
-        println!("army pair {p}: net {wn}  linear {wl}  draws {dr}");
+        println!("army pair {p}: net {wn}  {b_name} {wl}  draws {dr}");
     }
     let total = (wn + wl + dr).max(1);
-    let score = 100.0 * (wn as f64 + dr as f64 * 0.5) / total as f64;
+    let raw = 100.0 * (wn as f64 + dr as f64 * 0.5) / total as f64;
+    let adj = 100.0 * (awn as f64 + adr as f64 * 0.5) / total as f64;
+    println!("probe (raw):         net {wn} — {dr} — {wl} {b_name}  score {raw:.1}%");
     println!(
-        "probe: net {wn} — {dr} — {wl} linear  score {score:.1}%  → {}",
-        if score >= 55.0 { "PROMOTE" } else { "HOLD" }
+        "probe (adjudicated): net {awn} — {adr} — {awl} {b_name}  score {adj:.1}%  → {}",
+        if adj >= 55.0 { "PROMOTE" } else { "HOLD" }
     );
+    (awn, awl, adr)
+}
+
+/// `probe-srw` (training-plan M0.1): probe EXISTING checkpoints without
+/// retraining — the M2 gate-stability tool (fixed net, vary `--seed`)
+/// and the M3/M4 promotion gate (net-vs-net via `--vs`).
+fn cmd_probe_srw(args: &[String]) {
+    let net_path: String = opt(args, "--net", String::new());
+    if net_path.is_empty() {
+        eprintln!("probe-srw needs --net <checkpoint>");
+        std::process::exit(2);
+    }
+    let load = |path: &str| -> botboard_core::nnue::FloatNet {
+        let data = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        botboard_core::nnue::FloatNet::from_bytes(&data)
+            .unwrap_or_else(|e| panic!("parse {path}: {e}"))
+    };
+    let net = load(&net_path);
+    let vs_path: String = opt(args, "--vs", String::new());
+    let vs = if vs_path.is_empty() { None } else { Some(load(&vs_path)) };
+    let pairs: u32 = opt(args, "--pairs", 32);
+    let budget: f64 = opt(args, "--budget", 14.0);
+    let seed: u64 = opt(args, "--seed", 11);
+    let w = botboard_core::cost::CostWeights { w_move: 0.35, w_attack: 0.35 };
+    println!(
+        "probe-srw: {net_path} (H={}) vs {} over {pairs} paired armies (seed {seed})…",
+        net.h,
+        if vs_path.is_empty() { "linear teacher" } else { vs_path.as_str() }
+    );
+    srw_probe(&net, vs.as_ref(), pairs, budget, seed, &w);
 }
 
 /// The CwDA fairness bench (vocabulary batch 3): price each army with the
@@ -591,12 +681,19 @@ fn main() {
             &g, &mut net, &material, games, 2, epochs, 0.01, 11,
         );
         println!(
-            "samples: {}  loss: {:.4} → {:.4}",
-            rep.samples, rep.first_loss, rep.last_loss
+            "samples: {}  decisive: {:.1}%  loss: {:.4} → {:.4}",
+            rep.samples,
+            100.0 * rep.decisive as f64 / rep.samples.max(1) as f64,
+            rep.first_loss,
+            rep.last_loss
         );
         std::fs::write(&out, net.to_bytes()).expect("write checkpoint");
         println!("checkpoint written to {out} (deterministic grade derives at load)");
         return;
+    }
+
+    if cmd == "probe-srw" {
+        return cmd_probe_srw(&args[2.min(args.len())..]);
     }
 
     let variant = args.get(2).map(String::as_str).unwrap_or("chess");

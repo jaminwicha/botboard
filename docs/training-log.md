@@ -41,6 +41,8 @@ paired-army probes vs the teacher, ≥55% to PROMOTE.
 | Aug 2026 | srw_net_v2_candidate | H=32, **depth 3, 240 plies**, 800 g / 10 ep | 15.6k | 0.692→0.689 (flat) | 0–26–6 = 40.6% | HOLD — deeper teacher strengthens the baseline too |
 | Aug 2026 | srw_net_h64 | **H=64**, depth 3, 240 plies, 800 g / 10 ep | 15.6k | 0.6915→0.6873 | 4–21–7 = 45.3% | HOLD |
 | Aug 2026 | srw_net_h128 | **H=128**, depth 3, 240 plies, 800 g / 10 ep | 15.6k | 0.6914→0.6866 | 0–23–9 = 35.9% | HOLD — non-monotonic in H |
+| Aug 2026 | srw_net_m2_s23 | H=64, depth 3, 240 plies, 800 g / 10 ep, 32-pair probe, seed 23 | 15,568 samples | 0.6915→0.6873 | 5–48–11 = 45.3% | HOLD |
+| Aug 2026 | srw_net_m2_s41 | H=64, depth 3, 240 plies, 800 g / 10 ep, 32-pair probe, seed 41 | 15,538 samples | 0.6914→0.6875 | 3–42–19 = 37.5% | HOLD |
 
 ## Lessons bought so far
 
@@ -76,6 +78,17 @@ paired-army probes vs the teacher, ≥55% to PROMOTE.
    - **A 32-game probe cannot rank near-tied nets** (the three scores
      differ by a handful of games). Widen `--probe-pairs` or adjudicate
      before trusting single-digit deltas.
+7. **The gate was stable; the NETS are the variance — and draws were
+   flattering them** (M0/M2 tooling, Aug 2026). Probing the FIXED
+   srw_net_m2_s23 checkpoint under two disjoint probe seeds
+   (`probe-srw`, 32 pairs): raw 42.2% vs 40.6% (Δ1.6 — gate criterion
+   MET), so the earlier 7.8-point same-config spread was TRAINING-seed
+   variance: same-recipe nets genuinely differ in strength. And the
+   adjudicated scores were 18.0% / 12.5% (Δ5.5 — criterion MET): the
+   teacher led on material in ~50 of 64 "drawn" games. Consequences:
+   (a) compare recipes at fixed training seed or averaged over 2–3
+   seeds; (b) read ADJUDICATED scores from now on — the net is far
+   below promotion, which makes M1 corpus-signal work unambiguous.
 
 ## Infrastructure changes
 
@@ -91,6 +104,22 @@ paired-army probes vs the teacher, ≥55% to PROMOTE.
   `population(n)`: 4 seeds + a deterministic 2-D style lattice
   (material scale × mobility). 14-member chess run produced Nash
   support on 5 members — spread achieved for future value targets.
+- **Aug 2026 — M0 tooling shipped.** `probe-srw --net A [--vs B]
+  --pairs K --seed S` (probe existing checkpoints, net-vs-linear or
+  net-vs-net, no retrain); `train-net` reports the decisive-label
+  fraction (M1's exit stat); the probe prints raw AND adjudicated
+  tallies (undecided games score by ≥1-pawn material verdict at the
+  final position) with the PROMOTE/HOLD verdict on the adjudicated
+  score. Fixed-net stability measured: raw Δ1.6, adjudicated Δ5.5
+  over disjoint probe seeds — M2 exit criterion MET; the gate is
+  usable.
+- Aug 2026 — M2 gate-stability baseline: two same-config H=64 runs
+  (seeds 23/41) at 32-pair probes scored 45.3% and 37.5% (Δ 7.8
+  points) — criterion NOT MET; league refresh at 8 games/pair:
+  support set [berserk 0.38, active 0.35, s70m5 0.15, s105m14 0.09,
+  s105m9 0.03] (shifted vs 4 games/pair: balanced dropped out,
+  s105m9 entered; 4 of 5 members retained but weights redistributed
+  toward berserk/active).
 
 ## Next levers, in order of current belief (revised after the H sweep)
 

@@ -469,6 +469,10 @@ impl QuantNet {
 
 pub struct TrainReport {
     pub samples: usize,
+    /// Samples whose outcome label is decisive (≠ 0.5) — the corpus
+    /// signal stat (training-plan M0.2/M1): a draw-dominated corpus
+    /// cannot teach, whatever the model size.
+    pub decisive: usize,
     pub first_loss: f32,
     pub last_loss: f32,
 }
@@ -558,7 +562,8 @@ pub fn train_from_selfplay(
         }
         last = avg;
     }
-    TrainReport { samples: samples.len(), first_loss: first, last_loss: last }
+    let decisive = samples.iter().filter(|(_, z)| (*z - 0.5).abs() > 1e-6).count();
+    TrainReport { samples: samples.len(), decisive, first_loss: first, last_loss: last }
 }
 
 /// SRW-content training (STATUS scale rung 3): the same recipe as
@@ -661,5 +666,6 @@ pub fn train_srw_from_selfplay(
         }
         last = avg;
     }
-    TrainReport { samples: samples.len(), first_loss: first, last_loss: last }
+    let decisive = samples.iter().filter(|(_, _, z)| (*z - 0.5).abs() > 1e-6).count();
+    TrainReport { samples: samples.len(), decisive, first_loss: first, last_loss: last }
 }
