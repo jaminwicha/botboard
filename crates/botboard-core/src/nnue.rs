@@ -24,7 +24,13 @@ pub const D: usize = 21; // descriptor dims (v2: SRW ability vocabulary)
 pub const P: usize = 4; // positional basis dims
 pub const F: usize = D * P; // per-perspective feature dims
 pub const IN: usize = 2 * F; // own + enemy perspectives
-pub const H: usize = 32; // hidden units
+/// Default hidden width. H is RUNTIME-SIZED per net (the rung-5
+/// prerequisite: capacity scaling without an engine release) — this
+/// constant is only the default for `FloatNet::new` and the width of
+/// every checkpoint shipped before widths were runtime-sized.
+pub const H: usize = 32;
+/// Checkpoint-header sanity bound for runtime widths.
+pub const MAX_H: usize = 4096;
 
 /// v1 descriptor shape (BBNET001 checkpoints): 12 dims, ability vocabulary
 /// summarized as a bare `abilities.len()/4` at dim 10. Kept for backward
@@ -169,34 +175,46 @@ fn features(g: &GameDef, pos: &Position, stm: Side) -> [f32; IN] {
 
 #[derive(Clone, Debug)]
 pub struct FloatNet {
-    pub w1: Vec<f32>, // [IN][H]
-    pub b1: Vec<f32>, // [H]
-    pub w2: Vec<f32>, // [H]
+    /// Hidden width of THIS net (runtime-sized; `H` is only the default).
+    pub h: usize,
+    pub w1: Vec<f32>, // [IN][h]
+    pub b1: Vec<f32>, // [h]
+    pub w2: Vec<f32>, // [h]
     pub b2: f32,
 }
 
 impl FloatNet {
     pub fn new(seed: u64) -> Self {
+        Self::with_h(H, seed)
+    }
+
+    /// A fresh net at hidden width `h` (init scales follow the H=32
+    /// defaults, tempered by √(H/h) on the fan-in-facing layers so wider
+    /// nets start at comparable output magnitude).
+    pub fn with_h(h: usize, seed: u64) -> Self {
+        assert!(h >= 1 && h <= MAX_H, "hidden width out of range: {h}");
         let mut rng = Rng::new(seed);
+        let temper = (H as f32 / h as f32).sqrt();
         let mut init = |n: usize, scale: f32| {
             (0..n).map(|_| (rng.unit_f64() as f32 - 0.5) * scale).collect::<Vec<f32>>()
         };
         FloatNet {
-            w1: init(IN * H, 0.2),
-            b1: init(H, 0.05),
-            w2: init(H, 0.4),
+            h,
+            w1: init(IN * h, 0.2),
+            b1: init(h, 0.05),
+            w2: init(h, 0.4 * temper),
             b2: 0.0,
         }
     }
 
-    fn hidden(&self, f: &[f32; IN]) -> [f32; H] {
-        let mut h = [0f32; H];
-        for j in 0..H {
+    fn hidden(&self, f: &[f32; IN]) -> Vec<f32> {
+        let mut h = vec![0f32; self.h];
+        for (j, hj) in h.iter_mut().enumerate() {
             let mut a = self.b1[j];
             for i in 0..IN {
-                a += f[i] * self.w1[i * H + j];
+                a += f[i] * self.w1[i * self.h + j];
             }
-            h[j] = a.max(0.0);
+            *hj = a.max(0.0);
         }
         h
     }
@@ -206,7 +224,7 @@ impl FloatNet {
         let f = features(g, pos, pos.stm);
         let h = self.hidden(&f);
         let mut v = self.b2;
-        for j in 0..H {
+        for j in 0..self.h {
             v += h[j] * self.w2[j];
         }
         v * 100.0
@@ -218,13 +236,13 @@ impl FloatNet {
         let f = features(g, pos, pos.stm);
         let h = self.hidden(&f);
         let mut v = self.b2;
-        for j in 0..H {
+        for j in 0..self.h {
             v += h[j] * self.w2[j];
         }
         let p = 1.0 / (1.0 + (-v / 4.0).exp());
         let dv = (p - z) / 4.0; // dLoss/dv
         // Output layer.
-        for j in 0..H {
+        for j in 0..self.h {
             let gw2 = dv * h[j];
             let dh = if h[j] > 0.0 { dv * self.w2[j] } else { 0.0 };
             self.w2[j] -= lr * gw2;
@@ -232,7 +250,7 @@ impl FloatNet {
                 self.b1[j] -= lr * dh;
                 for i in 0..IN {
                     if f[i] != 0.0 {
-                        self.w1[i * H + j] -= lr * dh * f[i];
+                        self.w1[i * self.h + j] -= lr * dh * f[i];
                     }
                 }
             }
@@ -243,11 +261,14 @@ impl FloatNet {
 }
 
 impl FloatNet {
-    /// Versioned checkpoint (Training Spec §8): little-endian f32s.
+    /// Versioned checkpoint (Training Spec §8): little-endian f32s. The
+    /// header carries this net's width — BBNET002 has always stored H,
+    /// so runtime-sized widths are format-compatible: old readers reject
+    /// non-32 widths loudly, new readers load every shipped checkpoint.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = b"BBNET002".to_vec();
         out.extend((IN as u32).to_le_bytes());
-        out.extend((H as u32).to_le_bytes());
+        out.extend((self.h as u32).to_le_bytes());
         for v in self.w1.iter().chain(self.b1.iter()).chain(self.w2.iter()) {
             out.extend(v.to_le_bytes());
         }
@@ -263,10 +284,14 @@ impl FloatNet {
             return Err("bad magic".into());
         }
         let rd = |i: usize| u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
-        if rd(8) as usize != IN || rd(12) as usize != H {
+        if rd(8) as usize != IN {
             return Err("dimension mismatch".into());
         }
-        let need = 16 + (IN * H + H + H + 1) * 4;
+        let h = rd(12) as usize;
+        if h < 1 || h > MAX_H {
+            return Err(format!("hidden width out of range: {h}"));
+        }
+        let need = 16 + (IN * h + h + h + 1) * 4;
         if data.len() != need {
             return Err(format!("expected {need} bytes, got {}", data.len()));
         }
@@ -275,9 +300,10 @@ impl FloatNet {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()));
         let mut take = |n: usize| (0..n).map(|_| f.next().unwrap()).collect::<Vec<f32>>();
         Ok(FloatNet {
-            w1: take(IN * H),
-            b1: take(H),
-            w2: take(H),
+            h,
+            w1: take(IN * h),
+            b1: take(h),
+            w2: take(h),
             b2: f.next().unwrap(),
         })
     }
@@ -293,10 +319,14 @@ impl FloatNet {
     /// skips zero features).
     fn from_bytes_v1(data: &[u8]) -> Result<Self, String> {
         let rd = |i: usize| u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
-        if rd(8) as usize != IN_V1 || rd(12) as usize != H {
+        if rd(8) as usize != IN_V1 {
             return Err("v1 dimension mismatch".into());
         }
-        let need = 16 + (IN_V1 * H + H + H + 1) * 4;
+        let h = rd(12) as usize;
+        if h < 1 || h > MAX_H {
+            return Err(format!("v1 hidden width out of range: {h}"));
+        }
+        let need = 16 + (IN_V1 * h + h + h + 1) * 4;
         if data.len() != need {
             return Err(format!("expected {need} bytes (v1), got {}", data.len()));
         }
@@ -304,11 +334,11 @@ impl FloatNet {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()));
         let mut take = |n: usize| (0..n).map(|_| f.next().unwrap()).collect::<Vec<f32>>();
-        let w1_v1 = take(IN_V1 * H);
-        let b1 = take(H);
-        let w2 = take(H);
+        let w1_v1 = take(IN_V1 * h);
+        let b1 = take(h);
+        let w2 = take(h);
         let b2 = f.next().unwrap();
-        let mut w1 = vec![0f32; IN * H];
+        let mut w1 = vec![0f32; IN * h];
         for persp in 0..2 {
             for di in 0..D_V1 {
                 // v1 dim → v2 dim: 0–9 identity, 11 (bias) → D−1,
@@ -321,12 +351,12 @@ impl FloatNet {
                 for j in 0..P {
                     let old = persp * F_V1 + di * P + j;
                     let new = persp * F + ndi * P + j;
-                    w1[new * H..(new + 1) * H]
-                        .copy_from_slice(&w1_v1[old * H..(old + 1) * H]);
+                    w1[new * h..(new + 1) * h]
+                        .copy_from_slice(&w1_v1[old * h..(old + 1) * h]);
                 }
             }
         }
-        Ok(FloatNet { w1, b1, w2, b2 })
+        Ok(FloatNet { h, w1, b1, w2, b2 })
     }
 }
 
@@ -339,6 +369,8 @@ pub struct QuantNet {
     /// Quantized descriptor cache per (type, side): [D] × QIN.
     desc_q: Vec<[i32; D]>,
     nsides: usize,
+    /// Hidden width (runtime-sized, carried from the float net).
+    h: usize,
     w1: Vec<i16>, // × QW
     b1: Vec<i32>, // × QIN·QW
     w2: Vec<i16>, // × QW
@@ -367,6 +399,7 @@ impl QuantNet {
         QuantNet {
             desc_q,
             nsides: g.sides as usize,
+            h: net.h,
             w1: net.w1.iter().map(|&v| qi16(v)).collect(),
             b1: net.b1.iter().map(|&v| (v * (QIN * QW) as f32).round() as i32).collect(),
             w2: net.w2.iter().map(|&v| qi16(v)).collect(),
@@ -415,11 +448,11 @@ impl QuantNet {
         }
         // Hidden: Σ acc(×QIN²) · w1(×QW) → ×QIN²·QW; shift to ×QIN·QW.
         let mut v: i64 = self.b2 as i64;
-        for j in 0..H {
+        for j in 0..self.h {
             let mut a: i64 = self.b1[j] as i64 * QIN as i64; // ×QIN²·QW
             for i in 0..IN {
                 if acc[i] != 0 {
-                    a += acc[i] * self.w1[i * H + j] as i64;
+                    a += acc[i] * self.w1[i * self.h + j] as i64;
                 }
             }
             let h = (a >> 6).max(0); // ReLU, ×QIN·QW  (QIN=64 ⇒ >>6)

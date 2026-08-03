@@ -368,13 +368,15 @@ fn cmd_train_srw(args: &[String]) {
     // depth 2 / 160 plies.
     let depth: i32 = opt(args, "--depth", 3);
     let plies: u32 = opt(args, "--plies", 240);
+    // Runtime-sized capacity (the rung-5 prerequisite): hidden width.
+    let hidden: usize = opt(args, "--hidden", botboard_core::nnue::H);
     let out: String = opt(args, "--out", "srw_net_v1.bin".into());
     let w = botboard_core::cost::CostWeights { w_move: 0.35, w_attack: 0.35 };
 
-    let mut net = botboard_core::nnue::FloatNet::new(7);
+    let mut net = botboard_core::nnue::FloatNet::with_h(hidden, 7);
     println!(
         "training on {games} sampled robot armies (budget {budget}, teacher depth {depth}, \
-         horizon {plies} plies, {epochs} epochs)…"
+         horizon {plies} plies, {epochs} epochs, H={hidden})…"
     );
     let t0 = Instant::now();
     let rep = botboard_core::nnue::train_srw_from_selfplay(
@@ -580,10 +582,11 @@ fn main() {
         let rest: Vec<String> = args[3.min(args.len())..].to_vec();
         let games: u32 = opt(&rest, "--games", 24);
         let epochs: u32 = opt(&rest, "--epochs", 6);
+        let hidden: usize = opt(&rest, "--hidden", botboard_core::nnue::H);
         let out: String = opt(&rest, "--out", format!("{variant}_net.bin"));
         let material = material_for(&g, variant);
-        let mut net = botboard_core::nnue::FloatNet::new(7);
-        println!("training on {games} self-play games ({epochs} epochs)…");
+        let mut net = botboard_core::nnue::FloatNet::with_h(hidden, 7);
+        println!("training on {games} self-play games ({epochs} epochs, H={hidden})…");
         let rep = botboard_core::nnue::train_from_selfplay(
             &g, &mut net, &material, games, 2, epochs, 0.01, 11,
         );

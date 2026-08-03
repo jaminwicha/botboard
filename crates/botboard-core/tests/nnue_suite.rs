@@ -331,3 +331,50 @@ fn searcher_runs_on_the_deterministic_net() {
     assert!(r.best.is_some());
     assert!(r.depth >= 3);
 }
+
+#[test]
+fn runtime_width_roundtrips_and_keeps_parity() {
+    // Runtime-sized H (the rung-5 prerequisite): a non-default width
+    // trains, checkpoints with its width in the header, reloads exactly,
+    // quantizes, and keeps the §10.6 parity obligations.
+    let (g, material) = chess_setup();
+    let mut net = FloatNet::with_h(64, 7);
+    assert_eq!(net.h, 64);
+    let report = train_from_selfplay(&g, &mut net, &material, 6, 2, 3, 0.01, 11);
+    assert!(
+        report.last_loss < report.first_loss,
+        "wide net trains: {} -> {}",
+        report.first_loss,
+        report.last_loss
+    );
+
+    // Checkpoint roundtrip: exact weights, exact width.
+    let bytes = net.to_bytes();
+    let back = FloatNet::from_bytes(&bytes).expect("H=64 checkpoint loads");
+    assert_eq!(back.h, 64);
+    assert_eq!(back.w1, net.w1);
+    assert_eq!(back.b1, net.b1);
+    assert_eq!(back.w2, net.w2);
+    assert_eq!(back.b2, net.b2);
+    // The default-width net remains loadable alongside (H in the header).
+    assert_eq!(FloatNet::new(7).h, H);
+
+    // Quantized-grade determinism + value parity at the wide width.
+    let q1 = QuantNet::from_float(&g, &net);
+    let q2 = QuantNet::from_float(&g, &back);
+    let mut pos = Position::startpos(&g);
+    let mut rng = Rng::new(9);
+    let mut max_dv = 0i32;
+    for _ in 0..30 {
+        let moves = legal_moves(&g, &mut pos);
+        if moves.is_empty() {
+            break;
+        }
+        assert_eq!(q1.eval(&g, &pos), q2.eval(&g, &pos), "bit-exact across loads");
+        let dv = (net.eval(&g, &pos) as i32 - q1.eval(&g, &pos)).abs();
+        max_dv = max_dv.max(dv);
+        let mv = moves[rng.below(moves.len())];
+        pos.make(&g, &mv);
+    }
+    assert!(max_dv <= 20, "H=64 value drift {max_dv}cp exceeds tolerance");
+}

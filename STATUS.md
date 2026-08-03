@@ -105,13 +105,19 @@ remain ops work outside the engine's semantics.
    `--depth` (teacher depth, was fixed 2) and `--plies` (value-target
    horizon, was fixed 160). The 800-game / depth-3 / 240-ply / 10-epoch
    run (15.6k samples, loss 0.692 → 0.689, probed at depth 3) scored
-   **40.6% HOLD** (0–26–6, draw-heavy) — WORSE than the depth-2 50%:
-   a deeper teacher strengthens the baseline as much as the corpus,
-   and the near-flat loss says H=32 is capacity-saturated on the
-   21-dim SRW descriptor space. Conclusion: depth/horizon alone do
-   not promote; the binding constraint is net capacity —
-   runtime-sized H (the rung-5 prerequisite) or a teacher-diverse
-   corpus is the next real lever.
+   **40.6% HOLD** (0–26–6, draw-heavy) — WORSE than the depth-2 50%.
+   **H is now RUNTIME-SIZED** (Aug 2026: `FloatNet::with_h`,
+   width-carrying BBNET002 headers — every shipped checkpoint loads
+   unchanged; `--hidden` on train-net; parity re-proven at H=64).
+   The capacity sweep on the identical recipe answered the capacity
+   hypothesis: H=32 → 40.6%, H=64 → 45.3%, H=128 → 35.9%, every loss
+   curve pinned at ≈ln 2. Revised conclusion: the CORPUS is the front
+   constraint (mirrored armies + one teacher both sides ⇒ near-
+   uninformative outcome labels), and 32-game probes are noise-
+   dominated — see `docs/training-log.md` (the living experiment
+   log) for the full table and the revised lever order: corpus
+   signal (style-diverse teachers / adjudicated labels / asymmetric
+   budgets), probe power, THEN capacity re-tests.
 4. **Process-parallel farm** (ops): N engine processes with disjoint
    seed ranges appending to a shared game store; the deterministic
    per-seed actor pool makes shard merges trivially reproducible.
@@ -200,10 +206,11 @@ each is a deliberate deferral, listed so it can't silently vanish.
    `Subterranean_Robot_Wars_Spec_v4.md` (Appendix E = the authoring
    surface; §7 rules army transfer campaign-side; spy/codex shipped).
 3. **SRW net promotion recipe** — 🟡 LEVERS DONE, PROMOTION OPEN
-   (Aug 2026): `--depth`/`--plies` implemented and measured; the
-   depth-3/240-ply run probed 40.6% HOLD (see rung 3 above). The
-   empirical answer: capacity (runtime-sized H) is the binding
-   constraint, so promotion moves behind the rung-5 prerequisite.
+   (Aug 2026): `--depth`/`--plies`/`--hidden` implemented; runtime-H
+   shipped and parity-proven; the depth and H sweeps both measured
+   HOLD (best 45.3% at H=64). Empirical verdict: corpus signal, not
+   capacity, is the front constraint — the lever order lives in
+   `docs/training-log.md`.
 4. **League widening** — ✅ DONE (Aug 2026): 14-member run with real
    Nash spread (see rung 2 above).
 5. **Bits 2.0 tail, on demand** — custom MOVE scripts and descriptor
